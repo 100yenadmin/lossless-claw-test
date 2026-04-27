@@ -6,12 +6,15 @@ import { RollupStore } from "../store/rollup-store.js";
 import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
-import { parseIsoTimestampParam, resolveLcmConversationScope } from "./lcm-conversation-scope.js";
+import {
+  parseIsoTimestampParam,
+  resolveLcmConversationScope,
+} from "./lcm-conversation-scope.js";
 
 const LcmRecentSchema = Type.Object({
   period: Type.String({
     description:
-      'Time period: "today", "yesterday", "7d", "week", "month", "30d", or "date:YYYY-MM-DD"',
+      'Time period: "today", "yesterday", "7d", "week", "month", "30d", "date:YYYY-MM-DD", or a deterministic local-time window such as "yesterday 4-8pm", "today morning", "date:2026-04-27 14:00-16:30", "last 3h", or "last 90m"',
   }),
   conversationId: Type.Optional(
     Type.Number({
@@ -71,12 +74,21 @@ type PeriodResolution = {
   periodKey?: string;
   start: Date;
   end: Date;
+  window?: {
+    day?: string;
+    name?: string;
+    startMinutes?: number;
+    endMinutes?: number;
+    relative?: boolean;
+  };
 };
 
 function parseJsonStringArray(value: string): string[] {
   try {
     const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === "string")
+      : [];
   } catch {
     return [];
   }
@@ -104,7 +116,10 @@ function getLcmDatabase(lcm: LcmContextEngine): DatabaseSync {
   return candidate.db;
 }
 
-function getPartsInTimezone(date: Date, timezone: string): { year: number; month: number; day: number } {
+function getPartsInTimezone(
+  date: Date,
+  timezone: string,
+): { year: number; month: number; day: number } {
   const formatter = new Intl.DateTimeFormat("en-CA", {
     timeZone: timezone,
     year: "numeric",
@@ -143,9 +158,20 @@ function getUtcDateForZonedMidnight(dayString: string, timezone: string): Date {
   const zonedMonth = Number(parts.find((part) => part.type === "month")?.value);
   const zonedDay = Number(parts.find((part) => part.type === "day")?.value);
   const zonedHour = Number(parts.find((part) => part.type === "hour")?.value);
-  const zonedMinute = Number(parts.find((part) => part.type === "minute")?.value);
-  const zonedSecond = Number(parts.find((part) => part.type === "second")?.value);
-  const asUtc = Date.UTC(zonedYear, zonedMonth - 1, zonedDay, zonedHour, zonedMinute, zonedSecond);
+  const zonedMinute = Number(
+    parts.find((part) => part.type === "minute")?.value,
+  );
+  const zonedSecond = Number(
+    parts.find((part) => part.type === "second")?.value,
+  );
+  const asUtc = Date.UTC(
+    zonedYear,
+    zonedMonth - 1,
+    zonedDay,
+    zonedHour,
+    zonedMinute,
+    zonedSecond,
+  );
   const desiredUtc = Date.UTC(year, month - 1, day, 0, 0, 0, 0);
   return new Date(approxUtc.getTime() - (asUtc - desiredUtc));
 }
@@ -169,10 +195,200 @@ function startOfMonthDayString(dayString: string): string {
   return `${year}-${month}-01`;
 }
 
+function getUtcDateForZonedLocalTime(
+  dayString: string,
+  timezone: string,
+  minutesAfterMidnight: number,
+): Date {
+  return new Date(
+    getUtcDateForZonedMidnight(dayString, timezone).getTime() +
+      minutesAfterMidnight * 60_000,
+  );
+}
+
+function parseClockToken(raw: string): number | null {
+  const token = raw.trim().toLowerCase().replace(/\s+/g, "");
+  const match = /^(\d{1,2})(?::(\d{2}))?(am|pm)?$/.exec(token);
+  if (!match) {
+    return null;
+  }
+
+  let hour = Number(match[1]);
+  const minute = match[2] == null ? 0 : Number(match[2]);
+  const meridiem = match[3];
+  if (minute < 0 || minute > 59) {
+    return null;
+  }
+  if (meridiem) {
+    if (hour < 1 || hour > 12) {
+      return null;
+    }
+    if (meridiem === "am") {
+      hour = hour === 12 ? 0 : hour;
+    } else {
+      hour = hour === 12 ? 12 : hour + 12;
+    }
+  } else if (hour < 0 || hour > 23) {
+    return null;
+  }
+
+  return hour * 60 + minute;
+}
+
+function inferWindowEndMeridiem(startRaw: string, endRaw: string): string {
+  const start = startRaw.trim().toLowerCase();
+  const end = endRaw.trim().toLowerCase();
+  if (/(am|pm)\b/.test(end) || !/(am|pm)\b/.test(start)) {
+    return end;
+  }
+  return `${end}${start.endsWith("pm") ? "pm" : "am"}`;
+}
+
+function parseNamedWindow(
+  name: string,
+): { startMinutes: number; endMinutes: number; name: string } | null {
+  switch (name.trim().toLowerCase()) {
+    case "morning":
+      return { name: "morning", startMinutes: 6 * 60, endMinutes: 12 * 60 };
+    case "afternoon":
+      return { name: "afternoon", startMinutes: 12 * 60, endMinutes: 17 * 60 };
+    case "evening":
+      return { name: "evening", startMinutes: 17 * 60, endMinutes: 22 * 60 };
+    case "night":
+      return { name: "night", startMinutes: 22 * 60, endMinutes: 24 * 60 };
+    default:
+      return null;
+  }
+}
+
+function parseExplicitWindow(
+  windowText: string,
+): { startMinutes: number; endMinutes: number; label: string } | null {
+  const match = /^(.+?)\s*(?:-|–|—|to)\s*(.+)$/.exec(
+    windowText.trim().toLowerCase(),
+  );
+  if (!match) {
+    return null;
+  }
+
+  const startRaw = match[1].trim();
+  const endRaw = inferWindowEndMeridiem(startRaw, match[2].trim());
+  const startMinutes = parseClockToken(startRaw);
+  const endMinutes = parseClockToken(endRaw);
+  if (
+    startMinutes == null ||
+    endMinutes == null ||
+    endMinutes <= startMinutes
+  ) {
+    return null;
+  }
+
+  return { startMinutes, endMinutes, label: `${startRaw}-${match[2].trim()}` };
+}
+
+function parseBaseDay(
+  baseText: string,
+  today: string,
+): { day: string; label: string } | null {
+  const base = baseText.trim().toLowerCase();
+  if (base === "today") {
+    return { day: today, label: "today" };
+  }
+  if (base === "yesterday") {
+    return { day: addDays(today, -1), label: "yesterday" };
+  }
+  if (base.startsWith("date:")) {
+    const day = base.slice(5).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+      return null;
+    }
+    return { day, label: day };
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(base)) {
+    return { day: base, label: base };
+  }
+  return null;
+}
+
+function resolveWindowPeriod(
+  normalized: string,
+  timezone: string,
+  today: string,
+): PeriodResolution | null {
+  const relative =
+    /^last\s+(\d+)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes)$/.exec(
+      normalized,
+    );
+  if (relative) {
+    const amount = Number(relative[1]);
+    const unit = relative[2];
+    const minutes = unit.startsWith("h") ? amount * 60 : amount;
+    if (!Number.isFinite(minutes) || minutes <= 0) {
+      return null;
+    }
+    const end = new Date();
+    const start = new Date(end.getTime() - minutes * 60_000);
+    return {
+      label: `last ${amount}${unit.startsWith("h") ? "h" : "m"}`,
+      start,
+      end,
+      window: { relative: true },
+    };
+  }
+
+  const windowMatch =
+    /^(today|yesterday|date:\d{4}-\d{2}-\d{2}|\d{4}-\d{2}-\d{2})\s+(.+)$/.exec(
+      normalized,
+    );
+  if (!windowMatch) {
+    return null;
+  }
+
+  const base = parseBaseDay(windowMatch[1], today);
+  if (!base) {
+    return null;
+  }
+
+  const windowText = windowMatch[2].trim();
+  const named = parseNamedWindow(windowText);
+  const explicit = named ?? parseExplicitWindow(windowText);
+  if (!explicit) {
+    return null;
+  }
+
+  const start = getUtcDateForZonedLocalTime(
+    base.day,
+    timezone,
+    explicit.startMinutes,
+  );
+  const end = getUtcDateForZonedLocalTime(
+    base.day,
+    timezone,
+    explicit.endMinutes,
+  );
+  return {
+    label: `${base.label} ${explicit.name ?? explicit.label}`,
+    kind: "day",
+    periodKey: base.day,
+    start,
+    end,
+    window: {
+      day: base.day,
+      name: explicit.name ?? explicit.label,
+      startMinutes: explicit.startMinutes,
+      endMinutes: explicit.endMinutes,
+    },
+  };
+}
+
 function resolvePeriod(period: string, timezone: string): PeriodResolution {
-  const normalized = period.trim().toLowerCase();
+  const normalized = period.trim().toLowerCase().replace(/\s+/g, " ");
   const now = new Date();
   const today = getZonedDayString(now, timezone);
+  const windowPeriod = resolveWindowPeriod(normalized, timezone, today);
+  if (windowPeriod) {
+    return windowPeriod;
+  }
 
   if (normalized === "today") {
     const start = getUtcDateForZonedMidnight(today, timezone);
@@ -244,11 +460,14 @@ function resolvePeriod(period: string, timezone: string): PeriodResolution {
   }
 
   throw new Error(
-    'period must be one of "today", "yesterday", "7d", "week", "month", "30d", or "date:YYYY-MM-DD".',
+    'period must be one of "today", "yesterday", "7d", "week", "month", "30d", "date:YYYY-MM-DD", "today morning", "yesterday 4-8pm", "date:YYYY-MM-DD 14:00-16:30", "last Nh", or "last Nm".',
   );
 }
 
-function formatSourcesLine(summaryIds: string[], includeSources: boolean): string {
+function formatSourcesLine(
+  summaryIds: string[],
+  includeSources: boolean,
+): string {
   if (!includeSources || summaryIds.length === 0) {
     return "*Sources: omitted*";
   }
@@ -264,9 +483,16 @@ function combineRollups(rollups: RollupRecord[]): {
   const content = rollups
     .map((rollup) => `### ${rollup.periodKey}\n\n${rollup.content.trim()}`)
     .join("\n\n");
-  const tokenCount = rollups.reduce((sum, rollup) => sum + rollup.tokenCount, 0);
-  const sourceSummaryIds = [...new Set(rollups.flatMap((rollup) => rollup.sourceSummaryIds))];
-  const status = rollups.every((rollup) => rollup.status === "ready") ? "ready" : "stale";
+  const tokenCount = rollups.reduce(
+    (sum, rollup) => sum + rollup.tokenCount,
+    0,
+  );
+  const sourceSummaryIds = [
+    ...new Set(rollups.flatMap((rollup) => rollup.sourceSummaryIds)),
+  ];
+  const status = rollups.every((rollup) => rollup.status === "ready")
+    ? "ready"
+    : "stale";
   return { content, tokenCount, status, sourceSummaryIds };
 }
 
@@ -277,9 +503,10 @@ function getRecentSummaryFallback(
   end: Date,
 ): RecentSummaryFallbackRow[] {
   const scopeClause = conversationId == null ? "" : "conversation_id = ? AND";
-  const args: Array<string | number> = conversationId == null
-    ? [start.toISOString(), end.toISOString()]
-    : [conversationId, start.toISOString(), end.toISOString()];
+  const args: Array<string | number> =
+    conversationId == null
+      ? [start.toISOString(), end.toISOString()]
+      : [conversationId, start.toISOString(), end.toISOString()];
 
   return db
     .prepare(
@@ -300,6 +527,12 @@ function getRecentSummaryFallback(
     )
     .all(...args) as unknown as RecentSummaryFallbackRow[];
 }
+
+export const __lcmRecentTestInternals = {
+  resolvePeriod,
+  getUtcDateForZonedMidnight,
+  getUtcDateForZonedLocalTime,
+};
 
 export function createLcmRecentTool(input: {
   deps: LcmDependencies;
@@ -333,7 +566,10 @@ export function createLcmRecentTool(input: {
         params: p,
       });
 
-      if (!conversationScope.allConversations && conversationScope.conversationId == null) {
+      if (
+        !conversationScope.allConversations &&
+        conversationScope.conversationId == null
+      ) {
         return jsonResult({
           error:
             "No LCM conversation found for this session. Provide conversationId or set allConversations=true.",
@@ -376,9 +612,13 @@ export function createLcmRecentTool(input: {
         lines.push(`**Token count:** 0`);
         lines.push("");
         if (recentSummaries.length === 0) {
-          lines.push("No pre-built rollup found, and no leaf summaries were captured in this period.");
+          lines.push(
+            "No pre-built rollup found, and no leaf summaries were captured in this period.",
+          );
         } else {
-          lines.push("No pre-built rollup available. Here's what LCM captured for this period:");
+          lines.push(
+            "No pre-built rollup available. Here's what LCM captured for this period:",
+          );
           lines.push("");
           for (const summary of recentSummaries) {
             lines.push(
@@ -389,7 +629,9 @@ export function createLcmRecentTool(input: {
         }
         lines.push("---");
         lines.push(formatSourcesLine(summaryIds, includeSources));
-        lines.push("*Drill down: Use lcm_expand_query with matching summaryIds for deeper recall*");
+        lines.push(
+          "*Drill down: Use lcm_expand_query with matching summaryIds for deeper recall*",
+        );
 
         return {
           content: [{ type: "text", text: lines.join("\n") }],
@@ -411,38 +653,60 @@ export function createLcmRecentTool(input: {
       let sourceSummaryIds: string[] = [];
 
       if (resolution.kind && resolution.periodKey) {
-        const rollup = rollupStore.getRollup(conversationId, resolution.kind, resolution.periodKey);
-        if (rollup && (rollup.status === "ready" || rollup.status === "stale")) {
+        const rollup = rollupStore.getRollup(
+          conversationId,
+          resolution.kind,
+          resolution.periodKey,
+        );
+        if (
+          rollup &&
+          (rollup.status === "ready" || rollup.status === "stale")
+        ) {
           rollupContent = rollup.content;
           tokenCount = rollup.token_count;
           status = rollup.status === "ready" ? "ready" : "stale";
           sourceSummaryIds = parseJsonStringArray(rollup.source_summary_ids);
         }
       } else if (resolution.kind) {
-        const rollups = rollupStore.listRollups(conversationId, resolution.kind, 200)
-          .filter((rollup) => new Date(rollup.period_start) >= resolution.start && new Date(rollup.period_start) < resolution.end);
-        const usableRollups = rollups.filter((rollup) => rollup.status === "ready" || rollup.status === "stale").map((rollup) => ({
-          rollupId: rollup.rollup_id,
-          conversationId: rollup.conversation_id,
-          periodKind: rollup.period_kind,
-          periodKey: rollup.period_key,
-          periodStart: new Date(rollup.period_start),
-          periodEnd: new Date(rollup.period_end),
-          timezone: rollup.timezone,
-          content: rollup.content,
-          tokenCount: rollup.token_count,
-          sourceSummaryIds: parseJsonStringArray(rollup.source_summary_ids),
-          sourceMessageCount: rollup.source_message_count,
-          sourceTokenCount: rollup.source_token_count,
-          status: rollup.status,
-          coverageStart: rollup.coverage_start ? new Date(rollup.coverage_start) : null,
-          coverageEnd: rollup.coverage_end ? new Date(rollup.coverage_end) : null,
-          summarizerModel: rollup.summarizer_model,
-          sourceFingerprint: rollup.source_fingerprint,
-          builtAt: new Date(rollup.built_at),
-          invalidatedAt: rollup.invalidated_at ? new Date(rollup.invalidated_at) : null,
-          errorText: rollup.error_text,
-        }));
+        const rollups = rollupStore
+          .listRollups(conversationId, resolution.kind, 200)
+          .filter(
+            (rollup) =>
+              new Date(rollup.period_start) >= resolution.start &&
+              new Date(rollup.period_start) < resolution.end,
+          );
+        const usableRollups = rollups
+          .filter(
+            (rollup) => rollup.status === "ready" || rollup.status === "stale",
+          )
+          .map((rollup) => ({
+            rollupId: rollup.rollup_id,
+            conversationId: rollup.conversation_id,
+            periodKind: rollup.period_kind,
+            periodKey: rollup.period_key,
+            periodStart: new Date(rollup.period_start),
+            periodEnd: new Date(rollup.period_end),
+            timezone: rollup.timezone,
+            content: rollup.content,
+            tokenCount: rollup.token_count,
+            sourceSummaryIds: parseJsonStringArray(rollup.source_summary_ids),
+            sourceMessageCount: rollup.source_message_count,
+            sourceTokenCount: rollup.source_token_count,
+            status: rollup.status,
+            coverageStart: rollup.coverage_start
+              ? new Date(rollup.coverage_start)
+              : null,
+            coverageEnd: rollup.coverage_end
+              ? new Date(rollup.coverage_end)
+              : null,
+            summarizerModel: rollup.summarizer_model,
+            sourceFingerprint: rollup.source_fingerprint,
+            builtAt: new Date(rollup.built_at),
+            invalidatedAt: rollup.invalidated_at
+              ? new Date(rollup.invalidated_at)
+              : null,
+            errorText: rollup.error_text,
+          }));
         if (usableRollups.length > 0) {
           const combined = combineRollups(usableRollups);
           rollupContent = combined.content;
@@ -453,7 +717,12 @@ export function createLcmRecentTool(input: {
       }
 
       if (rollupContent == null) {
-        const recentSummaries = getRecentSummaryFallback(db, conversationId, resolution.start, resolution.end);
+        const recentSummaries = getRecentSummaryFallback(
+          db,
+          conversationId,
+          resolution.start,
+          resolution.end,
+        );
 
         const lines: string[] = [];
         lines.push(`## Recent Activity: ${resolution.label}`);
@@ -464,9 +733,13 @@ export function createLcmRecentTool(input: {
         lines.push("**Token count:** 0");
         lines.push("");
         if (recentSummaries.length === 0) {
-          lines.push("No pre-built rollup available, and LCM captured no leaf summaries for this period.");
+          lines.push(
+            "No pre-built rollup available, and LCM captured no leaf summaries for this period.",
+          );
         } else {
-          lines.push("No pre-built rollup available. Here's what LCM captured for this period:");
+          lines.push(
+            "No pre-built rollup available. Here's what LCM captured for this period:",
+          );
           lines.push("");
           for (const summary of recentSummaries) {
             lines.push(
@@ -474,11 +747,15 @@ export function createLcmRecentTool(input: {
             );
           }
           lines.push("");
-          sourceSummaryIds = recentSummaries.map((summary) => summary.summary_id);
+          sourceSummaryIds = recentSummaries.map(
+            (summary) => summary.summary_id,
+          );
         }
         lines.push("---");
         lines.push(formatSourcesLine(sourceSummaryIds, includeSources));
-        lines.push("*Drill down: Use lcm_expand_query with these summaryIds for deeper recall*");
+        lines.push(
+          "*Drill down: Use lcm_expand_query with these summaryIds for deeper recall*",
+        );
 
         return {
           content: [{ type: "text", text: lines.join("\n") }],
@@ -503,7 +780,9 @@ export function createLcmRecentTool(input: {
       lines.push("");
       lines.push("---");
       lines.push(formatSourcesLine(sourceSummaryIds, includeSources));
-      lines.push("*Drill down: Use lcm_expand_query with these summaryIds for deeper recall*");
+      lines.push(
+        "*Drill down: Use lcm_expand_query with these summaryIds for deeper recall*",
+      );
 
       return {
         content: [{ type: "text", text: lines.join("\n") }],
