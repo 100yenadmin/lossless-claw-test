@@ -46,6 +46,8 @@ import {
 import { describeLogError } from "./lcm-log.js";
 import { describeLcmConfigSource } from "./db/config.js";
 import { RetrievalEngine } from "./retrieval.js";
+import { RollupBuilder } from "./rollup-builder.js";
+import { RollupStore } from "./store/rollup-store.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
 import { logStartupBannerOnce } from "./startup-banner-log.js";
 import {
@@ -1294,6 +1296,8 @@ export class LcmContextEngine implements ContextEngine {
   private summaryStore: SummaryStore;
   private compactionTelemetryStore: CompactionTelemetryStore;
   private compactionMaintenanceStore: CompactionMaintenanceStore;
+  private rollupStore: RollupStore;
+  private rollupBuilder: RollupBuilder;
   private assembler: ContextAssembler;
   private compaction: CompactionEngine;
   private retrieval: RetrievalEngine;
@@ -1380,6 +1384,8 @@ export class LcmContextEngine implements ContextEngine {
     this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
     this.compactionTelemetryStore = new CompactionTelemetryStore(this.db);
     this.compactionMaintenanceStore = new CompactionMaintenanceStore(this.db);
+    this.rollupStore = new RollupStore(this.db);
+    this.rollupBuilder = new RollupBuilder(this.rollupStore, { timezone: this.config.timezone });
 
     if (!this.fts5Available) {
       this.deps.log.warn(
@@ -4135,6 +4141,23 @@ export class LcmContextEngine implements ContextEngine {
         }
 
         let deferredCompactionResult: ContextEngineMaintenanceResult | null = null;
+        try {
+          const rollupState = this.rollupStore.getState(conversation.conversationId);
+          if (rollupState?.pending_rebuild === 1) {
+            const rollupResult = await this.rollupBuilder.buildDailyRollups(
+              conversation.conversationId,
+              { daysBack: 7, forceCurrentDay: true },
+            );
+            this.deps.log.info(
+              `[lcm] maintain: daily rollups conversation=${conversation.conversationId} ${sessionLabel} built=${rollupResult.built} skipped=${rollupResult.skipped} errors=${rollupResult.errors.length}`,
+            );
+          }
+        } catch (error) {
+          this.deps.log.warn(
+            `[lcm] maintain: daily rollup build failed conversation=${conversation.conversationId} ${sessionLabel}: ${describeLogError(error)}`,
+          );
+        }
+
         const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
           conversation.conversationId,
         );
@@ -4415,6 +4438,11 @@ export class LcmContextEngine implements ContextEngine {
 
     // Append to context items so assembler can see it
     await this.summaryStore.appendContextMessage(conversationId, msgRecord.messageId);
+    this.rollupStore.upsertState(conversationId, {
+      timezone: this.config.timezone,
+      last_message_at: new Date().toISOString(),
+      pending_rebuild: 1,
+    });
 
     return { ingested: true };
   }
@@ -5935,6 +5963,14 @@ export class LcmContextEngine implements ContextEngine {
 
   getCompactionMaintenanceStore(): CompactionMaintenanceStore {
     return this.compactionMaintenanceStore;
+  }
+
+  getRollupStore(): RollupStore {
+    return this.rollupStore;
+  }
+
+  getRollupBuilder(): RollupBuilder {
+    return this.rollupBuilder;
   }
 
   // ── Heartbeat pruning ──────────────────────────────────────────────────
