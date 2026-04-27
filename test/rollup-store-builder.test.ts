@@ -27,30 +27,30 @@ describe("LCM temporal rollup MVP", () => {
     expect(
       db
         .prepare(
-          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'lcm_rollups'",
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'lcm_rollups'"
         )
-        .get(),
+        .get()
     ).toBeTruthy();
     expect(
       db
         .prepare(
-          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'lcm_rollup_sources'",
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'lcm_rollup_sources'"
         )
-        .get(),
+        .get()
     ).toBeTruthy();
     expect(
       db
         .prepare(
-          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'lcm_rollup_state'",
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'lcm_rollup_state'"
         )
-        .get(),
+        .get()
     ).toBeTruthy();
     expect(
       db
         .prepare(
-          "SELECT name FROM sqlite_master WHERE type = 'view' AND name = 'daily_rollups'",
+          "SELECT name FROM sqlite_master WHERE type = 'view' AND name = 'daily_rollups'"
         )
-        .get(),
+        .get()
     ).toBeTruthy();
   });
 
@@ -86,32 +86,32 @@ describe("LCM temporal rollup MVP", () => {
 
     const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
     await expect(
-      builder.buildDayRollup(conversation.conversationId, "2026-04-27"),
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
     ).resolves.toBe(true);
     const first = rollupStore.getRollup(
       conversation.conversationId,
       "day",
-      "2026-04-27",
+      "2026-04-27"
     );
     expect(first?.status).toBe("ready");
     expect(first?.content).toContain("Daily Summary: 2026-04-27");
     expect(first?.source_summary_ids).toBe(
-      JSON.stringify(["sum_rollup_a", "sum_rollup_b"]),
+      JSON.stringify(["sum_rollup_a", "sum_rollup_b"])
     );
 
     await expect(
-      builder.buildDayRollup(conversation.conversationId, "2026-04-27"),
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
     ).resolves.toBe(true);
     const second = rollupStore.getRollup(
       conversation.conversationId,
       "day",
-      "2026-04-27",
+      "2026-04-27"
     );
     expect(second?.rollup_id).toBe(first?.rollup_id);
     expect(
       rollupStore
         .getRollupSources(second!.rollup_id)
-        .map((source) => source.source_id),
+        .map((source) => source.source_id)
     ).toEqual(["sum_rollup_a", "sum_rollup_b"]);
   });
 });
@@ -178,7 +178,7 @@ describe("LCM sub-day window retrieval", () => {
   it("parses deterministic local-time windows with DST-safe UTC bounds", () => {
     const dateWindow = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-03-08 1:30-3:30",
-      "America/New_York",
+      "America/New_York"
     );
     expect(dateWindow.label).toBe("2026-03-08 1:30-3:30");
     expect(dateWindow.window?.startMinutes).toBe(90);
@@ -188,7 +188,7 @@ describe("LCM sub-day window retrieval", () => {
 
     const namedWindow = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-04-27 morning",
-      "Asia/Bangkok",
+      "Asia/Bangkok"
     );
     expect(namedWindow.label).toBe("2026-04-27 morning");
     expect(namedWindow.start.toISOString()).toBe("2026-04-26T23:00:00.000Z");
@@ -270,5 +270,82 @@ describe("LCM sub-day window retrieval", () => {
     expect((result.details as { summaryIds?: string[] }).summaryIds).toEqual([
       "sum_inside_window",
     ]);
+  });
+});
+
+describe("LCM weekly and monthly rollups", () => {
+  it("builds aggregate week/month rollups from stable daily rollups", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "aggregate-rollups",
+      sessionKey: "agent:main:aggregate-rollups",
+      title: "Aggregate rollups",
+    });
+
+    for (const [summaryId, timestamp, content] of [
+      ["sum_mon", "2026-04-27T10:00:00.000Z", "Monday decision completed."],
+      ["sum_tue", "2026-04-28T10:00:00.000Z", "Tuesday rollout shipped."],
+      ["sum_may", "2026-05-01T10:00:00.000Z", "May follow-up issue created."],
+    ] as const) {
+      await summaryStore.insertSummary({
+        summaryId,
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content,
+        tokenCount: 10,
+        earliestAt: new Date(timestamp),
+        latestAt: new Date(timestamp),
+      });
+    }
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-28")
+    ).resolves.toBe(true);
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-05-01")
+    ).resolves.toBe(true);
+
+    await expect(
+      builder.buildWeeklyRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    await expect(
+      builder.buildMonthlyRollup(conversation.conversationId, "2026-04")
+    ).resolves.toBe(true);
+
+    const week = rollupStore.getRollup(
+      conversation.conversationId,
+      "week",
+      "2026-04-27"
+    );
+    expect(week?.status).toBe("ready");
+    expect(week?.content).toContain("Weekly Summary: 2026-04-27");
+    expect(
+      rollupStore
+        .getRollupSources(week!.rollup_id)
+        .map((source) => source.source_type)
+    ).toEqual(["rollup", "rollup", "rollup"]);
+
+    const month = rollupStore.getRollup(
+      conversation.conversationId,
+      "month",
+      "2026-04"
+    );
+    expect(month?.status).toBe("ready");
+    expect(month?.content).toContain("Monthly Summary: 2026-04");
+    expect(rollupStore.getRollupSources(month!.rollup_id)).toHaveLength(2);
+
+    const firstMonthId = month?.rollup_id;
+    await expect(
+      builder.buildMonthlyRollup(conversation.conversationId, "2026-04")
+    ).resolves.toBe(false);
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "month", "2026-04")
+        ?.rollup_id
+    ).toBe(firstMonthId);
   });
 });

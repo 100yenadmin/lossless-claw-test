@@ -31,6 +31,8 @@ export interface RollupStateRow {
   last_message_at: string | null;
   last_rollup_check_at: string | null;
   last_daily_build_at: string | null;
+  last_weekly_build_at: string | null;
+  last_monthly_build_at: string | null;
   pending_rebuild: number;
   updated_at: string;
 }
@@ -59,7 +61,9 @@ export interface LeafSummaryForDayRow {
 export class RollupStore {
   constructor(public db: DatabaseSync) {}
 
-  upsertRollup(input: Omit<RollupRow, "built_at" | "invalidated_at" | "error_text">): void {
+  upsertRollup(
+    input: Omit<RollupRow, "built_at" | "invalidated_at" | "error_text">
+  ): void {
     const rollupId = input.rollup_id || randomUUID();
 
     this.db
@@ -102,7 +106,7 @@ export class RollupStore {
           source_fingerprint = excluded.source_fingerprint,
           built_at = datetime('now'),
           invalidated_at = NULL,
-          error_text = NULL`,
+          error_text = NULL`
       )
       .run(
         rollupId,
@@ -121,14 +125,14 @@ export class RollupStore {
         input.coverage_start,
         input.coverage_end,
         input.summarizer_model,
-        input.source_fingerprint,
+        input.source_fingerprint
       );
   }
 
   getRollup(
     conversationId: number,
     periodKind: string,
-    periodKey: string,
+    periodKey: string
   ): RollupRow | null {
     const row = this.db
       .prepare(
@@ -156,7 +160,7 @@ export class RollupStore {
         FROM lcm_rollups
         WHERE conversation_id = ?
           AND period_kind = ?
-          AND period_key = ?`,
+          AND period_key = ?`
       )
       .get(conversationId, periodKind, periodKey) as RollupRow | undefined;
 
@@ -188,15 +192,20 @@ export class RollupStore {
           invalidated_at,
           error_text
         FROM lcm_rollups
-        WHERE rollup_id = ?`,
+        WHERE rollup_id = ?`
       )
       .get(rollupId) as RollupRow | undefined;
 
     return row ?? null;
   }
 
-  listRollups(conversationId: number, periodKind?: string, limit = 50): RollupRow[] {
-    const normalizedLimit = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 50;
+  listRollups(
+    conversationId: number,
+    periodKind?: string,
+    limit = 50
+  ): RollupRow[] {
+    const normalizedLimit =
+      Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 50;
     const sql = periodKind
       ? `SELECT
            rollup_id,
@@ -252,7 +261,48 @@ export class RollupStore {
 
     return (periodKind
       ? this.db.prepare(sql).all(conversationId, periodKind, normalizedLimit)
-      : this.db.prepare(sql).all(conversationId, normalizedLimit)) as unknown as RollupRow[];
+      : this.db
+          .prepare(sql)
+          .all(conversationId, normalizedLimit)) as unknown as RollupRow[];
+  }
+
+  listRollupsInRange(
+    conversationId: number,
+    periodKind: string,
+    start: string,
+    end: string
+  ): RollupRow[] {
+    return this.db
+      .prepare(
+        `SELECT
+          rollup_id,
+          conversation_id,
+          period_kind,
+          period_key,
+          period_start,
+          period_end,
+          timezone,
+          content,
+          token_count,
+          source_summary_ids,
+          source_message_count,
+          source_token_count,
+          status,
+          coverage_start,
+          coverage_end,
+          summarizer_model,
+          source_fingerprint,
+          built_at,
+          invalidated_at,
+          error_text
+         FROM lcm_rollups
+         WHERE conversation_id = ?
+           AND period_kind = ?
+           AND period_start >= ?
+           AND period_start < ?
+         ORDER BY period_start ASC`
+      )
+      .all(conversationId, periodKind, start, end) as unknown as RollupRow[];
   }
 
   markStale(rollupId: string): void {
@@ -261,18 +311,22 @@ export class RollupStore {
         `UPDATE lcm_rollups
          SET status = 'stale',
              invalidated_at = datetime('now')
-         WHERE rollup_id = ?`,
+         WHERE rollup_id = ?`
       )
       .run(rollupId);
   }
 
   deleteRollup(rollupId: string): void {
-    this.db.prepare(`DELETE FROM lcm_rollups WHERE rollup_id = ?`).run(rollupId);
+    this.db
+      .prepare(`DELETE FROM lcm_rollups WHERE rollup_id = ?`)
+      .run(rollupId);
   }
 
   replaceRollupSources(rollupId: string, sources: RollupSourceInput[]): void {
     void withDatabaseTransaction(this.db, "BEGIN", () => {
-      this.db.prepare(`DELETE FROM lcm_rollup_sources WHERE rollup_id = ?`).run(rollupId);
+      this.db
+        .prepare(`DELETE FROM lcm_rollup_sources WHERE rollup_id = ?`)
+        .run(rollupId);
 
       if (sources.length === 0) {
         return;
@@ -280,7 +334,7 @@ export class RollupStore {
 
       const insert = this.db.prepare(
         `INSERT INTO lcm_rollup_sources (rollup_id, source_type, source_id, ordinal)
-         VALUES (?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?)`
       );
 
       for (const source of sources) {
@@ -289,13 +343,15 @@ export class RollupStore {
     });
   }
 
-  getRollupSources(rollupId: string): Array<{ source_type: string; source_id: string; ordinal: number }> {
+  getRollupSources(
+    rollupId: string
+  ): Array<{ source_type: string; source_id: string; ordinal: number }> {
     return this.db
       .prepare(
         `SELECT source_type, source_id, ordinal
          FROM lcm_rollup_sources
          WHERE rollup_id = ?
-         ORDER BY ordinal ASC`,
+         ORDER BY ordinal ASC`
       )
       .all(rollupId) as unknown as RollupSourceRow[];
   }
@@ -309,10 +365,12 @@ export class RollupStore {
           last_message_at,
           last_rollup_check_at,
           last_daily_build_at,
+          last_weekly_build_at,
+          last_monthly_build_at,
           pending_rebuild,
           updated_at
          FROM lcm_rollup_state
-         WHERE conversation_id = ?`,
+         WHERE conversation_id = ?`
       )
       .get(conversationId) as RollupStateRow | undefined;
 
@@ -327,7 +385,7 @@ export class RollupStore {
           timezone,
           updated_at
         ) VALUES (?, ?, datetime('now'))
-        ON CONFLICT(conversation_id) DO NOTHING`,
+        ON CONFLICT(conversation_id) DO NOTHING`
       )
       .run(conversationId, updates.timezone ?? "UTC");
 
@@ -337,7 +395,7 @@ export class RollupStore {
           `UPDATE lcm_rollup_state
            SET timezone = ?,
                updated_at = datetime('now')
-           WHERE conversation_id = ?`,
+           WHERE conversation_id = ?`
         )
         .run(updates.timezone, conversationId);
     }
@@ -348,7 +406,7 @@ export class RollupStore {
           `UPDATE lcm_rollup_state
            SET last_message_at = ?,
                updated_at = datetime('now')
-           WHERE conversation_id = ?`,
+           WHERE conversation_id = ?`
         )
         .run(updates.last_message_at, conversationId);
     }
@@ -359,7 +417,7 @@ export class RollupStore {
           `UPDATE lcm_rollup_state
            SET last_rollup_check_at = ?,
                updated_at = datetime('now')
-           WHERE conversation_id = ?`,
+           WHERE conversation_id = ?`
         )
         .run(updates.last_rollup_check_at, conversationId);
     }
@@ -370,9 +428,31 @@ export class RollupStore {
           `UPDATE lcm_rollup_state
            SET last_daily_build_at = ?,
                updated_at = datetime('now')
-           WHERE conversation_id = ?`,
+           WHERE conversation_id = ?`
         )
         .run(updates.last_daily_build_at, conversationId);
+    }
+
+    if (updates.last_weekly_build_at !== undefined) {
+      this.db
+        .prepare(
+          `UPDATE lcm_rollup_state
+           SET last_weekly_build_at = ?,
+               updated_at = datetime('now')
+           WHERE conversation_id = ?`
+        )
+        .run(updates.last_weekly_build_at, conversationId);
+    }
+
+    if (updates.last_monthly_build_at !== undefined) {
+      this.db
+        .prepare(
+          `UPDATE lcm_rollup_state
+           SET last_monthly_build_at = ?,
+               updated_at = datetime('now')
+           WHERE conversation_id = ?`
+        )
+        .run(updates.last_monthly_build_at, conversationId);
     }
 
     if (updates.pending_rebuild !== undefined) {
@@ -381,7 +461,7 @@ export class RollupStore {
           `UPDATE lcm_rollup_state
            SET pending_rebuild = ?,
                updated_at = datetime('now')
-           WHERE conversation_id = ?`,
+           WHERE conversation_id = ?`
         )
         .run(updates.pending_rebuild, conversationId);
     }
@@ -390,7 +470,7 @@ export class RollupStore {
   getLeafSummariesForDay(
     conversationId: number,
     dayStart: string,
-    dayEnd: string,
+    dayEnd: string
   ): Array<{
     summary_id: string;
     content: string;
@@ -413,8 +493,12 @@ export class RollupStore {
            AND kind = 'leaf'
            AND coalesce(latest_at, earliest_at, created_at) >= ?
            AND coalesce(latest_at, earliest_at, created_at) < ?
-         ORDER BY coalesce(latest_at, earliest_at, created_at) ASC, created_at ASC`,
+         ORDER BY coalesce(latest_at, earliest_at, created_at) ASC, created_at ASC`
       )
-      .all(conversationId, dayStart, dayEnd) as unknown as LeafSummaryForDayRow[];
+      .all(
+        conversationId,
+        dayStart,
+        dayEnd
+      ) as unknown as LeafSummaryForDayRow[];
   }
 }

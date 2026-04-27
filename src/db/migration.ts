@@ -59,21 +59,33 @@ const VERSIONED_BACKFILL_STEPS = {
 type VersionedBackfillStepName = keyof typeof VERSIONED_BACKFILL_STEPS;
 
 function ensureSummaryDepthColumn(db: DatabaseSync): void {
-  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
+  const summaryColumns = db
+    .prepare(`PRAGMA table_info(summaries)`)
+    .all() as SummaryColumnInfo[];
   const hasDepth = summaryColumns.some((col) => col.name === "depth");
   if (!hasDepth) {
-    db.exec(`ALTER TABLE summaries ADD COLUMN depth INTEGER NOT NULL DEFAULT 0`);
+    db.exec(
+      `ALTER TABLE summaries ADD COLUMN depth INTEGER NOT NULL DEFAULT 0`
+    );
   }
 }
 
 function ensureSummaryMetadataColumns(db: DatabaseSync): void {
-  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
-  const hasEarliestAt = summaryColumns.some((col) => col.name === "earliest_at");
+  const summaryColumns = db
+    .prepare(`PRAGMA table_info(summaries)`)
+    .all() as SummaryColumnInfo[];
+  const hasEarliestAt = summaryColumns.some(
+    (col) => col.name === "earliest_at"
+  );
   const hasLatestAt = summaryColumns.some((col) => col.name === "latest_at");
-  const hasDescendantCount = summaryColumns.some((col) => col.name === "descendant_count");
-  const hasDescendantTokenCount = summaryColumns.some((col) => col.name === "descendant_token_count");
+  const hasDescendantCount = summaryColumns.some(
+    (col) => col.name === "descendant_count"
+  );
+  const hasDescendantTokenCount = summaryColumns.some(
+    (col) => col.name === "descendant_token_count"
+  );
   const hasSourceMessageTokenCount = summaryColumns.some(
-    (col) => col.name === "source_message_token_count",
+    (col) => col.name === "source_message_token_count"
   );
 
   if (!hasEarliestAt) {
@@ -83,13 +95,19 @@ function ensureSummaryMetadataColumns(db: DatabaseSync): void {
     db.exec(`ALTER TABLE summaries ADD COLUMN latest_at TEXT`);
   }
   if (!hasDescendantCount) {
-    db.exec(`ALTER TABLE summaries ADD COLUMN descendant_count INTEGER NOT NULL DEFAULT 0`);
+    db.exec(
+      `ALTER TABLE summaries ADD COLUMN descendant_count INTEGER NOT NULL DEFAULT 0`
+    );
   }
   if (!hasDescendantTokenCount) {
-    db.exec(`ALTER TABLE summaries ADD COLUMN descendant_token_count INTEGER NOT NULL DEFAULT 0`);
+    db.exec(
+      `ALTER TABLE summaries ADD COLUMN descendant_token_count INTEGER NOT NULL DEFAULT 0`
+    );
   }
   if (!hasSourceMessageTokenCount) {
-    db.exec(`ALTER TABLE summaries ADD COLUMN source_message_token_count INTEGER NOT NULL DEFAULT 0`);
+    db.exec(
+      `ALTER TABLE summaries ADD COLUMN source_message_token_count INTEGER NOT NULL DEFAULT 0`
+    );
   }
 }
 
@@ -102,69 +120,99 @@ function isoStringOrNull(value: Date | null): string | null {
 }
 
 function ensureSummaryModelColumn(db: DatabaseSync): void {
-  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
+  const summaryColumns = db
+    .prepare(`PRAGMA table_info(summaries)`)
+    .all() as SummaryColumnInfo[];
   const hasModel = summaryColumns.some((col) => col.name === "model");
   if (!hasModel) {
-    db.exec(`ALTER TABLE summaries ADD COLUMN model TEXT NOT NULL DEFAULT 'unknown'`);
+    db.exec(
+      `ALTER TABLE summaries ADD COLUMN model TEXT NOT NULL DEFAULT 'unknown'`
+    );
   }
 }
 
 function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
-  const telemetryColumns = db.prepare(`PRAGMA table_info(conversation_compaction_telemetry)`).all() as SummaryColumnInfo[];
+  const telemetryColumns = db
+    .prepare(`PRAGMA table_info(conversation_compaction_telemetry)`)
+    .all() as SummaryColumnInfo[];
   const hasConsecutiveColdObservations = telemetryColumns.some(
-    (col) => col.name === "consecutive_cold_observations",
+    (col) => col.name === "consecutive_cold_observations"
   );
-  const hasLastLeafCompactionAt = telemetryColumns.some((col) => col.name === "last_leaf_compaction_at");
-  const hasTurnsSinceLeafCompaction = telemetryColumns.some((col) => col.name === "turns_since_leaf_compaction");
+  const hasLastLeafCompactionAt = telemetryColumns.some(
+    (col) => col.name === "last_leaf_compaction_at"
+  );
+  const hasTurnsSinceLeafCompaction = telemetryColumns.some(
+    (col) => col.name === "turns_since_leaf_compaction"
+  );
   const hasTokensAccumulatedSinceLeafCompaction = telemetryColumns.some(
-    (col) => col.name === "tokens_accumulated_since_leaf_compaction",
+    (col) => col.name === "tokens_accumulated_since_leaf_compaction"
   );
-  const hasLastActivityBand = telemetryColumns.some((col) => col.name === "last_activity_band");
-  const hasLastApiCallAt = telemetryColumns.some((col) => col.name === "last_api_call_at");
-  const hasLastCacheTouchAt = telemetryColumns.some((col) => col.name === "last_cache_touch_at");
+  const hasLastActivityBand = telemetryColumns.some(
+    (col) => col.name === "last_activity_band"
+  );
+  const hasLastApiCallAt = telemetryColumns.some(
+    (col) => col.name === "last_api_call_at"
+  );
+  const hasLastCacheTouchAt = telemetryColumns.some(
+    (col) => col.name === "last_cache_touch_at"
+  );
   const hasProvider = telemetryColumns.some((col) => col.name === "provider");
   const hasModel = telemetryColumns.some((col) => col.name === "model");
 
   if (!hasConsecutiveColdObservations) {
     db.exec(
-      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN consecutive_cold_observations INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN consecutive_cold_observations INTEGER NOT NULL DEFAULT 0`
     );
   }
   if (!hasLastLeafCompactionAt) {
-    db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_leaf_compaction_at TEXT`);
+    db.exec(
+      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_leaf_compaction_at TEXT`
+    );
   }
   if (!hasTurnsSinceLeafCompaction) {
     db.exec(
-      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN turns_since_leaf_compaction INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN turns_since_leaf_compaction INTEGER NOT NULL DEFAULT 0`
     );
   }
   if (!hasTokensAccumulatedSinceLeafCompaction) {
     db.exec(
-      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN tokens_accumulated_since_leaf_compaction INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN tokens_accumulated_since_leaf_compaction INTEGER NOT NULL DEFAULT 0`
     );
   }
   if (!hasLastActivityBand) {
     db.exec(
-      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_activity_band TEXT NOT NULL DEFAULT 'low' CHECK (last_activity_band IN ('low', 'medium', 'high'))`,
+      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_activity_band TEXT NOT NULL DEFAULT 'low' CHECK (last_activity_band IN ('low', 'medium', 'high'))`
     );
   }
   if (!hasLastApiCallAt) {
-    db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_api_call_at TEXT`);
+    db.exec(
+      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_api_call_at TEXT`
+    );
   }
   if (!hasLastCacheTouchAt) {
-    db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_cache_touch_at TEXT`);
+    db.exec(
+      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_cache_touch_at TEXT`
+    );
   }
   if (!hasProvider) {
-    db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN provider TEXT`);
+    db.exec(
+      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN provider TEXT`
+    );
   }
   if (!hasModel) {
-    db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN model TEXT`);
+    db.exec(
+      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN model TEXT`
+    );
   }
 }
 
 function ensureMessageIdentityHashColumn(db: DatabaseSync): void {
-  const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
-  const hasIdentityHash = messageColumns.some((col) => col.name === "identity_hash");
+  const messageColumns = db
+    .prepare(`PRAGMA table_info(messages)`)
+    .all() as SummaryColumnInfo[];
+  const hasIdentityHash = messageColumns.some(
+    (col) => col.name === "identity_hash"
+  );
   if (!hasIdentityHash) {
     db.exec(`ALTER TABLE messages ADD COLUMN identity_hash TEXT`);
   }
@@ -177,20 +225,28 @@ function backfillMessageIdentityHashes(db: DatabaseSync): void {
      WHERE message_id > ?
        AND (identity_hash IS NULL OR identity_hash = '')
      ORDER BY message_id
-     LIMIT ?`,
+     LIMIT ?`
   );
-  const updateStmt = db.prepare(`UPDATE messages SET identity_hash = ? WHERE message_id = ?`);
+  const updateStmt = db.prepare(
+    `UPDATE messages SET identity_hash = ? WHERE message_id = ?`
+  );
   let lastProcessedMessageId = 0;
 
   while (true) {
-    const rows = selectStmt.all(lastProcessedMessageId, 1_000) as MessageIdentityBackfillRow[];
+    const rows = selectStmt.all(
+      lastProcessedMessageId,
+      1_000
+    ) as MessageIdentityBackfillRow[];
     if (rows.length === 0) {
       return;
     }
     db.exec(`BEGIN`);
     try {
       for (const row of rows) {
-        updateStmt.run(buildMessageIdentityHash(row.role, row.content), row.message_id);
+        updateStmt.run(
+          buildMessageIdentityHash(row.role, row.content),
+          row.message_id
+        );
       }
       db.exec(`COMMIT`);
     } catch (error) {
@@ -201,7 +257,8 @@ function backfillMessageIdentityHashes(db: DatabaseSync): void {
       }
       throw error;
     }
-    lastProcessedMessageId = rows[rows.length - 1]?.message_id ?? lastProcessedMessageId;
+    lastProcessedMessageId =
+      rows[rows.length - 1]?.message_id ?? lastProcessedMessageId;
   }
 }
 
@@ -212,37 +269,43 @@ function describeMigrationError(error: unknown): string {
 function runMigrationStep(
   name: string,
   log: MigrationLogger | undefined,
-  step: () => void,
+  step: () => void
 ): void {
   const startedAt = Date.now();
   try {
     step();
     log?.info?.(
-      `[lcm] migration step complete: step=${name} durationMs=${Date.now() - startedAt}`,
+      `[lcm] migration step complete: step=${name} durationMs=${
+        Date.now() - startedAt
+      }`
     );
   } catch (error) {
     log?.info?.(
-      `[lcm] migration step failed: step=${name} durationMs=${Date.now() - startedAt} error=${describeMigrationError(error)}`,
+      `[lcm] migration step failed: step=${name} durationMs=${
+        Date.now() - startedAt
+      } error=${describeMigrationError(error)}`
     );
     throw error;
   }
 }
 
-function getVersionedBackfillSavepointName(stepName: VersionedBackfillStepName): string {
+function getVersionedBackfillSavepointName(
+  stepName: VersionedBackfillStepName
+): string {
   return `lcm_backfill_${stepName}`;
 }
 
 function hasCompletedVersionedBackfill(
   db: DatabaseSync,
   stepName: VersionedBackfillStepName,
-  algorithmVersion: number,
+  algorithmVersion: number
 ): boolean {
   const row = db
     .prepare(
       `SELECT 1
        FROM lcm_migration_state
        WHERE step_name = ? AND algorithm_version = ?
-       LIMIT 1`,
+       LIMIT 1`
     )
     .get(stepName, algorithmVersion) as { 1?: number } | undefined;
   return row != null;
@@ -251,13 +314,13 @@ function hasCompletedVersionedBackfill(
 function markVersionedBackfillComplete(
   db: DatabaseSync,
   stepName: VersionedBackfillStepName,
-  algorithmVersion: number,
+  algorithmVersion: number
 ): void {
   db.prepare(
     `INSERT INTO lcm_migration_state (step_name, algorithm_version, completed_at)
      VALUES (?, ?, datetime('now'))
      ON CONFLICT(step_name, algorithm_version)
-     DO UPDATE SET completed_at = excluded.completed_at`,
+     DO UPDATE SET completed_at = excluded.completed_at`
   ).run(stepName, algorithmVersion);
 }
 
@@ -273,12 +336,12 @@ function runVersionedBackfillStep(
   db: DatabaseSync,
   stepName: VersionedBackfillStepName,
   log: MigrationLogger | undefined,
-  step: () => void,
+  step: () => void
 ): void {
   const algorithmVersion = VERSIONED_BACKFILL_STEPS[stepName];
   if (hasCompletedVersionedBackfill(db, stepName, algorithmVersion)) {
     log?.info?.(
-      `[lcm] migration step skipped: step=${stepName} algorithmVersion=${algorithmVersion} reason=already-complete`,
+      `[lcm] migration step skipped: step=${stepName} algorithmVersion=${algorithmVersion} reason=already-complete`
     );
     return;
   }
@@ -293,12 +356,16 @@ function runVersionedBackfillStep(
     markVersionedBackfillComplete(db, stepName, algorithmVersion);
     db.exec(`RELEASE SAVEPOINT ${savepointName}`);
     log?.info?.(
-      `[lcm] migration step complete: step=${stepName} algorithmVersion=${algorithmVersion} durationMs=${Date.now() - startedAt}`,
+      `[lcm] migration step complete: step=${stepName} algorithmVersion=${algorithmVersion} durationMs=${
+        Date.now() - startedAt
+      }`
     );
   } catch (error) {
     rollbackSavepoint(db, savepointName);
     log?.info?.(
-      `[lcm] migration step failed: step=${stepName} algorithmVersion=${algorithmVersion} durationMs=${Date.now() - startedAt} error=${describeMigrationError(error)}`,
+      `[lcm] migration step failed: step=${stepName} algorithmVersion=${algorithmVersion} durationMs=${
+        Date.now() - startedAt
+      } error=${describeMigrationError(error)}`
     );
     throw error;
   }
@@ -309,13 +376,17 @@ function backfillSummaryDepths(db: DatabaseSync): void {
   db.exec(`UPDATE summaries SET depth = 0 WHERE kind = 'leaf'`);
 
   const conversationRows = db
-    .prepare(`SELECT DISTINCT conversation_id FROM summaries WHERE kind = 'condensed'`)
+    .prepare(
+      `SELECT DISTINCT conversation_id FROM summaries WHERE kind = 'condensed'`
+    )
     .all() as Array<{ conversation_id: number }>;
   if (conversationRows.length === 0) {
     return;
   }
 
-  const updateDepthStmt = db.prepare(`UPDATE summaries SET depth = ? WHERE summary_id = ?`);
+  const updateDepthStmt = db.prepare(
+    `UPDATE summaries SET depth = ? WHERE summary_id = ?`
+  );
 
   for (const row of conversationRows) {
     const conversationId = row.conversation_id;
@@ -323,7 +394,7 @@ function backfillSummaryDepths(db: DatabaseSync): void {
       .prepare(
         `SELECT summary_id, conversation_id, kind, depth, token_count, created_at
          FROM summaries
-         WHERE conversation_id = ?`,
+         WHERE conversation_id = ?`
       )
       .all(conversationId) as SummaryDepthRow[];
 
@@ -344,7 +415,7 @@ function backfillSummaryDepths(db: DatabaseSync): void {
          WHERE summary_id IN (
            SELECT summary_id FROM summaries
            WHERE conversation_id = ? AND kind = 'condensed'
-         )`,
+         )`
       )
       .all(conversationId) as SummaryParentEdgeRow[];
     const parentsBySummaryId = new Map<string, string[]>();
@@ -419,7 +490,7 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
     `UPDATE summaries
      SET earliest_at = ?, latest_at = ?, descendant_count = ?,
          descendant_token_count = ?, source_message_token_count = ?
-     WHERE summary_id = ?`,
+     WHERE summary_id = ?`
   );
 
   for (const conversationRow of conversationRows) {
@@ -429,7 +500,7 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
         `SELECT summary_id, conversation_id, kind, depth, token_count, created_at
          FROM summaries
          WHERE conversation_id = ?
-         ORDER BY depth ASC, created_at ASC`,
+         ORDER BY depth ASC, created_at ASC`
       )
       .all(conversationId) as SummaryDepthRow[];
     if (summaries.length === 0) {
@@ -447,7 +518,7 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
          JOIN messages m ON m.message_id = sm.message_id
          JOIN summaries s ON s.summary_id = sm.summary_id
          WHERE s.conversation_id = ? AND s.kind = 'leaf'
-         GROUP BY sm.summary_id`,
+         GROUP BY sm.summary_id`
       )
       .all(conversationId) as SummaryMessageTimeRangeRow[];
     const leafRangeBySummaryId = new Map(
@@ -458,7 +529,7 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
           latestAt: row.latest_at,
           sourceMessageTokenCount: row.source_message_token_count,
         },
-      ]),
+      ])
     );
 
     const edges = db
@@ -467,7 +538,7 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
          FROM summary_parents
          WHERE summary_id IN (
            SELECT summary_id FROM summaries WHERE conversation_id = ?
-         )`,
+         )`
       )
       .all(conversationId) as SummaryParentEdgeRow[];
     const parentsBySummaryId = new Map<string, string[]>();
@@ -488,15 +559,21 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
       }
     >();
     const tokenCountBySummaryId = new Map(
-      summaries.map((summary) => [summary.summary_id, Math.max(0, Math.floor(summary.token_count ?? 0))]),
+      summaries.map((summary) => [
+        summary.summary_id,
+        Math.max(0, Math.floor(summary.token_count ?? 0)),
+      ])
     );
 
     for (const summary of summaries) {
       const fallbackDate = parseTimestamp(summary.created_at);
       if (summary.kind === "leaf") {
         const range = leafRangeBySummaryId.get(summary.summary_id);
-        const earliestAt = parseTimestamp(range?.earliestAt ?? summary.created_at) ?? fallbackDate;
-        const latestAt = parseTimestamp(range?.latestAt ?? summary.created_at) ?? fallbackDate;
+        const earliestAt =
+          parseTimestamp(range?.earliestAt ?? summary.created_at) ??
+          fallbackDate;
+        const latestAt =
+          parseTimestamp(range?.latestAt ?? summary.created_at) ?? fallbackDate;
 
         metadataBySummaryId.set(summary.summary_id, {
           earliestAt,
@@ -505,7 +582,7 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
           descendantTokenCount: 0,
           sourceMessageTokenCount: Math.max(
             0,
-            Math.floor(range?.sourceMessageTokenCount ?? 0),
+            Math.floor(range?.sourceMessageTokenCount ?? 0)
           ),
         });
         continue;
@@ -548,8 +625,12 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
         descendantCount += Math.max(0, parentMetadata.descendantCount) + 1;
         const parentTokenCount = tokenCountBySummaryId.get(parentId) ?? 0;
         descendantTokenCount +=
-          Math.max(0, parentTokenCount) + Math.max(0, parentMetadata.descendantTokenCount);
-        sourceMessageTokenCount += Math.max(0, parentMetadata.sourceMessageTokenCount);
+          Math.max(0, parentTokenCount) +
+          Math.max(0, parentMetadata.descendantTokenCount);
+        sourceMessageTokenCount += Math.max(
+          0,
+          parentMetadata.sourceMessageTokenCount
+        );
       }
 
       metadataBySummaryId.set(summary.summary_id, {
@@ -573,7 +654,7 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
         Math.max(0, metadata.descendantCount),
         Math.max(0, metadata.descendantTokenCount),
         Math.max(0, metadata.sourceMessageTokenCount),
-        summary.summary_id,
+        summary.summary_id
       );
     }
   }
@@ -603,7 +684,7 @@ function backfillToolCallColumns(db: DatabaseSync): void {
          json_extract(metadata, '$.raw.call_id'),
          json_extract(metadata, '$.raw.toolCallId'),
          json_extract(metadata, '$.raw.tool_call_id')
-       ) IS NOT NULL`,
+       ) IS NOT NULL`
   );
 
   db.exec(
@@ -621,7 +702,7 @@ function backfillToolCallColumns(db: DatabaseSync): void {
          json_extract(metadata, '$.raw.name'),
          json_extract(metadata, '$.raw.toolName'),
          json_extract(metadata, '$.raw.tool_name')
-       ) IS NOT NULL`,
+       ) IS NOT NULL`
   );
 
   db.exec(
@@ -637,7 +718,7 @@ function backfillToolCallColumns(db: DatabaseSync): void {
          json_extract(metadata, '$.raw.input'),
          json_extract(metadata, '$.raw.arguments'),
          json_extract(metadata, '$.raw.toolInput')
-       ) IS NOT NULL`,
+       ) IS NOT NULL`
   );
 }
 
@@ -647,12 +728,16 @@ function getExistingTableNames(db: DatabaseSync, names: string[]): Set<string> {
   }
   const placeholders = names.map(() => "?").join(", ");
   const rows = db
-    .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (${placeholders})`)
+    .prepare(
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (${placeholders})`
+    )
     .all(...names) as TableNameRow[];
   return new Set(
     rows
       .map((row) => row.name)
-      .filter((name): name is string => typeof name === "string" && name.length > 0),
+      .filter(
+        (name): name is string => typeof name === "string" && name.length > 0
+      )
   );
 }
 
@@ -673,9 +758,15 @@ function quoteSqlIdentifier(identifier: string): string {
   return `"${identifier.replaceAll(`"`, `""`)}"`;
 }
 
-function shouldRecreateStandaloneFtsTable(db: DatabaseSync, spec: FtsTableSpec): boolean {
+function shouldRecreateStandaloneFtsTable(
+  db: DatabaseSync,
+  spec: FtsTableSpec
+): boolean {
   const shadowTables = getFtsShadowTableNames(spec.tableName);
-  const existingTables = getExistingTableNames(db, [spec.tableName, ...shadowTables]);
+  const existingTables = getExistingTableNames(db, [
+    spec.tableName,
+    ...shadowTables,
+  ]);
   if (!existingTables.has(spec.tableName)) {
     return true;
   }
@@ -698,11 +789,31 @@ function shouldRecreateStandaloneFtsTable(db: DatabaseSync, spec: FtsTableSpec):
     const columnNames = new Set(
       columns
         .map((col) => col.name)
-        .filter((name): name is string => typeof name === "string" && name.length > 0),
+        .filter(
+          (name): name is string => typeof name === "string" && name.length > 0
+        )
     );
     return spec.expectedColumns.some((column) => !columnNames.has(column));
   } catch {
     return true;
+  }
+}
+
+function addColumnIfMissing(
+  db: DatabaseSync,
+  tableName: string,
+  columnName: string,
+  columnDefinition: string
+): void {
+  const columns = db
+    .prepare(`PRAGMA table_info(${quoteSqlIdentifier(tableName)})`)
+    .all() as SummaryColumnInfo[];
+  if (!columns.some((col) => col.name === columnName)) {
+    db.exec(
+      `ALTER TABLE ${quoteSqlIdentifier(
+        tableName
+      )} ADD COLUMN ${quoteSqlIdentifier(columnName)} ${columnDefinition}`
+    );
   }
 }
 
@@ -721,7 +832,7 @@ function ensureStandaloneFtsTable(db: DatabaseSync, spec: FtsTableSpec): void {
 
 export function runLcmMigrations(
   db: DatabaseSync,
-  options?: { fts5Available?: boolean; log?: MigrationLogger },
+  options?: { fts5Available?: boolean; log?: MigrationLogger }
 ): void {
   const log = options?.log;
   db.exec(`
@@ -914,25 +1025,35 @@ export function runLcmMigrations(
   `);
 
   // Forward-compatible conversations migration for existing DBs.
-  const conversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all() as Array<{
+  const conversationColumns = db
+    .prepare(`PRAGMA table_info(conversations)`)
+    .all() as Array<{
     name?: string;
   }>;
-  const hasBootstrappedAt = conversationColumns.some((col) => col.name === "bootstrapped_at");
+  const hasBootstrappedAt = conversationColumns.some(
+    (col) => col.name === "bootstrapped_at"
+  );
   if (!hasBootstrappedAt) {
     db.exec(`ALTER TABLE conversations ADD COLUMN bootstrapped_at TEXT`);
   }
 
-  const hasSessionKey = conversationColumns.some((col) => col.name === "session_key");
+  const hasSessionKey = conversationColumns.some(
+    (col) => col.name === "session_key"
+  );
   if (!hasSessionKey) {
     db.exec(`ALTER TABLE conversations ADD COLUMN session_key TEXT`);
   }
 
   const hasActive = conversationColumns.some((col) => col.name === "active");
   if (!hasActive) {
-    db.exec(`ALTER TABLE conversations ADD COLUMN active INTEGER NOT NULL DEFAULT 1`);
+    db.exec(
+      `ALTER TABLE conversations ADD COLUMN active INTEGER NOT NULL DEFAULT 1`
+    );
   }
 
-  const hasArchivedAt = conversationColumns.some((col) => col.name === "archived_at");
+  const hasArchivedAt = conversationColumns.some(
+    (col) => col.name === "archived_at"
+  );
   if (!hasArchivedAt) {
     db.exec(`ALTER TABLE conversations ADD COLUMN archived_at TEXT`);
   }
@@ -952,38 +1073,44 @@ export function runLcmMigrations(
     ON conversations (session_id, active, created_at)
   `);
   db.exec(`DROP INDEX IF EXISTS conversations_session_key_idx`);
-  runMigrationStep("ensureSummaryDepthColumn", log, () => ensureSummaryDepthColumn(db));
-  runMigrationStep("ensureSummaryMetadataColumns", log, () =>
-    ensureSummaryMetadataColumns(db),
+  runMigrationStep("ensureSummaryDepthColumn", log, () =>
+    ensureSummaryDepthColumn(db)
   );
-  runMigrationStep("ensureSummaryModelColumn", log, () => ensureSummaryModelColumn(db));
+  runMigrationStep("ensureSummaryMetadataColumns", log, () =>
+    ensureSummaryMetadataColumns(db)
+  );
+  runMigrationStep("ensureSummaryModelColumn", log, () =>
+    ensureSummaryModelColumn(db)
+  );
   runMigrationStep("ensureMessageIdentityHashColumn", log, () =>
-    ensureMessageIdentityHashColumn(db),
+    ensureMessageIdentityHashColumn(db)
   );
   runMigrationStep("backfillMessageIdentityHashes", log, () =>
-    backfillMessageIdentityHashes(db),
+    backfillMessageIdentityHashes(db)
   );
   runMigrationStep("createMessagesIdentityHashIndex", log, () =>
     db.exec(
-      `CREATE INDEX IF NOT EXISTS messages_conv_identity_hash_idx ON messages (conversation_id, identity_hash)`,
-    ),
+      `CREATE INDEX IF NOT EXISTS messages_conv_identity_hash_idx ON messages (conversation_id, identity_hash)`
+    )
   );
   runMigrationStep("ensureCompactionTelemetryColumns", log, () =>
-    ensureCompactionTelemetryColumns(db),
+    ensureCompactionTelemetryColumns(db)
   );
-  runVersionedBackfillStep(db, "backfillSummaryDepths", log, () => backfillSummaryDepths(db));
+  runVersionedBackfillStep(db, "backfillSummaryDepths", log, () =>
+    backfillSummaryDepths(db)
+  );
   // Index on depth — created AFTER backfillSummaryDepths to avoid index
   // maintenance overhead during bulk depth updates on large existing DBs.
   runMigrationStep("createSummariesDepthIndex", log, () =>
     db.exec(
-      `CREATE INDEX IF NOT EXISTS summaries_conv_depth_kind_idx ON summaries (conversation_id, depth, kind)`,
-    ),
+      `CREATE INDEX IF NOT EXISTS summaries_conv_depth_kind_idx ON summaries (conversation_id, depth, kind)`
+    )
   );
   runVersionedBackfillStep(db, "backfillSummaryMetadata", log, () =>
-    backfillSummaryMetadata(db),
+    backfillSummaryMetadata(db)
   );
   runVersionedBackfillStep(db, "backfillToolCallColumns", log, () =>
-    backfillToolCallColumns(db),
+    backfillToolCallColumns(db)
   );
 
   runMigrationStep("ensureRollupTables", log, () => {
@@ -1026,10 +1153,17 @@ export function runLcmMigrations(
         last_message_at TEXT,
         last_rollup_check_at TEXT,
         last_daily_build_at TEXT,
+        last_weekly_build_at TEXT,
+        last_monthly_build_at TEXT,
         pending_rebuild INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
     `);
+  });
+
+  runMigrationStep("ensureRollupStateAggregateColumns", log, () => {
+    addColumnIfMissing(db, "lcm_rollup_state", "last_weekly_build_at", "TEXT");
+    addColumnIfMissing(db, "lcm_rollup_state", "last_monthly_build_at", "TEXT");
   });
 
   runMigrationStep("ensureRollupIndexes", log, () => {
@@ -1062,13 +1196,16 @@ export function runLcmMigrations(
     `);
   });
 
-  const detectedFeatures = options?.fts5Available === false ? null : getLcmDbFeatures(db);
-  const fts5Available = options?.fts5Available ?? detectedFeatures?.fts5Available ?? false;
+  const detectedFeatures =
+    options?.fts5Available === false ? null : getLcmDbFeatures(db);
+  const fts5Available =
+    options?.fts5Available ?? detectedFeatures?.fts5Available ?? false;
   if (!fts5Available) {
     return;
   }
 
-  const trigramTokenizerAvailable = detectedFeatures?.trigramTokenizerAvailable ?? false;
+  const trigramTokenizerAvailable =
+    detectedFeatures?.trigramTokenizerAvailable ?? false;
   if (!trigramTokenizerAvailable) {
     try {
       db.exec(`DROP TABLE IF EXISTS summaries_fts_cjk`);

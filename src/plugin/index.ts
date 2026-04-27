@@ -20,6 +20,7 @@ import { createLcmExpandQueryTool } from "../tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
 import { createLcmRecentTool } from "../tools/lcm-recent-tool.js";
+import { createLcmRollupDebugTool } from "../tools/lcm-rollup-debug-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
 import type { LcmDependencies } from "../types.js";
 
@@ -1987,6 +1988,9 @@ function wirePluginHandlers(
   );
   api.registerTool((ctx) =>
     createLcmRecentTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  );
+  api.registerTool((ctx) =>
+    createLcmRollupDebugTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
   );
 
   api.registerCommand(

@@ -4148,8 +4148,11 @@ export class LcmContextEngine implements ContextEngine {
               conversation.conversationId,
               { daysBack: 7, forceCurrentDay: true },
             );
+            const aggregateResult = await this.rollupBuilder.buildWeeklyMonthlyRollups(
+              conversation.conversationId,
+            );
             this.deps.log.info(
-              `[lcm] maintain: daily rollups conversation=${conversation.conversationId} ${sessionLabel} built=${rollupResult.built} skipped=${rollupResult.skipped} errors=${rollupResult.errors.length}`,
+              `[lcm] maintain: rollups conversation=${conversation.conversationId} ${sessionLabel} dailyBuilt=${rollupResult.built} dailySkipped=${rollupResult.skipped} aggregateBuilt=${aggregateResult.built} aggregateSkipped=${aggregateResult.skipped} errors=${rollupResult.errors.length + aggregateResult.errors.length}`,
             );
           }
         } catch (error) {
