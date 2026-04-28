@@ -11,7 +11,7 @@ import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 const LcmRecentSchema = Type.Object({
   period: Type.String({
     description:
-      'Time period: "today", "yesterday", "7d", "week", "month", "30d", or "date:YYYY-MM-DD"',
+      'Time period: "today", "yesterday", "7d", "30d", "date:YYYY-MM-DD"; "week" and "month" are accepted as bounded fallback aliases until aggregate rollups land',
   }),
   conversationId: Type.Optional(
     Type.Number({
@@ -260,6 +260,12 @@ function formatSourcesLine(summaryIds: string[], includeSources: boolean): strin
   return `*Sources: ${summaryIds.join(", ")}*`;
 }
 
+function formatDrilldownHint(includeSources: boolean): string {
+  return includeSources
+    ? "*Drill down: Use lcm_expand_query with these summaryIds for deeper recall*"
+    : "*Drill down: Re-run with includeSources=true to reveal summaryIds for expansion*";
+}
+
 function combineRollups(rollups: RollupRecord[]): {
   content: string;
   tokenCount: number;
@@ -304,8 +310,8 @@ function getRecentSummaryFallback(
         kind,
         content,
         token_count,
-        created_at,
-        coalesce(latest_at, earliest_at, created_at) AS effective_time
+        strftime('%Y-%m-%dT%H:%M:%fZ', created_at) AS created_at,
+        strftime('%Y-%m-%dT%H:%M:%fZ', coalesce(latest_at, earliest_at, created_at)) AS effective_time
        FROM summaries
        WHERE ${scopeClause}
          kind = 'leaf'
@@ -397,7 +403,7 @@ export function createLcmRecentTool(input: {
         }
         lines.push("---");
         lines.push(formatSourcesLine(summaryIds, includeSources));
-        lines.push("*Drill down: Use lcm_expand_query with matching summaryIds for deeper recall*");
+        lines.push(formatDrilldownHint(includeSources));
 
         return {
           content: [{ type: "text", text: lines.join("\n") }],
@@ -418,7 +424,12 @@ export function createLcmRecentTool(input: {
       let sourceSummaryIds: string[] = [];
 
       if (resolution.kind && resolution.periodKey) {
-        const rollup = rollupStore.getRollup(conversationId, resolution.kind, resolution.periodKey);
+        const rollup = rollupStore.getRollup(
+          conversationId,
+          resolution.kind,
+          resolution.periodKey,
+          timezone
+        );
         if (rollup && (rollup.status === "ready" || rollup.status === "stale")) {
           rollupContent = rollup.content;
           tokenCount = rollup.token_count;
@@ -427,6 +438,7 @@ export function createLcmRecentTool(input: {
         }
       } else if (resolution.kind) {
         const rollups = rollupStore.listRollups(conversationId, resolution.kind, 200)
+          .filter((rollup) => rollup.timezone === timezone)
           .filter((rollup) => new Date(rollup.period_start) >= resolution.start && new Date(rollup.period_start) < resolution.end);
         const usableRollups = rollups.filter((rollup) => rollup.status === "ready" || rollup.status === "stale").map((rollup) => ({
           rollupId: rollup.rollup_id,
@@ -504,7 +516,7 @@ export function createLcmRecentTool(input: {
         }
         lines.push("---");
         lines.push(formatSourcesLine(sourceSummaryIds, includeSources));
-        lines.push("*Drill down: Use lcm_expand_query with these summaryIds for deeper recall*");
+        lines.push(formatDrilldownHint(includeSources));
 
         return {
           content: [{ type: "text", text: lines.join("\n") }],
@@ -529,7 +541,7 @@ export function createLcmRecentTool(input: {
       lines.push("");
       lines.push("---");
       lines.push(formatSourcesLine(sourceSummaryIds, includeSources));
-      lines.push("*Drill down: Use lcm_expand_query with these summaryIds for deeper recall*");
+      lines.push(formatDrilldownHint(includeSources));
 
       return {
         content: [{ type: "text", text: lines.join("\n") }],

@@ -147,7 +147,12 @@ export class RollupBuilder {
 
       let existing: RollupRow | null = null;
       try {
-        existing = this.store.getRollup(conversationId, PERIOD_KIND, dateKey);
+        existing = this.store.getRollup(
+          conversationId,
+          PERIOD_KIND,
+          dateKey,
+          this.config.timezone
+        );
       } catch (error) {
         result.errors.push(
           `${dateKey}: existing rollup lookup failed: ${formatError(error)}`
@@ -232,7 +237,12 @@ export class RollupBuilder {
       this.store.db,
       "BEGIN IMMEDIATE",
       async () => {
-        const existing = this.store.getRollup(conversationId, PERIOD_KIND, dateKey);
+        const existing = this.store.getRollup(
+          conversationId,
+          PERIOD_KIND,
+          dateKey,
+          this.config.timezone
+        );
         const rollupId = existing?.rollup_id ?? buildRollupId(PERIOD_KIND, dateKey);
         this.store.upsertRollup({
           rollup_id: rollupId,
