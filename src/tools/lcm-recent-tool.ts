@@ -329,7 +329,7 @@ export function createLcmRecentTool(input: {
     name: "lcm_recent",
     label: "LCM Recent",
     description:
-      "Retrieve recent activity summaries from pre-built temporal rollups. Returns daily, weekly, or monthly summaries without LLM calls. Use for questions like 'what happened today?', 'what did we do yesterday?', or recap requests. Falls back to a direct time-bounded SQL query over leaf summaries when no rollup exists.",
+      "Retrieve recent activity summaries from pre-built daily temporal rollups or a direct time-bounded SQL query over leaf summaries. Supports today, yesterday, exact dates, and rolling 7d/30d recap windows without LLM calls; calendar week/month aggregate rollups are added by the follow-up aggregate PR.",
     parameters: LcmRecentSchema,
     async execute(_toolCallId, params) {
       const lcm = input.lcm ?? (await input.getLcm?.());
