@@ -154,6 +154,42 @@ describe("LCM temporal rollup MVP", () => {
     expect(rebuilt?.content).toContain("content-sensitive rebuilds");
   });
 
+  it("deletes an existing daily rollup when a direct rebuild finds no sources", async () => {
+    const { db, conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "empty-direct-day",
+      sessionKey: "agent:main:empty-direct-day",
+      title: "Empty direct day",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_empty_direct",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Temporary direct day rollup content.",
+      tokenCount: 10,
+      earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+      latestAt: new Date("2026-04-27T10:30:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "day", "2026-04-27")
+    ).toBeTruthy();
+
+    db.prepare("DELETE FROM summaries WHERE summary_id = ?").run("sum_empty_direct");
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "day", "2026-04-27")
+    ).toBeNull();
+  });
+
   it("checks for an existing rollup inside buildDayRollup before writing", async () => {
     const { conversationStore, summaryStore, rollupStore } = createStores();
     const conversation = await conversationStore.createConversation({

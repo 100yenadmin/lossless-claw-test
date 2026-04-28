@@ -191,6 +191,16 @@ export class RollupBuilder {
       .sort(compareSummariesChronologically);
 
     if (summaries.length === 0) {
+      const existing = this.store.getRollup(
+        conversationId,
+        PERIOD_KIND,
+        dateKey,
+        this.config.timezone
+      );
+      if (existing) {
+        this.store.deleteRollup(existing.rollup_id);
+        return true;
+      }
       return false;
     }
 
