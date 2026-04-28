@@ -30,6 +30,9 @@ const LcmRecentSchema = Type.Object({
   ),
 });
 
+const ISO_DAY_FORMAT = /^\d{4}-\d{2}-\d{2}$/;
+const MULTI_DAY_ROLLUP_TARGET_TOKENS = 20_000;
+
 type RollupStatus = "building" | "ready" | "stale" | "failed";
 type RollupPeriodKind = "day" | "week" | "month";
 
@@ -74,7 +77,7 @@ type PeriodResolution = {
 };
 
 function isStrictIsoDay(day: string): boolean {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+  if (!ISO_DAY_FORMAT.test(day)) {
     return false;
   }
   const [year, month, date] = day.split("-").map((part) => Number(part));
@@ -194,8 +197,13 @@ function resolvePeriod(period: string, timezone: string): PeriodResolution {
 
   if (normalized.startsWith("date:")) {
     const day = normalized.slice(5);
-    if (!isStrictIsoDay(day)) {
+    if (!ISO_DAY_FORMAT.test(day)) {
       throw new Error('period date must be in the form "date:YYYY-MM-DD".');
+    }
+    if (!isStrictIsoDay(day)) {
+      throw new Error(
+        'Invalid date in period; expected a real calendar date in the form "date:YYYY-MM-DD".',
+      );
     }
     const start = getUtcDateForZonedMidnight(day, timezone);
     const end = getUtcDateForZonedMidnight(addDays(day, 1), timezone);
@@ -272,13 +280,32 @@ function combineRollups(rollups: RollupRecord[]): {
   status: "ready" | "stale";
   sourceSummaryIds: string[];
 } {
-  const content = rollups
+  const retained = [...rollups];
+  let tokenCount = retained.reduce((sum, rollup) => sum + rollup.tokenCount, 0);
+
+  while (
+    retained.length > 1 &&
+    tokenCount > MULTI_DAY_ROLLUP_TARGET_TOKENS
+  ) {
+    const dropped = retained.shift();
+    tokenCount -= dropped?.tokenCount ?? 0;
+  }
+
+  const omittedRollups = rollups.length - retained.length;
+  const content = retained
     .map((rollup) => `### ${rollup.periodKey}\n\n${rollup.content.trim()}`)
     .join("\n\n");
-  const tokenCount = rollups.reduce((sum, rollup) => sum + rollup.tokenCount, 0);
-  const sourceSummaryIds = [...new Set(rollups.flatMap((rollup) => rollup.sourceSummaryIds))];
-  const status = rollups.every((rollup) => rollup.status === "ready") ? "ready" : "stale";
-  return { content, tokenCount, status, sourceSummaryIds };
+  const cappedContent =
+    omittedRollups > 0
+      ? `(${omittedRollups} earlier rollups omitted to fit budget)\n\n${content}`
+      : content;
+  const sourceSummaryIds = [
+    ...new Set(retained.flatMap((rollup) => rollup.sourceSummaryIds)),
+  ];
+  const status = retained.every((rollup) => rollup.status === "ready")
+    ? "ready"
+    : "stale";
+  return { content: cappedContent, tokenCount, status, sourceSummaryIds };
 }
 
 function getExpectedDayKeys(start: Date, end: Date, timezone: string): string[] {
@@ -411,7 +438,7 @@ export function createLcmRecentTool(input: {
             status: "fallback",
             usedFallback: true,
             totalMatches: recentSummaries.length,
-            summaryIds,
+            summaryIds: includeSources ? summaryIds : [],
           },
         };
       }
@@ -524,7 +551,7 @@ export function createLcmRecentTool(input: {
             status: "fallback",
             usedFallback: true,
             totalMatches: recentSummaries.length,
-            summaryIds: sourceSummaryIds,
+            summaryIds: includeSources ? sourceSummaryIds : [],
           },
         };
       }
@@ -549,7 +576,7 @@ export function createLcmRecentTool(input: {
           status,
           usedFallback: false,
           tokenCount,
-          summaryIds: sourceSummaryIds,
+          summaryIds: includeSources ? sourceSummaryIds : [],
         },
       };
     },
