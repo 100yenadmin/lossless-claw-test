@@ -722,17 +722,35 @@ function getExpectedDayKeys(
   return keys;
 }
 
+function buildRecentSummaryRange(
+  conversationId: number | undefined,
+  start: Date,
+  end: Date
+): { whereClause: string; args: Array<string | number> } {
+  const scopeClause = conversationId == null ? "" : "conversation_id = ? AND";
+  return {
+    whereClause: `${scopeClause}
+         kind = 'leaf'
+         AND julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)
+         AND julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)`,
+    args:
+      conversationId == null
+        ? [end.toISOString(), start.toISOString()]
+        : [conversationId, end.toISOString(), start.toISOString()],
+  };
+}
+
 function getRecentSummaryFallback(
   db: DatabaseSync,
   conversationId: number | undefined,
   start: Date,
   end: Date
 ): RecentSummaryFallbackRow[] {
-  const scopeClause = conversationId == null ? "" : "conversation_id = ? AND";
-  const args: Array<string | number> =
-    conversationId == null
-      ? [end.toISOString(), start.toISOString()]
-      : [conversationId, end.toISOString(), start.toISOString()];
+  const { whereClause, args } = buildRecentSummaryRange(
+    conversationId,
+    start,
+    end
+  );
 
   return db
     .prepare(
@@ -744,10 +762,7 @@ function getRecentSummaryFallback(
         strftime('%Y-%m-%dT%H:%M:%fZ', created_at) AS created_at,
         strftime('%Y-%m-%dT%H:%M:%fZ', coalesce(latest_at, earliest_at, created_at)) AS effective_time
        FROM summaries
-       WHERE ${scopeClause}
-         kind = 'leaf'
-         AND julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)
-         AND julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)
+       WHERE ${whereClause}
        ORDER BY julianday(coalesce(latest_at, earliest_at, created_at)) DESC
        LIMIT 20`
     )
@@ -760,20 +775,17 @@ function countRecentSummaryFallback(
   start: Date,
   end: Date
 ): number {
-  const scopeClause = conversationId == null ? "" : "conversation_id = ? AND";
-  const args: Array<string | number> =
-    conversationId == null
-      ? [end.toISOString(), start.toISOString()]
-      : [conversationId, end.toISOString(), start.toISOString()];
+  const { whereClause, args } = buildRecentSummaryRange(
+    conversationId,
+    start,
+    end
+  );
 
   const row = db
     .prepare(
       `SELECT COUNT(*) AS count
        FROM summaries
-       WHERE ${scopeClause}
-         kind = 'leaf'
-         AND julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)
-         AND julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)`
+       WHERE ${whereClause}`
     )
     .get(...args) as { count: number } | undefined;
   return row?.count ?? 0;
@@ -785,20 +797,17 @@ function hasLeafSummariesInRange(
   start: Date,
   end: Date
 ): boolean {
-  const scopeClause = conversationId == null ? "" : "conversation_id = ? AND";
-  const args: Array<string | number> =
-    conversationId == null
-      ? [end.toISOString(), start.toISOString()]
-      : [conversationId, end.toISOString(), start.toISOString()];
+  const { whereClause, args } = buildRecentSummaryRange(
+    conversationId,
+    start,
+    end
+  );
 
   const row = db
     .prepare(
       `SELECT 1 AS present
        FROM summaries
-       WHERE ${scopeClause}
-         kind = 'leaf'
-         AND julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)
-         AND julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)
+       WHERE ${whereClause}
        LIMIT 1`
     )
     .get(...args) as { present: 1 } | undefined;
@@ -946,15 +955,17 @@ export function createLcmRecentTool(input: {
       let sourceSummaryIds: string[] = [];
       let usedFallback = false;
 
-      const currentDayKey = getZonedDayString(new Date(), timezone);
-      const canUseStoredCurrentDay =
-        resolution.periodKey == null || resolution.periodKey !== currentDayKey;
+      const now = new Date();
+      const currentDayKey = getZonedDayString(now, timezone);
+      const includesCurrentInstant =
+        resolution.start.getTime() <= now.getTime() &&
+        now.getTime() < resolution.end.getTime();
 
       if (
         resolution.kind &&
         resolution.periodKey &&
         !resolution.window &&
-        canUseStoredCurrentDay
+        !includesCurrentInstant
       ) {
         const rollup = rollupStore.getRollup(
           conversationId,
@@ -971,7 +982,11 @@ export function createLcmRecentTool(input: {
           status = rollup.status === "ready" ? "ready" : "stale";
           sourceSummaryIds = parseJsonStringArray(rollup.source_summary_ids);
         }
-      } else if (resolution.kind && !resolution.window) {
+      } else if (
+        resolution.kind &&
+        !resolution.window &&
+        (resolution.kind === "day" || !includesCurrentInstant)
+      ) {
         const rollups = rollupStore
           .listRollups(conversationId, resolution.kind, 200)
           .filter((rollup) => rollup.timezone === timezone)

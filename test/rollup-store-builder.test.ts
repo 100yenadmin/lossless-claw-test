@@ -860,6 +860,81 @@ describe("LCM sub-day window retrieval", () => {
     }
   });
 
+  it("uses fallback for current week even when a cached week rollup exists", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const { conversationStore, summaryStore, rollupStore } = createStores();
+      const conversation = await conversationStore.createConversation({
+        sessionId: "current-week-freshness",
+        sessionKey: "agent:main:current-week-freshness",
+        title: "Current week freshness",
+      });
+
+      await summaryStore.insertSummary({
+        summaryId: "sum_current_week_fresh",
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: "Fresh current week work should come from bounded fallback.",
+        tokenCount: 8,
+        latestAt: new Date("2026-04-28T10:00:00.000Z"),
+      });
+      rollupStore.upsertRollup({
+        rollup_id: "rollup_current_week_stale",
+        conversation_id: conversation.conversationId,
+        period_kind: "week",
+        period_key: "2026-04-27",
+        period_start: "2026-04-27T00:00:00.000Z",
+        period_end: "2026-05-04T00:00:00.000Z",
+        timezone: "UTC",
+        content: "STALE CURRENT WEEK ROLLUP SHOULD NOT BE USED",
+        token_count: 8,
+        source_summary_ids: JSON.stringify(["sum_current_week_fresh"]),
+        source_message_count: 1,
+        source_token_count: 8,
+        status: "ready",
+        coverage_start: "2026-04-28T10:00:00.000Z",
+        coverage_end: "2026-04-28T10:00:00.000Z",
+        summarizer_model: "test",
+        source_fingerprint: "stale",
+      });
+
+      const lcm = {
+        timezone: "UTC",
+        getRollupStore: () => rollupStore,
+        getConversationStore: () => ({
+          getConversationBySessionId: async () => ({
+            conversationId: conversation.conversationId,
+            sessionId: "current-week-freshness",
+            title: null,
+            bootstrappedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          }),
+          getConversationBySessionKey: async () => null,
+        }),
+      };
+      const tool = createLcmRecentTool({
+        deps: makeRecentDeps(),
+        lcm: lcm as never,
+        sessionId: "current-week-freshness",
+      });
+
+      const result = await tool.execute("call-week", {
+        period: "week",
+        includeSources: true,
+      });
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).toContain("Fresh current week work");
+      expect(text).not.toContain("STALE CURRENT WEEK");
+      expect((result.details as { status?: string }).status).toBe("fallback");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("combines complete prior daily rollups with live fallback for 7d", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     vi.useFakeTimers();
