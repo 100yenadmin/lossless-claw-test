@@ -1497,7 +1497,7 @@ export class LcmContextEngine implements ContextEngine {
     this.compactionMaintenanceStore = new CompactionMaintenanceStore(this.db);
     this.rollupStore = new RollupStore(this.db);
     this.rollupBuilder = new RollupBuilder(this.rollupStore, {
-      timezone: this.config.timezone,
+      timezone: this.timezone,
     });
 
     if (!this.fts5Available) {

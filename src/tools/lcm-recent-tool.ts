@@ -33,6 +33,8 @@ const LcmRecentSchema = Type.Object({
   ),
 });
 
+const MULTI_DAY_ROLLUP_TARGET_TOKENS = 20_000;
+
 type RollupStatus = "building" | "ready" | "stale" | "failed";
 type RollupPeriodKind = "day" | "week" | "month";
 
@@ -644,20 +646,35 @@ function combineRollups(rollups: RollupRecord[]): {
   status: "ready" | "stale";
   sourceSummaryIds: string[];
 } {
-  const content = rollups
-    .map((rollup) => `### ${rollup.periodKey}\n\n${rollup.content.trim()}`)
-    .join("\n\n");
-  const tokenCount = rollups.reduce(
+  const retained = [...rollups];
+  let tokenCount = retained.reduce(
     (sum, rollup) => sum + rollup.tokenCount,
     0
   );
+
+  while (
+    retained.length > 1 &&
+    tokenCount > MULTI_DAY_ROLLUP_TARGET_TOKENS
+  ) {
+    const dropped = retained.shift();
+    tokenCount -= dropped?.tokenCount ?? 0;
+  }
+
+  const omittedRollups = rollups.length - retained.length;
+  const content = retained
+    .map((rollup) => `### ${rollup.periodKey}\n\n${rollup.content.trim()}`)
+    .join("\n\n");
+  const cappedContent =
+    omittedRollups > 0
+      ? `(${omittedRollups} earlier rollups omitted to fit budget)\n\n${content}`
+      : content;
   const sourceSummaryIds = [
-    ...new Set(rollups.flatMap((rollup) => rollup.sourceSummaryIds)),
+    ...new Set(retained.flatMap((rollup) => rollup.sourceSummaryIds)),
   ];
-  const status = rollups.every((rollup) => rollup.status === "ready")
+  const status = retained.every((rollup) => rollup.status === "ready")
     ? "ready"
     : "stale";
-  return { content, tokenCount, status, sourceSummaryIds };
+  return { content: cappedContent, tokenCount, status, sourceSummaryIds };
 }
 
 function renderFallbackRollupSection(
@@ -916,7 +933,7 @@ export function createLcmRecentTool(input: {
             status: "fallback",
             usedFallback: true,
             totalMatches,
-            summaryIds,
+            summaryIds: includeSources ? summaryIds : [],
           },
         };
       }
@@ -1124,7 +1141,7 @@ export function createLcmRecentTool(input: {
             status: "fallback",
             usedFallback: true,
             totalMatches,
-            summaryIds: sourceSummaryIds,
+            summaryIds: includeSources ? sourceSummaryIds : [],
           },
         };
       }
@@ -1152,7 +1169,7 @@ export function createLcmRecentTool(input: {
           status,
           usedFallback,
           tokenCount,
-          summaryIds: sourceSummaryIds,
+          summaryIds: includeSources ? sourceSummaryIds : [],
         },
       };
     },

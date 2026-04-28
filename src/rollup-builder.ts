@@ -182,19 +182,24 @@ export class RollupBuilder {
       }
     }
 
-    const finishedAt = new Date();
-    const latestState = this.store.getState(conversationId);
-    const shouldClearPending =
-      result.errors.length === 0 &&
-      isTimestampAtOrBefore(latestState?.last_message_at, scannedAt);
-    this.store.upsertState(conversationId, {
-      timezone: this.config.timezone,
-      last_rollup_check_at: laterDate(
-        finishedAt,
-        latestState?.last_rollup_check_at
-      ).toISOString(),
-      pending_rebuild: result.errors.length === 0 && shouldClearPending ? 0 : 1,
-    });
+    try {
+      const finishedAt = new Date();
+      const latestState = this.store.getState(conversationId);
+      const shouldClearPending =
+        result.errors.length === 0 &&
+        isTimestampAtOrBefore(latestState?.last_message_at, scannedAt);
+      this.store.upsertState(conversationId, {
+        timezone: this.config.timezone,
+        last_rollup_check_at: laterDate(
+          finishedAt,
+          latestState?.last_rollup_check_at
+        ).toISOString(),
+        pending_rebuild:
+          result.errors.length === 0 && shouldClearPending ? 0 : 1,
+      });
+    } catch (error) {
+      result.errors.push(`final sweep state update failed: ${formatError(error)}`);
+    }
 
     return result;
   }
