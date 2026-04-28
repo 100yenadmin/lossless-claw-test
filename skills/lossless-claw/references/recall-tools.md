@@ -4,17 +4,17 @@ Use recall tools when the answer depends on historical evidence from compacted c
 
 ## Availability
 
-`lcm_recent` and `lcm_rollup_debug` are temporal-memory stack tools. Use them only when they are present in the current runtime. Until the temporal-memory PR stack is merged and deployed, approximate time-window recall with `lcm_grep` plus bounded expansion and say the coverage is approximate.
+`lcm_recent` and `lcm_rollup_debug` are temporal-memory stack tools. Before choosing either one, check the active tool list for the current runtime. If the tool is absent, do not treat this reference as permission to call it; approximate time-window recall with `lcm_grep` plus bounded expansion and say the coverage is approximate.
 
 ## Decision table
 
 | Need                                                               | Start with                                      | Then verify with                                      |
 | ------------------------------------------------------------------ | ----------------------------------------------- | ----------------------------------------------------- |
-| Recap by known time window                                         | `lcm_recent` if available; otherwise `lcm_grep` | `lcm_describe` / `lcm_expand_query` for proof         |
+| Recap by known time window                                         | `lcm_recent` only if active; otherwise `lcm_grep` | `lcm_describe` / `lcm_expand_query` for proof       |
 | Keyword, PR, file, customer, error, or identifier search           | `lcm_grep`                                      | `lcm_describe` / `lcm_expand_query`                   |
 | Known summary or file ID                                           | `lcm_describe`                                  | `lcm_expand` / `lcm_expand_query` if needed           |
 | Exact command, path, timestamp, root cause, or shipped-proof claim | `lcm_recent` or `lcm_grep` only to narrow       | `lcm_describe` / `lcm_expand_query` before asserting  |
-| Rollup freshness/provenance/debugging                              | `lcm_rollup_debug` if available                 | Source drilldown if needed                            |
+| Rollup freshness/provenance/debugging                              | `lcm_rollup_debug` only if active               | Source drilldown if needed                            |
 
 ## Tool selection
 

@@ -20,17 +20,19 @@ LCM owns temporal evidence, provenance, and drilldown. Cortex owns curated durab
 
 ## Evidence base
 
-This plan is based on local audits and prior architecture docs. These evidence files are external/private planning artifacts, not repo-tracked references in this PR:
+This plan is based on local audits and prior architecture docs. The following names are external/private planning artifacts from the authoring environment, not repo-tracked paths, and this PR does not require them to exist in `docs/`:
 
-- `docs/audits/R-515-lcm-rollup-pr-stack-gap-report-2026-04-28.md`
-- `docs/audits/R-516-lcm-emotional-temporal-gap-report-2026-04-28.md`
-- `docs/audits/R-517-lcm-operational-window-gap-report-2026-04-28.md`
-- `docs/audits/R-518-lcm-temporal-architecture-gap-report-2026-04-28.md`
-- `docs/research/R-457-lcm-recent-architecture-2026-04-13.md`
-- `docs/research/R-459-lcm-recent-scenarios-2026-04-13.md`
-- `docs/audits/R-473-salvage-ranking-2026-04-13.md`
+- `R-515-lcm-rollup-pr-stack-gap-report-2026-04-28.md`
+- `R-516-lcm-emotional-temporal-gap-report-2026-04-28.md`
+- `R-517-lcm-operational-window-gap-report-2026-04-28.md`
+- `R-518-lcm-temporal-architecture-gap-report-2026-04-28.md`
+- `R-457-lcm-recent-architecture-2026-04-13.md`
+- `R-459-lcm-recent-scenarios-2026-04-13.md`
+- `R-473-salvage-ranking-2026-04-13.md`
 
 The recovered PR stack contains salvageable daily-rollup code, but the current `main` branch does not yet include `lcm_recent`, `lcm_rollups`, or rollup builders.
+
+This PR intentionally carries both the long-form implementation plan and user-facing skill/reference wording. The skill/reference wording is safe before the implementation PRs land because every `lcm_recent` and `lcm_rollup_debug` recommendation is gated on the tool being present in the current runtime.
 
 ## Current gap summary
 
