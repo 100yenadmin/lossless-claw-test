@@ -333,6 +333,18 @@ describe("LCM sub-day window retrieval", () => {
     expect(skippedMidnightNight.end.toISOString()).toBe(
       "2026-04-23T22:00:00.000Z"
     );
+
+    const explicitEndOfDay = __lcmRecentTestInternals.resolvePeriod(
+      "date:2026-04-23 22:00-24:00",
+      "Africa/Cairo"
+    );
+    expect(explicitEndOfDay.window?.endMinutes).toBe(24 * 60);
+    expect(explicitEndOfDay.start.toISOString()).toBe(
+      "2026-04-23T20:00:00.000Z"
+    );
+    expect(explicitEndOfDay.end.toISOString()).toBe(
+      "2026-04-23T22:00:00.000Z"
+    );
   });
 
   it("falls back to leaf summaries inside the requested sub-day window", async () => {
@@ -472,6 +484,81 @@ describe("LCM sub-day window retrieval", () => {
     expect(text).not.toContain("sum_budget_");
     expect(estimateTokens(text)).toBeLessThanOrEqual(250);
     expect((result.details as { summaryIds?: string[] }).summaryIds).toEqual([]);
+  });
+
+  it("uses fallback status for today's window even when a rollup exists", async () => {
+    const now = new Date("2026-04-27T12:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const { db, conversationStore, summaryStore, rollupStore } = createStores();
+      const conversation = await conversationStore.createConversation({
+        sessionId: "today-freshness",
+        sessionKey: "agent:main:today-freshness",
+        title: "Today freshness",
+      });
+      const todayKey = now.toISOString().slice(0, 10);
+
+      await summaryStore.insertSummary({
+        summaryId: "sum_today_fresh",
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: "Fresh same-day work should come from bounded fallback.",
+        tokenCount: 8,
+        latestAt: now,
+      });
+
+      const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+      await builder.buildDayRollup(conversation.conversationId, todayKey);
+      db.prepare(
+        `UPDATE lcm_rollups
+         SET content = ?
+         WHERE conversation_id = ? AND period_kind = 'day' AND period_key = ?`
+      ).run(
+        "STALE CURRENT DAY ROLLUP SHOULD NOT BE USED",
+        conversation.conversationId,
+        todayKey
+      );
+
+      const lcm = {
+        timezone: "UTC",
+        getRollupStore: () => rollupStore,
+        getConversationStore: () => ({
+          getConversationBySessionId: async () => ({
+            conversationId: conversation.conversationId,
+            sessionId: "today-freshness",
+            title: null,
+            bootstrappedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          }),
+          getConversationBySessionKey: async () => null,
+        }),
+      };
+      const tool = createLcmRecentTool({
+        deps: makeRecentDeps(),
+        lcm: lcm as never,
+        sessionId: "today-freshness",
+      });
+
+      const result = await tool.execute("call-today", {
+        period: "today",
+        includeSources: true,
+      });
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).toContain("Fresh same-day work");
+      expect(text).not.toContain("STALE CURRENT DAY ROLLUP");
+      expect(
+        (result.details as { status?: string; usedFallback?: boolean }).status
+      ).toBe("fallback");
+      expect(
+        (result.details as { status?: string; usedFallback?: boolean })
+          .usedFallback
+      ).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("combines complete prior daily rollups with live fallback for 7d", async () => {

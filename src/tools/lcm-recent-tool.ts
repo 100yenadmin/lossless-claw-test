@@ -386,7 +386,14 @@ function normalizeZonedParts(parts: {
   };
 }
 
-function parseClockToken(raw: string): number | null {
+function isEndOfDayClockToken(raw: string): boolean {
+  return /^24(?::00)?$/.test(raw.trim().toLowerCase().replace(/\s+/g, ""));
+}
+
+function parseClockToken(
+  raw: string,
+  options: { allowEndOfDay?: boolean } = {}
+): number | null {
   const token = raw.trim().toLowerCase().replace(/\s+/g, "");
   const match = /^(\d{1,2})(?::(\d{2}))?(am|pm)?$/.exec(token);
   if (!match) {
@@ -408,6 +415,8 @@ function parseClockToken(raw: string): number | null {
     } else {
       hour = hour === 12 ? 12 : hour + 12;
     }
+  } else if (hour === 24 && minute === 0 && options.allowEndOfDay) {
+    return 24 * 60;
   } else if (hour < 0 || hour > 23) {
     return null;
   }
@@ -423,7 +432,7 @@ function inferWindowMeridiems(
   const end = endRaw.trim().toLowerCase();
   const startMeridiem = /(am|pm)\b/.exec(start)?.[1];
   const endMeridiem = /(am|pm)\b/.exec(end)?.[1];
-  if (startMeridiem && !endMeridiem) {
+  if (startMeridiem && !endMeridiem && !isEndOfDayClockToken(end)) {
     return { start, end: `${end}${startMeridiem}` };
   }
   if (!startMeridiem && endMeridiem) {
@@ -466,7 +475,7 @@ function parseExplicitWindow(
     displayEndRaw
   );
   const startMinutes = parseClockToken(startRaw);
-  const endMinutes = parseClockToken(endRaw);
+  const endMinutes = parseClockToken(endRaw, { allowEndOfDay: true });
   if (
     startMinutes == null ||
     endMinutes == null ||
@@ -1283,7 +1292,11 @@ export function createLcmRecentTool(input: {
                 usableKeys.has(key) ||
                 !dayHasLeafSummaries(db, conversationId, key, timezone)
             ));
-        if (usableRollups.length > 0 && hasCompleteCoverage) {
+        const hasStoredCoverage =
+          resolution.kind === "day"
+            ? requiredKeys.some((key) => usableKeys.has(key))
+            : usableRollups.length > 0;
+        if (hasStoredCoverage && hasCompleteCoverage) {
           const orderedRollups =
             resolution.kind === "day"
               ? requiredKeys
