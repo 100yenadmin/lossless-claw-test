@@ -145,7 +145,7 @@ Scope:
 - Add episode grouping/search primitives for incidents and project threads.
 - Add cross-window continuity retrieval for `since X`, `before/after`, and day-boundary-spanning work.
 - Define explicit contracts for Cortex, GBrain, and BIL/enrichment consumers.
-- Add privacy/scope rules for cross-conversation aggregation.
+- Extend PR1 baseline privacy/scope rules for advanced cross-conversation aggregation and episode continuity.
 
 Acceptance tests:
 

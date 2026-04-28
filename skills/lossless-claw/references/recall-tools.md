@@ -28,7 +28,7 @@ Proof path:
 
 Use first for **clearly time-bounded episodic recall** only when the tool is available: when the user asks what happened **today**, **yesterday**, **this week**, **this month**, or inside a known local-time window.
 
-Local-time windows are interpreted in the runtime's effective LCM timezone unless the tool explicitly accepts and receives another timezone. Treat returned ranges as start-inclusive and end-exclusive.
+Local-time windows use this precedence: explicit tool timezone if supported and provided, then the runtime's effective LCM timezone, then the configured/system fallback. Treat returned ranges as start-inclusive and end-exclusive.
 
 Good prompts for `lcm_recent`:
 
@@ -71,7 +71,7 @@ Use for:
 
 Do not use it for:
 
-- timeline questions like "what happened yesterday afternoon?" when the window is already known; start with `lcm_recent` instead
+- timeline questions like "what happened yesterday afternoon?" when the window is already known and `lcm_recent` is available; start with `lcm_recent` instead. If `lcm_recent` is unavailable, use `lcm_grep` plus bounded expansion and state the coverage limit.
 - answering detail-heavy questions by itself
 
 ### `lcm_describe`
