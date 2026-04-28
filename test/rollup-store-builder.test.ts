@@ -690,6 +690,27 @@ describe("LCM weekly and monthly rollups", () => {
       rollupStore.getRollup(conversation.conversationId, "month", "2026-04")
         ?.rollup_id
     ).toBe(firstMonthId);
+
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    await expect(
+      builder.buildWeeklyRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(false);
+  });
+
+  it("rejects non-canonical weekly rollup keys", async () => {
+    const { conversationStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "bad-week-key",
+      sessionKey: "agent:main:bad-week-key",
+      title: "Bad week key",
+    });
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await expect(
+      builder.buildWeeklyRollup(conversation.conversationId, "2026-04-29")
+    ).rejects.toThrow(/Monday calendar week start/);
   });
 
   it("treats missing no-activity days as covered for aggregate rollups", async () => {

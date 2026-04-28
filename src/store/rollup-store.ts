@@ -219,10 +219,15 @@ export class RollupStore {
   listRollups(
     conversationId: number,
     periodKind?: string,
-    limit = 50
+    limit: number | null = 50
   ): RollupRow[] {
     const normalizedLimit =
-      Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 50;
+      limit == null
+        ? null
+        : Number.isFinite(limit) && limit > 0
+          ? Math.floor(limit)
+          : 50;
+    const limitClause = normalizedLimit == null ? "" : "LIMIT ?";
     const sql = periodKind
       ? `SELECT
            rollup_id,
@@ -249,7 +254,7 @@ export class RollupStore {
          WHERE conversation_id = ?
            AND period_kind = ?
          ORDER BY period_start DESC
-         LIMIT ?`
+         ${limitClause}`
       : `SELECT
            rollup_id,
            conversation_id,
@@ -274,13 +279,18 @@ export class RollupStore {
          FROM lcm_rollups
          WHERE conversation_id = ?
          ORDER BY period_start DESC
-         LIMIT ?`;
+         ${limitClause}`;
 
-    return (periodKind
-      ? this.db.prepare(sql).all(conversationId, periodKind, normalizedLimit)
-      : this.db
-          .prepare(sql)
-          .all(conversationId, normalizedLimit)) as unknown as RollupRow[];
+    if (periodKind) {
+      const args =
+        normalizedLimit == null
+          ? [conversationId, periodKind]
+          : [conversationId, periodKind, normalizedLimit];
+      return this.db.prepare(sql).all(...args) as unknown as RollupRow[];
+    }
+    const args =
+      normalizedLimit == null ? [conversationId] : [conversationId, normalizedLimit];
+    return this.db.prepare(sql).all(...args) as unknown as RollupRow[];
   }
 
   listRollupsInRange(

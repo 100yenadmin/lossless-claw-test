@@ -129,6 +129,12 @@ export class RollupBuilder {
     conversationId: number,
     weekKey: string
   ): Promise<boolean> {
+    const canonicalWeekKey = startOfWeekKey(weekKey, this.config.timezone);
+    if (weekKey !== canonicalWeekKey) {
+      throw new Error(
+        `Week key must be a Monday calendar week start: ${canonicalWeekKey}`
+      );
+    }
     return this.buildAggregateRollup(conversationId, WEEK_PERIOD_KIND, weekKey);
   }
 
@@ -150,13 +156,13 @@ export class RollupBuilder {
     const dayRollups = this.store.listRollups(
       conversationId,
       DAY_PERIOD_KIND,
-      400
+      null
     );
     const keys = new Set<string>();
     for (const rollup of this.store.listRollups(
       conversationId,
       periodKind,
-      400
+      null
     )) {
       if (rollup.timezone === this.config.timezone) {
         keys.add(rollup.period_key);
@@ -245,7 +251,6 @@ export class RollupBuilder {
         id: rollup.rollup_id,
         tokenCount: rollup.source_token_count,
         content: rollup.content,
-        updatedAt: rollup.built_at,
         earliestAt: rollup.coverage_start,
         latestAt: rollup.coverage_end,
         sourceCount: rollup.source_message_count,
