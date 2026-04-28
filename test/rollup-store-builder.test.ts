@@ -184,7 +184,7 @@ describe("LCM sub-day window retrieval", () => {
     expect(dateWindow.window?.startMinutes).toBe(90);
     expect(dateWindow.window?.endMinutes).toBe(210);
     expect(dateWindow.start.toISOString()).toBe("2026-03-08T06:30:00.000Z");
-    expect(dateWindow.end.toISOString()).toBe("2026-03-08T08:30:00.000Z");
+    expect(dateWindow.end.toISOString()).toBe("2026-03-08T07:30:00.000Z");
 
     const namedWindow = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-04-27 morning",
@@ -193,6 +193,13 @@ describe("LCM sub-day window retrieval", () => {
     expect(namedWindow.label).toBe("2026-04-27 morning");
     expect(namedWindow.start.toISOString()).toBe("2026-04-26T23:00:00.000Z");
     expect(namedWindow.end.toISOString()).toBe("2026-04-27T05:00:00.000Z");
+
+    const meridiemWindow = __lcmRecentTestInternals.resolvePeriod(
+      "date:2026-04-27 4-8pm",
+      "Asia/Bangkok"
+    );
+    expect(meridiemWindow.window?.startMinutes).toBe(16 * 60);
+    expect(meridiemWindow.window?.endMinutes).toBe(20 * 60);
   });
 
   it("falls back to leaf summaries inside the requested sub-day window", async () => {
@@ -221,6 +228,16 @@ describe("LCM sub-day window retrieval", () => {
         "Eric Wilder npm ENOTEMPTY repair happened in the afternoon window.",
       tokenCount: 12,
       latestAt: new Date("2026-04-27T10:30:00.000Z"),
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_spanning_window",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Spanning summary began before the window but overlaps it.",
+      tokenCount: 11,
+      earliestAt: new Date("2026-04-27T09:50:00.000Z"),
+      latestAt: new Date("2026-04-27T11:10:00.000Z"),
     });
     await summaryStore.insertSummary({
       summaryId: "sum_after_window",
@@ -264,11 +281,13 @@ describe("LCM sub-day window retrieval", () => {
     });
     const text = (result.content[0] as { text: string }).text;
     expect(text).toContain("sum_inside_window");
+    expect(text).toContain("sum_spanning_window");
     expect(text).toContain("ENOTEMPTY repair");
     expect(text).not.toContain("sum_before_window");
     expect(text).not.toContain("sum_after_window");
     expect((result.details as { summaryIds?: string[] }).summaryIds).toEqual([
       "sum_inside_window",
+      "sum_spanning_window",
     ]);
   });
 });

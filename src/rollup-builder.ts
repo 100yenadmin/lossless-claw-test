@@ -225,50 +225,54 @@ export class RollupBuilder {
       0
     );
 
-    await withDatabaseTransaction(this.store.db, "BEGIN IMMEDIATE", () => {
-      if (
-        existing?.rollup_id &&
-        existing.source_fingerprint &&
-        existing.source_fingerprint !== fingerprint
-      ) {
-        this.store.markStale(existing.rollup_id);
+    await withDatabaseTransaction(
+      this.store.db,
+      "BEGIN IMMEDIATE",
+      async () => {
+        if (
+          existing?.rollup_id &&
+          existing.source_fingerprint &&
+          existing.source_fingerprint !== fingerprint
+        ) {
+          this.store.markStale(existing.rollup_id);
+        }
+
+        this.store.upsertRollup({
+          rollup_id: rollupId,
+          conversation_id: conversationId,
+          period_kind: periodKind,
+          period_key: periodKey,
+          period_start: bounds.start.toISOString(),
+          period_end: bounds.end.toISOString(),
+          timezone: this.config.timezone,
+          content: draft.content,
+          token_count: draft.summaryTokenCount,
+          source_summary_ids: JSON.stringify(sourceSummaryIds),
+          source_message_count: sourceMessageCount,
+          source_token_count: sourceTokens,
+          status: "ready",
+          coverage_start:
+            sourceRollups[0]?.coverage_start ??
+            sourceRollups[0]?.period_start ??
+            null,
+          coverage_end:
+            sourceRollups[sourceRollups.length - 1]?.coverage_end ??
+            sourceRollups[sourceRollups.length - 1]?.period_end ??
+            null,
+          summarizer_model: "rollup-concat-v1",
+          source_fingerprint: fingerprint,
+        });
+
+        await this.store.replaceRollupSources(
+          rollupId,
+          sourceRollups.map((rollup, index) => ({
+            type: "rollup",
+            id: rollup.rollup_id,
+            ordinal: index,
+          }))
+        );
       }
-
-      this.store.upsertRollup({
-        rollup_id: rollupId,
-        conversation_id: conversationId,
-        period_kind: periodKind,
-        period_key: periodKey,
-        period_start: bounds.start.toISOString(),
-        period_end: bounds.end.toISOString(),
-        timezone: this.config.timezone,
-        content: draft.content,
-        token_count: draft.summaryTokenCount,
-        source_summary_ids: JSON.stringify(sourceSummaryIds),
-        source_message_count: sourceMessageCount,
-        source_token_count: sourceTokens,
-        status: "ready",
-        coverage_start:
-          sourceRollups[0]?.coverage_start ??
-          sourceRollups[0]?.period_start ??
-          null,
-        coverage_end:
-          sourceRollups[sourceRollups.length - 1]?.coverage_end ??
-          sourceRollups[sourceRollups.length - 1]?.period_end ??
-          null,
-        summarizer_model: "rollup-concat-v1",
-        source_fingerprint: fingerprint,
-      });
-
-      this.store.replaceRollupSources(
-        rollupId,
-        sourceRollups.map((rollup, index) => ({
-          type: "rollup",
-          id: rollup.rollup_id,
-          ordinal: index,
-        }))
-      );
-    });
+    );
 
     return true;
   }
@@ -295,6 +299,8 @@ export class RollupBuilder {
       result.skipped += daysBack;
       return result;
     }
+
+    const scannedAt = new Date();
 
     for (let offset = 0; offset < daysBack; offset += 1) {
       const candidateDate = shiftLocalDate(now, this.config.timezone, -offset);
@@ -366,6 +372,12 @@ export class RollupBuilder {
       }
     }
 
+    this.store.upsertState(conversationId, {
+      timezone: this.config.timezone,
+      last_rollup_check_at: scannedAt.toISOString(),
+      pending_rebuild: result.errors.length === 0 ? 0 : 1,
+    });
+
     return result;
   }
 
@@ -406,87 +418,90 @@ export class RollupBuilder {
       existing?.rollup_id ?? buildRollupId(DAY_PERIOD_KIND, dateKey);
     const builtAt = new Date();
 
-    await withDatabaseTransaction(this.store.db, "BEGIN IMMEDIATE", () => {
-      if (
-        existing?.rollup_id &&
-        existing.source_fingerprint &&
-        existing.source_fingerprint !== fingerprint
-      ) {
-        this.store.markStale(existing.rollup_id);
+    await withDatabaseTransaction(
+      this.store.db,
+      "BEGIN IMMEDIATE",
+      async () => {
+        if (
+          existing?.rollup_id &&
+          existing.source_fingerprint &&
+          existing.source_fingerprint !== fingerprint
+        ) {
+          this.store.markStale(existing.rollup_id);
+        }
+
+        this.store.upsertRollup({
+          rollup_id: rollupId,
+          conversation_id: conversationId,
+          period_kind: DAY_PERIOD_KIND,
+          period_key: dateKey,
+          period_start: start.toISOString(),
+          period_end: end.toISOString(),
+          timezone: this.config.timezone,
+          content: draft.content,
+          token_count: draft.summaryTokenCount,
+          source_summary_ids: JSON.stringify(
+            summaries.map((summary) => summary.summaryId)
+          ),
+          source_message_count: 0,
+          source_token_count: totalSourceTokens,
+          status: "building",
+          coverage_start:
+            summaries[0]?.earliestAt?.toISOString() ??
+            summaries[0]?.createdAt.toISOString() ??
+            null,
+          coverage_end:
+            summaries[summaries.length - 1]?.latestAt?.toISOString() ??
+            summaries[summaries.length - 1]?.createdAt.toISOString() ??
+            null,
+          summarizer_model: "concatenation-v1",
+          source_fingerprint: fingerprint,
+        });
+
+        await this.store.replaceRollupSources(
+          rollupId,
+          summaries.map((summary, index) => ({
+            type: "summary",
+            id: summary.summaryId,
+            ordinal: index,
+          }))
+        );
+
+        this.store.upsertRollup({
+          rollup_id: rollupId,
+          conversation_id: conversationId,
+          period_kind: DAY_PERIOD_KIND,
+          period_key: dateKey,
+          period_start: start.toISOString(),
+          period_end: end.toISOString(),
+          timezone: this.config.timezone,
+          content: draft.content,
+          token_count: draft.summaryTokenCount,
+          source_summary_ids: JSON.stringify(
+            summaries.map((summary) => summary.summaryId)
+          ),
+          source_message_count: 0,
+          source_token_count: totalSourceTokens,
+          status: "ready",
+          coverage_start:
+            summaries[0]?.earliestAt?.toISOString() ??
+            summaries[0]?.createdAt.toISOString() ??
+            null,
+          coverage_end:
+            summaries[summaries.length - 1]?.latestAt?.toISOString() ??
+            summaries[summaries.length - 1]?.createdAt.toISOString() ??
+            null,
+          summarizer_model: "concatenation-v1",
+          source_fingerprint: fingerprint,
+        });
+
+        this.store.upsertState(conversationId, {
+          timezone: this.config.timezone,
+          last_daily_build_at: builtAt.toISOString(),
+          last_rollup_check_at: builtAt.toISOString(),
+        });
       }
-
-      this.store.upsertRollup({
-        rollup_id: rollupId,
-        conversation_id: conversationId,
-        period_kind: DAY_PERIOD_KIND,
-        period_key: dateKey,
-        period_start: start.toISOString(),
-        period_end: end.toISOString(),
-        timezone: this.config.timezone,
-        content: draft.content,
-        token_count: draft.summaryTokenCount,
-        source_summary_ids: JSON.stringify(
-          summaries.map((summary) => summary.summaryId)
-        ),
-        source_message_count: 0,
-        source_token_count: totalSourceTokens,
-        status: "building",
-        coverage_start:
-          summaries[0]?.earliestAt?.toISOString() ??
-          summaries[0]?.createdAt.toISOString() ??
-          null,
-        coverage_end:
-          summaries[summaries.length - 1]?.latestAt?.toISOString() ??
-          summaries[summaries.length - 1]?.createdAt.toISOString() ??
-          null,
-        summarizer_model: "concatenation-v1",
-        source_fingerprint: fingerprint,
-      });
-
-      this.store.replaceRollupSources(
-        rollupId,
-        summaries.map((summary, index) => ({
-          type: "summary",
-          id: summary.summaryId,
-          ordinal: index,
-        }))
-      );
-
-      this.store.upsertRollup({
-        rollup_id: rollupId,
-        conversation_id: conversationId,
-        period_kind: DAY_PERIOD_KIND,
-        period_key: dateKey,
-        period_start: start.toISOString(),
-        period_end: end.toISOString(),
-        timezone: this.config.timezone,
-        content: draft.content,
-        token_count: draft.summaryTokenCount,
-        source_summary_ids: JSON.stringify(
-          summaries.map((summary) => summary.summaryId)
-        ),
-        source_message_count: 0,
-        source_token_count: totalSourceTokens,
-        status: "ready",
-        coverage_start:
-          summaries[0]?.earliestAt?.toISOString() ??
-          summaries[0]?.createdAt.toISOString() ??
-          null,
-        coverage_end:
-          summaries[summaries.length - 1]?.latestAt?.toISOString() ??
-          summaries[summaries.length - 1]?.createdAt.toISOString() ??
-          null,
-        summarizer_model: "concatenation-v1",
-        source_fingerprint: fingerprint,
-      });
-
-      this.store.upsertState(conversationId, {
-        timezone: this.config.timezone,
-        last_daily_build_at: builtAt.toISOString(),
-        last_rollup_check_at: builtAt.toISOString(),
-        pending_rebuild: 0,
-      });
-    });
+    );
 
     return true;
   }
@@ -960,14 +975,43 @@ function localDateTimeToUtc(
   const [hour, minute, second] = time
     .split(":")
     .map((part) => Number.parseInt(part, 10));
-  const utcGuess = new Date(
+  let candidate = new Date(
     Date.UTC(year, month - 1, day, hour, minute, second, 0)
   );
-  const offsetMs = getTimeZoneOffsetMs(utcGuess, timezone);
-  return new Date(utcGuess.getTime() - offsetMs);
+
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const parts = getZonedDateTimeParts(candidate, timezone);
+    const deltaMs =
+      Date.UTC(year, month - 1, day, hour, minute, second, 0) -
+      Date.UTC(
+        parts.year,
+        parts.month - 1,
+        parts.day,
+        parts.hour,
+        parts.minute,
+        parts.second,
+        0
+      );
+    if (deltaMs === 0) {
+      return candidate;
+    }
+    candidate = new Date(candidate.getTime() + deltaMs);
+  }
+
+  return candidate;
 }
 
-function getTimeZoneOffsetMs(date: Date, timezone: string): number {
+function getZonedDateTimeParts(
+  date: Date,
+  timezone: string
+): {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+} {
   const formatter = new Intl.DateTimeFormat("en-US", {
     timeZone: timezone,
     year: "numeric",
@@ -980,15 +1024,15 @@ function getTimeZoneOffsetMs(date: Date, timezone: string): number {
   });
   const parts = formatter.formatToParts(date);
   const lookup = new Map(parts.map((part) => [part.type, part.value]));
-  const localAsUtc = Date.UTC(
-    Number.parseInt(lookup.get("year") ?? "0", 10),
-    Number.parseInt(lookup.get("month") ?? "1", 10) - 1,
-    Number.parseInt(lookup.get("day") ?? "1", 10),
-    Number.parseInt(lookup.get("hour") ?? "0", 10),
-    Number.parseInt(lookup.get("minute") ?? "0", 10),
-    Number.parseInt(lookup.get("second") ?? "0", 10)
-  );
-  return localAsUtc - date.getTime();
+  const rawHour = Number.parseInt(lookup.get("hour") ?? "0", 10);
+  return {
+    year: Number.parseInt(lookup.get("year") ?? "0", 10),
+    month: Number.parseInt(lookup.get("month") ?? "1", 10),
+    day: Number.parseInt(lookup.get("day") ?? "1", 10),
+    hour: rawHour === 24 ? 0 : rawHour,
+    minute: Number.parseInt(lookup.get("minute") ?? "0", 10),
+    second: Number.parseInt(lookup.get("second") ?? "0", 10),
+  };
 }
 
 function formatError(error: unknown): string {
