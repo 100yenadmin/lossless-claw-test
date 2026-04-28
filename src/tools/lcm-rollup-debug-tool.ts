@@ -31,6 +31,10 @@ const LcmRollupDebugSchema = Type.Object({
 });
 
 function getLcmDatabase(lcm: LcmContextEngine): DatabaseSync {
+  const store = lcm.getRollupStore?.();
+  if (store?.db) {
+    return store.db;
+  }
   const candidate = lcm as unknown as { db?: DatabaseSync };
   if (!candidate.db) {
     throw new Error("LCM rollup database is unavailable.");
@@ -89,7 +93,7 @@ export function createLcmRollupDebugTool(input: {
       const includeSources = p.includeSources === true;
       const state = store.getState(conversationId);
       const rollups = store.listRollups(conversationId, periodKind, limit);
-      const timezone = lcm.timezone;
+      const timezone = state?.timezone || lcm.timezone;
 
       const lines = [`## LCM Rollup Debug: conversation ${conversationId}`, ""];
       lines.push("### State");

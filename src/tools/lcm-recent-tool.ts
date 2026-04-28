@@ -109,6 +109,10 @@ function formatDisplayTime(
 }
 
 function getLcmDatabase(lcm: LcmContextEngine): DatabaseSync {
+  const store = lcm.getRollupStore?.();
+  if (store?.db) {
+    return store.db;
+  }
   const candidate = lcm as unknown as { db?: DatabaseSync };
   if (!candidate.db) {
     throw new Error("LCM rollup database is unavailable.");

@@ -156,7 +156,10 @@ export class RollupBuilder {
       }
       const key =
         periodKind === WEEK_PERIOD_KIND
-          ? startOfWeekKey(rollup.period_key)
+          ? startOfWeekKey(
+              rollup.period_key,
+              rollup.timezone || this.config.timezone
+            )
           : rollup.period_key.slice(0, 7);
       keys.add(key);
     }
@@ -229,14 +232,6 @@ export class RollupBuilder {
       this.store.db,
       "BEGIN IMMEDIATE",
       async () => {
-        if (
-          existing?.rollup_id &&
-          existing.source_fingerprint &&
-          existing.source_fingerprint !== fingerprint
-        ) {
-          this.store.markStale(existing.rollup_id);
-        }
-
         this.store.upsertRollup({
           rollup_id: rollupId,
           conversation_id: conversationId,
@@ -422,14 +417,6 @@ export class RollupBuilder {
       this.store.db,
       "BEGIN IMMEDIATE",
       async () => {
-        if (
-          existing?.rollup_id &&
-          existing.source_fingerprint &&
-          existing.source_fingerprint !== fingerprint
-        ) {
-          this.store.markStale(existing.rollup_id);
-        }
-
         this.store.upsertRollup({
           rollup_id: rollupId,
           conversation_id: conversationId,
@@ -909,10 +896,21 @@ function uniqueStrings(values: string[]): string[] {
   return [...new Set(values)];
 }
 
-function startOfWeekKey(dayKey: string): string {
-  const date = parseDateKey(dayKey);
-  const weekday = date.getUTCDay();
-  const mondayOffset = weekday === 0 ? -6 : 1 - weekday;
+function startOfWeekKey(dayKey: string, timezone: string): string {
+  const weekday = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    weekday: "short",
+  }).format(parseDateKey(dayKey));
+  const order = {
+    Mon: 0,
+    Tue: 1,
+    Wed: 2,
+    Thu: 3,
+    Fri: 4,
+    Sat: 5,
+    Sun: 6,
+  } as const;
+  const mondayOffset = -order[weekday as keyof typeof order];
   return shiftDateKey(dayKey, mondayOffset);
 }
 
