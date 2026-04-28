@@ -737,6 +737,31 @@ function getRecentSummaryFallback(
     .all(...args) as unknown as RecentSummaryFallbackRow[];
 }
 
+function countRecentSummaryFallback(
+  db: DatabaseSync,
+  conversationId: number | undefined,
+  start: Date,
+  end: Date
+): number {
+  const scopeClause = conversationId == null ? "" : "conversation_id = ? AND";
+  const args: Array<string | number> =
+    conversationId == null
+      ? [end.toISOString(), start.toISOString()]
+      : [conversationId, end.toISOString(), start.toISOString()];
+
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS count
+       FROM summaries
+       WHERE ${scopeClause}
+         kind = 'leaf'
+         AND julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)
+         AND julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)`
+    )
+    .get(...args) as { count: number } | undefined;
+  return row?.count ?? 0;
+}
+
 function hasLeafSummariesInRange(
   db: DatabaseSync,
   conversationId: number | undefined,
@@ -843,6 +868,12 @@ export function createLcmRecentTool(input: {
           resolution.start,
           resolution.end
         );
+        const totalMatches = countRecentSummaryFallback(
+          db,
+          undefined,
+          resolution.start,
+          resolution.end
+        );
         const summaryIds = recentSummaries.map((summary) => summary.summary_id);
 
         const lines: string[] = [];
@@ -884,7 +915,7 @@ export function createLcmRecentTool(input: {
           details: {
             status: "fallback",
             usedFallback: true,
-            totalMatches: recentSummaries.length,
+            totalMatches,
             summaryIds,
           },
         };
@@ -1043,6 +1074,12 @@ export function createLcmRecentTool(input: {
           resolution.start,
           resolution.end
         );
+        const totalMatches = countRecentSummaryFallback(
+          db,
+          conversationId,
+          resolution.start,
+          resolution.end
+        );
 
         const lines: string[] = [];
         lines.push(`## Recent Activity: ${resolution.label}`);
@@ -1086,7 +1123,7 @@ export function createLcmRecentTool(input: {
           details: {
             status: "fallback",
             usedFallback: true,
-            totalMatches: recentSummaries.length,
+            totalMatches,
             summaryIds: sourceSummaryIds,
           },
         };
