@@ -4515,7 +4515,7 @@ export class LcmContextEngine implements ContextEngine {
             ) {
               const rollupResult = await this.rollupBuilder.buildDailyRollups(
                 conversation.conversationId,
-                { daysBack: 7, forceCurrentDay: true },
+                { daysBack: 30, forceCurrentDay: true },
               );
               this.deps.log.info(
                 `[lcm] maintain: daily rollups conversation=${conversation.conversationId} ${sessionLabel} built=${rollupResult.built} skipped=${rollupResult.skipped} errors=${rollupResult.errors.length}`,
