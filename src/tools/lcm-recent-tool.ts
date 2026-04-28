@@ -12,6 +12,7 @@ import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 const DEFAULT_RECENT_OUTPUT_TOKENS = 24_000;
 const DEFAULT_RECENT_GLOBAL_MAX_TOKENS = 180_000;
 const ABSOLUTE_RECENT_GLOBAL_MAX_TOKENS = 300_000;
+const FALLBACK_SQL_LIMIT = 1_000;
 const DETAIL_LEVEL_TOKEN_HINTS = new Map<number, number>([
   [0, 12_000],
   [1, 24_000],
@@ -99,6 +100,12 @@ type RecentSummaryFallbackRow = {
   source_message_token_count: number;
   created_at: string;
   effective_time: string;
+};
+
+type RecentSummaryFallbackResult = {
+  summaries: RecentSummaryFallbackRow[];
+  availableCount: number;
+  sqlTruncated: boolean;
 };
 
 type RecallBudget = {
@@ -777,26 +784,6 @@ function buildAccounting(
   };
 }
 
-function confidenceForAccounting(
-  accounting: RecallAccounting,
-  status: "ready" | "stale" | "fallback"
-): "none" | "low" | "medium" | "high" {
-  if (accounting.summariesAvailable === 0 && accounting.outputTokens === 0) {
-    return "none";
-  }
-  if (accounting.truncated || accounting.summariesOmitted > 0 || status === "fallback") {
-    return accounting.summariesIncluded > 0 ? "medium" : "low";
-  }
-  return status === "stale" ? "medium" : "high";
-}
-
-function formatBudgetLines(budget: RecallBudget, accounting: RecallAccounting): string[] {
-  return [
-    `**Budget:** requested=${budget.requestedOutputTokens} global=${budget.globalMaxOutputTokens} effective=${budget.effectiveOutputTokens} detailLevel=${budget.detailLevel}`,
-    `**Ingested:** output≈${accounting.outputTokens} tokens; source summaries=${accounting.summariesIncluded}/${accounting.summariesAvailable}; source-summary tokens=${accounting.sourceSummaryTokens}; source-message tokens=${accounting.sourceMessageTokens}; omitted=${accounting.summariesOmitted}`,
-  ];
-}
-
 function combineRollups(rollups: RollupRecord[], budget: RecallBudget): {
   content: string;
   tokenCount: number;
@@ -848,14 +835,14 @@ function combineRollups(rollups: RollupRecord[], budget: RecallBudget): {
 
 function renderFallbackRollupSection(
   label: string,
-  summaries: RecentSummaryFallbackRow[],
+  fallback: RecentSummaryFallbackResult,
   timezone: string,
   budget: RecallBudget,
   includeSources: boolean
 ): { content: string; summaryIds: string[]; retainedSummaries: RecentSummaryFallbackRow[]; accounting: RecallAccounting } {
   const rendered = renderFallbackContent(
     label,
-    summaries,
+    fallback.summaries,
     timezone,
     budget,
     includeSources
@@ -867,8 +854,8 @@ function renderFallbackRollupSection(
     accounting: buildAccounting(
       rendered.content,
       rendered.retainedSummaries,
-      summaries.length,
-      rendered.truncated
+      fallback.availableCount,
+      rendered.truncated || fallback.sqlTruncated
     ),
   };
 }
@@ -1003,14 +990,14 @@ function getRecentSummaryFallback(
   conversationId: number | undefined,
   start: Date,
   end: Date
-): RecentSummaryFallbackRow[] {
+): RecentSummaryFallbackResult {
   const scopeClause = conversationId == null ? "" : "conversation_id = ? AND";
   const args: Array<string | number> =
     conversationId == null
       ? [end.toISOString(), start.toISOString()]
       : [conversationId, end.toISOString(), start.toISOString()];
 
-  return db
+  const rows = db
     .prepare(
       `SELECT
         summary_id,
@@ -1026,9 +1013,15 @@ function getRecentSummaryFallback(
          AND julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)
          AND julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)
        ORDER BY julianday(coalesce(earliest_at, latest_at, created_at)) DESC
-       LIMIT 1000`
+       LIMIT ${FALLBACK_SQL_LIMIT + 1}`
     )
     .all(...args) as unknown as RecentSummaryFallbackRow[];
+  const sqlTruncated = rows.length > FALLBACK_SQL_LIMIT;
+  return {
+    summaries: sqlTruncated ? rows.slice(0, FALLBACK_SQL_LIMIT) : rows,
+    availableCount: rows.length,
+    sqlTruncated,
+  };
 }
 
 function hasLeafSummariesInRange(
@@ -1132,7 +1125,7 @@ export function createLcmRecentTool(input: {
       const db = rollupStore.db;
 
       if (conversationScope.allConversations) {
-        const recentSummaries = getRecentSummaryFallback(
+        const fallback = getRecentSummaryFallback(
           db,
           undefined,
           resolution.start,
@@ -1140,7 +1133,7 @@ export function createLcmRecentTool(input: {
         );
         const rendered = renderFallbackContent(
           resolution.label,
-          recentSummaries,
+          fallback.summaries,
           timezone,
           budget,
           includeSources
@@ -1159,7 +1152,7 @@ export function createLcmRecentTool(input: {
         );
         lines.push("**Status:** fallback");
         lines.push("");
-        if (recentSummaries.length === 0) {
+        if (fallback.summaries.length === 0) {
           lines.push(
             "No pre-built rollup found, and no leaf summaries were captured in this period."
           );
@@ -1181,9 +1174,9 @@ export function createLcmRecentTool(input: {
           details: {
             status: "fallback",
             usedFallback: true,
-            totalMatches: recentSummaries.length,
+            totalMatches: fallback.availableCount,
             tokenCount: response.tokenCount,
-            truncated: response.truncated || rendered.truncated,
+            truncated: response.truncated || rendered.truncated || fallback.sqlTruncated,
             summaryIds: includeSources ? summaryIds : [],
           },
         };
@@ -1196,6 +1189,7 @@ export function createLcmRecentTool(input: {
       let status: "ready" | "stale" | "fallback" = "fallback";
       let sourceSummaryIds: string[] = [];
       let usedFallback = false;
+      let truncated = false;
 
       const currentDayKey = getZonedDayString(new Date(), timezone);
       const canUseStoredCurrentDay =
@@ -1307,6 +1301,7 @@ export function createLcmRecentTool(input: {
                     left.periodStart.getTime() - right.periodStart.getTime()
                 );
           const combined = combineRollups(orderedRollups, budget);
+          truncated = truncated || combined.truncated;
           const liveSections: string[] = [];
           const liveSummaryIds: string[] = [];
           if (currentDayInWindow) {
@@ -1333,6 +1328,7 @@ export function createLcmRecentTool(input: {
             liveSections.push(live.content);
             liveSummaryIds.push(...live.summaryIds);
             usedFallback = true;
+            truncated = truncated || live.accounting.truncated;
           }
           rollupContent = combined.content;
           if (liveSections.length > 0) {
@@ -1347,7 +1343,7 @@ export function createLcmRecentTool(input: {
       }
 
       if (rollupContent == null) {
-        const recentSummaries = getRecentSummaryFallback(
+        const fallback = getRecentSummaryFallback(
           db,
           conversationId,
           resolution.start,
@@ -1355,7 +1351,7 @@ export function createLcmRecentTool(input: {
         );
         const rendered = renderFallbackContent(
           resolution.label,
-          recentSummaries,
+          fallback.summaries,
           timezone,
           budget,
           includeSources
@@ -1371,7 +1367,7 @@ export function createLcmRecentTool(input: {
         );
         lines.push("**Status:** fallback");
         lines.push("");
-        if (recentSummaries.length === 0) {
+        if (fallback.summaries.length === 0) {
           lines.push(
             "No pre-built rollup available, and LCM captured no leaf summaries for this period."
           );
@@ -1396,9 +1392,9 @@ export function createLcmRecentTool(input: {
           details: {
             status: "fallback",
             usedFallback: true,
-            totalMatches: recentSummaries.length,
+            totalMatches: fallback.availableCount,
             tokenCount: response.tokenCount,
-            truncated: response.truncated || rendered.truncated,
+            truncated: response.truncated || rendered.truncated || fallback.sqlTruncated,
             summaryIds: includeSources ? sourceSummaryIds : [],
           },
         };
@@ -1432,7 +1428,7 @@ export function createLcmRecentTool(input: {
           status,
           usedFallback,
           tokenCount: response.tokenCount,
-          truncated: response.truncated,
+          truncated: response.truncated || truncated,
           summaryIds: includeSources ? sourceSummaryIds : [],
         },
       };

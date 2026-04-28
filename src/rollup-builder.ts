@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import { estimateTokens } from "./estimate-tokens.js";
 import { withDatabaseTransaction } from "./transaction-mutex.js";
 import type {
   LeafSummaryForDayRow,
@@ -1065,14 +1066,6 @@ function normalizePositiveInt(
     : fallback;
 }
 
-function estimateTokens(content: string): number {
-  const text = content.trim();
-  if (!text) {
-    return 0;
-  }
-  return Math.max(1, Math.ceil(text.length / 4));
-}
-
 function normalizeWhitespace(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
@@ -1119,8 +1112,8 @@ function getWeekBounds(
 ): { start: Date; end: Date } {
   assertValidDateKey(weekKey);
   return {
-    start: localDateTimeToUtc(weekKey, "00:00:00", timezone),
-    end: localDateTimeToUtc(shiftDateKey(weekKey, 7), "00:00:00", timezone),
+    start: localDayBoundaryToUtc(weekKey, timezone),
+    end: localDayBoundaryToUtc(shiftDateKey(weekKey, 7), timezone),
   };
 }
 
@@ -1171,8 +1164,8 @@ function getMonthBounds(
   }
   const nextMonth = getNextMonthStartKey(monthKey);
   return {
-    start: localDateTimeToUtc(`${monthKey}-01`, "00:00:00", timezone),
-    end: localDateTimeToUtc(nextMonth, "00:00:00", timezone),
+    start: localDayBoundaryToUtc(`${monthKey}-01`, timezone),
+    end: localDayBoundaryToUtc(nextMonth, timezone),
   };
 }
 
