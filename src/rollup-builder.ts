@@ -374,18 +374,24 @@ export class RollupBuilder {
         .filter((summary) => summary.kind === "leaf")
         .sort(compareSummariesChronologically);
       if (leafSummaries.length === 0) {
-        const existing = this.store.getRollup(
-          conversationId,
-          DAY_PERIOD_KIND,
-          dateKey,
-          this.config.timezone
-        );
-        if (existing) {
-          this.store.deleteRollup(existing.rollup_id);
-          result.built += 1;
-          continue;
+        try {
+          const existing = this.store.getRollup(
+            conversationId,
+            DAY_PERIOD_KIND,
+            dateKey,
+            this.config.timezone
+          );
+          if (existing) {
+            this.store.deleteRollup(existing.rollup_id);
+            result.built += 1;
+            continue;
+          }
+          result.skipped += 1;
+        } catch (error) {
+          result.errors.push(
+            `${dateKey}: empty-day cleanup failed: ${formatError(error)}`
+          );
         }
-        result.skipped += 1;
         continue;
       }
 
@@ -435,13 +441,17 @@ export class RollupBuilder {
       }
     }
 
+    const finishedAt = new Date();
     const latestState = this.store.getState(conversationId);
     const shouldClearPending =
       result.errors.length === 0 &&
       isTimestampAtOrBefore(latestState?.last_message_at, scannedAt);
     this.store.upsertState(conversationId, {
       timezone: this.config.timezone,
-      last_rollup_check_at: scannedAt.toISOString(),
+      last_rollup_check_at: laterDate(
+        finishedAt,
+        latestState?.last_rollup_check_at
+      ).toISOString(),
       pending_rebuild: result.errors.length === 0 && shouldClearPending ? 0 : 1,
     });
 
@@ -689,6 +699,17 @@ function isTimestampAtOrBefore(
   }
   const parsed = new Date(value);
   return Number.isNaN(parsed.getTime()) || parsed <= boundary;
+}
+
+function laterDate(left: Date, right: string | null | undefined): Date {
+  if (!right) {
+    return left;
+  }
+  const parsed = new Date(right);
+  if (Number.isNaN(parsed.getTime())) {
+    return left;
+  }
+  return parsed > left ? parsed : left;
 }
 
 function buildRollupId(periodKind: string, periodKey: string): string {

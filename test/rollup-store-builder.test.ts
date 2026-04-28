@@ -1087,6 +1087,55 @@ describe("LCM weekly and monthly rollups", () => {
     }
   });
 
+  it("does not move last_rollup_check_at backwards after sweep builds", async () => {
+    const scanStart = new Date("2026-04-28T12:00:00.000Z");
+    const buildTime = new Date("2026-04-28T12:00:05.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(scanStart);
+    try {
+      const { conversationStore, summaryStore, rollupStore } = createStores();
+      const conversation = await conversationStore.createConversation({
+        sessionId: "rollup-check-monotonic",
+        sessionKey: "agent:main:rollup-check-monotonic",
+        title: "Rollup check monotonic",
+      });
+
+      await summaryStore.insertSummary({
+        summaryId: "sum_rollup_check_monotonic",
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: "Completed a monotonic state update check.",
+        tokenCount: 10,
+        earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+        latestAt: new Date("2026-04-27T10:30:00.000Z"),
+      });
+
+      const originalGetLeafSummaries =
+        rollupStore.getLeafSummariesForDay.bind(rollupStore);
+      const lookupSpy = vi
+        .spyOn(rollupStore, "getLeafSummariesForDay")
+        .mockImplementation((...args) => {
+          vi.setSystemTime(buildTime);
+          return originalGetLeafSummaries(...args);
+        });
+
+      const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+      await expect(
+        builder.buildDailyRollups(conversation.conversationId, {
+          forceCurrentDay: true,
+          daysBack: 2,
+        })
+      ).resolves.toMatchObject({ built: 1, errors: [] });
+      lookupSpy.mockRestore();
+
+      const state = rollupStore.getState(conversation.conversationId);
+      expect(state?.last_rollup_check_at).toBe(buildTime.toISOString());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("hides debug source IDs unless includeSources is true", async () => {
     const { conversationStore, summaryStore, rollupStore } = createStores();
     const conversation = await conversationStore.createConversation({
