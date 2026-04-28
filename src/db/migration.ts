@@ -1046,6 +1046,21 @@ export function runLcmMigrations(
       CREATE INDEX IF NOT EXISTS summaries_leaf_temporal_idx
       ON summaries (conversation_id, kind, latest_at, earliest_at, created_at)
       WHERE kind = 'leaf';
+
+      CREATE INDEX IF NOT EXISTS summaries_leaf_effective_time_conv_idx
+      ON summaries (
+        conversation_id,
+        julianday(coalesce(earliest_at, latest_at, created_at)),
+        julianday(coalesce(latest_at, earliest_at, created_at))
+      )
+      WHERE kind = 'leaf';
+
+      CREATE INDEX IF NOT EXISTS summaries_leaf_effective_time_idx
+      ON summaries (
+        julianday(coalesce(earliest_at, latest_at, created_at)),
+        julianday(coalesce(latest_at, earliest_at, created_at))
+      )
+      WHERE kind = 'leaf';
     `);
   });
 
