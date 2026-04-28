@@ -135,7 +135,7 @@ function getUtcDateForZonedMidnight(dayString: string, timezone: string): Date {
   const approxUtc = new Date(Date.UTC(year, month - 1, day, 0, 0, 0, 0));
   const dtf = new Intl.DateTimeFormat("en-US", {
     timeZone: timezone,
-    hour12: false,
+    hourCycle: "h23",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",

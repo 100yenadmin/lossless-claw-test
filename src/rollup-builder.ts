@@ -821,7 +821,7 @@ function getTimeZoneOffsetMs(date: Date, timezone: string): number {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
-    hour12: false,
+    hourCycle: "h23",
   });
   const parts = formatter.formatToParts(date);
   const lookup = new Map(parts.map((part) => [part.type, part.value]));
