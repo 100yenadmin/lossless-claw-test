@@ -71,7 +71,7 @@ Use for:
 
 Call shape:
 
-- `lcm_grep` requires a `conversationId` in current runtimes. If you do not know it, first identify the active/relevant conversation from the session context or use the LCM conversation-scoping helpers available in that runtime.
+- `lcm_grep` accepts an optional `conversationId`. When the runtime has resolved the current session's conversation scope, omitting `conversationId` uses that conversation by default. If no conversation scope is resolved, provide `conversationId` or set `allConversations=true`.
 
 Do not use it for:
 
