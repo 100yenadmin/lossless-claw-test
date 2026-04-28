@@ -202,6 +202,46 @@ describe("LCM temporal rollup MVP", () => {
     ).toBeNull();
   });
 
+  it("deletes empty-day rollups during the daily sweep", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const { db, conversationStore, summaryStore, rollupStore } = createStores();
+      const conversation = await conversationStore.createConversation({
+        sessionId: "empty-sweep-day",
+        sessionKey: "agent:main:empty-sweep-day",
+        title: "Empty sweep day",
+      });
+
+      await summaryStore.insertSummary({
+        summaryId: "sum_empty_sweep",
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: "Temporary sweep day rollup content.",
+        tokenCount: 10,
+        earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+        latestAt: new Date("2026-04-27T10:30:00.000Z"),
+      });
+
+      const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+      await builder.buildDayRollup(conversation.conversationId, "2026-04-27");
+      db.prepare("DELETE FROM summaries WHERE summary_id = ?").run("sum_empty_sweep");
+      const result = await builder.buildDailyRollups(conversation.conversationId, {
+        forceCurrentDay: true,
+        daysBack: 2,
+      });
+
+      expect(result.built).toBeGreaterThan(0);
+      expect(
+        rollupStore.getRollup(conversation.conversationId, "day", "2026-04-27")
+      ).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("uses the requested local date key for UTC+13 daily rollups", async () => {
     const { conversationStore, summaryStore, rollupStore } = createStores();
     const conversation = await conversationStore.createConversation({

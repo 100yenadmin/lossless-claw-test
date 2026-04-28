@@ -127,6 +127,17 @@ export class RollupBuilder {
         .filter((summary) => summary.kind === "leaf")
         .sort(compareSummariesChronologically);
       if (leafSummaries.length === 0) {
+        const existing = this.store.getRollup(
+          conversationId,
+          PERIOD_KIND,
+          dateKey,
+          this.config.timezone
+        );
+        if (existing) {
+          this.store.deleteRollup(existing.rollup_id);
+          result.built += 1;
+          continue;
+        }
         result.skipped += 1;
         continue;
       }
