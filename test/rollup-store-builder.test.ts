@@ -190,6 +190,41 @@ describe("LCM temporal rollup MVP", () => {
     ).toBeNull();
   });
 
+  it("builds daily rollups when local midnight is skipped by DST", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "midnight-gap-day",
+      sessionKey: "agent:main:midnight-gap-day",
+      title: "Midnight gap day",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_midnight_gap",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Captured work after a skipped local midnight.",
+      tokenCount: 10,
+      earliestAt: new Date("2026-04-23T22:30:00.000Z"),
+      latestAt: new Date("2026-04-23T22:45:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, {
+      timezone: "Africa/Cairo",
+    });
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-24")
+    ).resolves.toBe(true);
+    expect(
+      rollupStore.getRollup(
+        conversation.conversationId,
+        "day",
+        "2026-04-24",
+        "Africa/Cairo"
+      )?.content
+    ).toContain("skipped local midnight");
+  });
+
   it("checks for an existing rollup inside buildDayRollup before writing", async () => {
     const { conversationStore, summaryStore, rollupStore } = createStores();
     const conversation = await conversationStore.createConversation({
@@ -375,6 +410,14 @@ describe("LCM sub-day window retrieval", () => {
     );
     expect(midnightTransition.start.toISOString()).toBe(
       "2026-03-27T22:00:00.000Z"
+    );
+
+    const skippedMidnight = __lcmRecentTestInternals.resolvePeriod(
+      "date:2026-04-24",
+      "Africa/Cairo"
+    );
+    expect(skippedMidnight.start.toISOString()).toBe(
+      "2026-04-23T22:00:00.000Z"
     );
   });
 

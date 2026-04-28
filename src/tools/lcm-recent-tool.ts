@@ -144,7 +144,21 @@ function getZonedDayString(date: Date, timezone: string): string {
 }
 
 function getUtcDateForZonedMidnight(dayString: string, timezone: string): Date {
-  return localDateTimeToUtc(dayString, "00:00:00", timezone);
+  try {
+    return localDateTimeToUtc(dayString, "00:00:00", timezone);
+  } catch (error) {
+    for (let minuteOfDay = 1; minuteOfDay < 24 * 60; minuteOfDay += 1) {
+      const hour = Math.floor(minuteOfDay / 60);
+      const minute = minuteOfDay % 60;
+      const time = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00`;
+      try {
+        return localDateTimeToUtc(dayString, time, timezone);
+      } catch {
+        // Day boundaries use the first representable instant on DST-skipped-midnight days.
+      }
+    }
+    throw error;
+  }
 }
 
 function addDays(dayString: string, delta: number): string {
