@@ -827,9 +827,16 @@ function renderFallbackRollupSection(
   label: string,
   summaries: RecentSummaryFallbackRow[],
   timezone: string,
-  budget: RecallBudget
+  budget: RecallBudget,
+  includeSources: boolean
 ): { content: string; summaryIds: string[]; retainedSummaries: RecentSummaryFallbackRow[]; accounting: RecallAccounting } {
-  const rendered = renderFallbackContent(label, summaries, timezone, budget);
+  const rendered = renderFallbackContent(
+    label,
+    summaries,
+    timezone,
+    budget,
+    includeSources
+  );
   return {
     content: rendered.content,
     summaryIds: rendered.retainedSummaries.map((summary) => summary.summary_id),
@@ -847,15 +854,28 @@ function renderFallbackContent(
   label: string,
   summaries: RecentSummaryFallbackRow[],
   timezone: string,
-  budget: RecallBudget
+  budget: RecallBudget,
+  includeSources: boolean
 ): { content: string; retainedSummaries: RecentSummaryFallbackRow[]; truncated: boolean } {
   const retainedSummaries = summaries.slice(0, budget.maxSourceSummaries);
   let truncated = retainedSummaries.length < summaries.length;
-  let lines = buildFallbackLines(label, retainedSummaries, timezone, truncated ? summaries.length - retainedSummaries.length : 0);
+  let lines = buildFallbackLines(
+    label,
+    retainedSummaries,
+    timezone,
+    truncated ? summaries.length - retainedSummaries.length : 0,
+    includeSources
+  );
   while (retainedSummaries.length > 1 && estimateTokens(lines.join("\n")) > budget.effectiveOutputTokens) {
     retainedSummaries.pop();
     truncated = true;
-    lines = buildFallbackLines(label, retainedSummaries, timezone, summaries.length - retainedSummaries.length);
+    lines = buildFallbackLines(
+      label,
+      retainedSummaries,
+      timezone,
+      summaries.length - retainedSummaries.length,
+      includeSources
+    );
   }
   let content = lines.join("\n");
   if (estimateTokens(content) > budget.effectiveOutputTokens) {
@@ -869,7 +889,8 @@ function buildFallbackLines(
   label: string,
   summaries: RecentSummaryFallbackRow[],
   timezone: string,
-  omitted: number
+  omitted: number,
+  includeSources: boolean
 ): string[] {
   const lines = [`### ${label} (source-summary layer)`];
   if (omitted > 0) {
@@ -879,8 +900,11 @@ function buildFallbackLines(
     lines.push("- No leaf summaries captured.");
   } else {
     for (const summary of summaries) {
+      const prefix = includeSources
+        ? `[${summary.summary_id}] `
+        : "";
       lines.push(
-        `- [${summary.summary_id}] (${summary.kind}, ${formatDisplayTime(
+        `- ${prefix}(${summary.kind}, ${formatDisplayTime(
           summary.effective_time,
           timezone
         )}, summaryTokens=${summary.token_count}, sourceTokens=${summary.source_message_token_count}): ${summary.content.replace(/\n/g, " ").trim()}`
@@ -912,6 +936,22 @@ function truncateToEstimatedTokens(text: string, maxTokens: number): string {
     }
   }
   return `${text.slice(0, low).trimEnd()}${suffix}`;
+}
+
+function enforceResponseBudget(
+  text: string,
+  budget: RecallBudget
+): { text: string; tokenCount: number; truncated: boolean } {
+  const tokenCount = estimateTokens(text);
+  if (tokenCount <= budget.effectiveOutputTokens) {
+    return { text, tokenCount, truncated: false };
+  }
+  const truncated = truncateToEstimatedTokens(text, budget.effectiveOutputTokens);
+  return {
+    text: truncated,
+    tokenCount: estimateTokens(truncated),
+    truncated: true,
+  };
 }
 
 function getExpectedDayKeys(
@@ -1035,7 +1075,16 @@ export function createLcmRecentTool(input: {
           resolution.start,
           resolution.end
         );
-        const summaryIds = recentSummaries.map((summary) => summary.summary_id);
+        const rendered = renderFallbackContent(
+          resolution.label,
+          recentSummaries,
+          timezone,
+          budget,
+          includeSources
+        );
+        const summaryIds = rendered.retainedSummaries.map(
+          (summary) => summary.summary_id
+        );
 
         const lines: string[] = [];
         lines.push(`## Recent Activity: ${resolution.label}`);
@@ -1046,7 +1095,7 @@ export function createLcmRecentTool(input: {
           )} — ${formatDisplayTime(resolution.end, timezone)}`
         );
         lines.push("**Status:** fallback");
-        lines.push(`**Token count:** 0`);
+        lines.push(`**Token count:** ${estimateTokens(rendered.content)}`);
         lines.push("");
         if (recentSummaries.length === 0) {
           lines.push(
@@ -1057,27 +1106,23 @@ export function createLcmRecentTool(input: {
             "No pre-built rollup available. Here's what LCM captured for this period:"
           );
           lines.push("");
-          for (const summary of recentSummaries) {
-            lines.push(
-              `- [${summary.summary_id}] (${summary.kind}, ${formatDisplayTime(
-                summary.effective_time,
-                timezone
-              )}): ${summary.content.replace(/\n/g, " ").trim()}`
-            );
-          }
+          lines.push(rendered.content);
           lines.push("");
         }
         lines.push("---");
         lines.push(formatSourcesLine(summaryIds, includeSources));
-        lines.push(formatDrilldownHint(includeSources));
+        lines.push(formatDrilldownHint(includeSources, "medium"));
+        const response = enforceResponseBudget(lines.join("\n"), budget);
 
         return {
-          content: [{ type: "text", text: lines.join("\n") }],
+          content: [{ type: "text", text: response.text }],
           details: {
             status: "fallback",
             usedFallback: true,
             totalMatches: recentSummaries.length,
-            summaryIds,
+            tokenCount: response.tokenCount,
+            truncated: response.truncated || rendered.truncated,
+            summaryIds: includeSources ? summaryIds : [],
           },
         };
       }
@@ -1212,7 +1257,8 @@ export function createLcmRecentTool(input: {
               currentDayKey,
               getRecentSummaryFallback(db, conversationId, currentStart, currentEnd),
               timezone,
-              budget
+              budget,
+              includeSources
             );
             liveSections.push(live.content);
             liveSummaryIds.push(...live.summaryIds);
@@ -1237,6 +1283,13 @@ export function createLcmRecentTool(input: {
           resolution.start,
           resolution.end
         );
+        const rendered = renderFallbackContent(
+          resolution.label,
+          recentSummaries,
+          timezone,
+          budget,
+          includeSources
+        );
 
         const lines: string[] = [];
         lines.push(`## Recent Activity: ${resolution.label}`);
@@ -1247,7 +1300,7 @@ export function createLcmRecentTool(input: {
           )} — ${formatDisplayTime(resolution.end, timezone)}`
         );
         lines.push("**Status:** fallback");
-        lines.push("**Token count:** 0");
+        lines.push(`**Token count:** ${estimateTokens(rendered.content)}`);
         lines.push("");
         if (recentSummaries.length === 0) {
           lines.push(
@@ -1258,30 +1311,26 @@ export function createLcmRecentTool(input: {
             "No pre-built rollup available. Here's what LCM captured for this period:"
           );
           lines.push("");
-          for (const summary of recentSummaries) {
-            lines.push(
-              `- [${summary.summary_id}] (${summary.kind}, ${formatDisplayTime(
-                summary.effective_time,
-                timezone
-              )}): ${summary.content.replace(/\n/g, " ").trim()}`
-            );
-          }
+          lines.push(rendered.content);
           lines.push("");
-          sourceSummaryIds = recentSummaries.map(
+          sourceSummaryIds = rendered.retainedSummaries.map(
             (summary) => summary.summary_id
           );
         }
         lines.push("---");
         lines.push(formatSourcesLine(sourceSummaryIds, includeSources));
-        lines.push(formatDrilldownHint(includeSources));
+        lines.push(formatDrilldownHint(includeSources, "medium"));
+        const response = enforceResponseBudget(lines.join("\n"), budget);
 
         return {
-          content: [{ type: "text", text: lines.join("\n") }],
+          content: [{ type: "text", text: response.text }],
           details: {
             status: "fallback",
             usedFallback: true,
             totalMatches: recentSummaries.length,
-            summaryIds: sourceSummaryIds,
+            tokenCount: response.tokenCount,
+            truncated: response.truncated || rendered.truncated,
+            summaryIds: includeSources ? sourceSummaryIds : [],
           },
         };
       }
@@ -1301,15 +1350,17 @@ export function createLcmRecentTool(input: {
       lines.push("");
       lines.push("---");
       lines.push(formatSourcesLine(sourceSummaryIds, includeSources));
-      lines.push(formatDrilldownHint(includeSources));
+      lines.push(formatDrilldownHint(includeSources, "high"));
+      const response = enforceResponseBudget(lines.join("\n"), budget);
 
       return {
-        content: [{ type: "text", text: lines.join("\n") }],
+        content: [{ type: "text", text: response.text }],
         details: {
           status,
           usedFallback,
-          tokenCount,
-          summaryIds: sourceSummaryIds,
+          tokenCount: response.tokenCount,
+          truncated: response.truncated,
+          summaryIds: includeSources ? sourceSummaryIds : [],
         },
       };
     },

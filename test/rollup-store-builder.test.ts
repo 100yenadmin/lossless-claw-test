@@ -6,6 +6,7 @@ import { ConversationStore } from "../src/store/conversation-store.js";
 import { SummaryStore } from "../src/store/summary-store.js";
 import { RollupBuilder } from "../src/rollup-builder.js";
 import { RollupStore } from "../src/store/rollup-store.js";
+import { estimateTokens } from "../src/estimate-tokens.js";
 
 function createStores() {
   const db = new DatabaseSync(":memory:");
@@ -324,6 +325,61 @@ describe("LCM sub-day window retrieval", () => {
       "sum_inside_window",
       "sum_spanning_window",
     ]);
+  });
+
+  it("hides fallback source IDs unless requested and clamps output budget", async () => {
+    const { db, conversationStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "fallback-budget",
+      sessionKey: "agent:main:fallback-budget",
+      title: "Fallback budget",
+    });
+
+    for (let index = 0; index < 80; index += 1) {
+      await summaryStore.insertSummary({
+        summaryId: `sum_budget_${index}`,
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: `Budgeted fallback item ${index} ${"detail ".repeat(80)}`,
+        tokenCount: 90,
+        sourceMessageTokenCount: 90,
+        latestAt: new Date(`2026-04-27T10:${String(index % 60).padStart(2, "0")}:00.000Z`),
+      });
+    }
+
+    const lcm = {
+      timezone: "UTC",
+      getRollupStore: () => new RollupStore(db),
+      getConversationStore: () => ({
+        getConversationBySessionId: async () => ({
+          conversationId: conversation.conversationId,
+          sessionId: "fallback-budget",
+          title: null,
+          bootstrappedAt: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }),
+        getConversationBySessionKey: async () => null,
+      }),
+    };
+    const tool = createLcmRecentTool({
+      deps: makeRecentDeps(),
+      lcm: lcm as never,
+      sessionId: "fallback-budget",
+    });
+
+    const result = await tool.execute("call-budget", {
+      period: "date:2026-04-27 10:00-11:30",
+      includeSources: false,
+      maxOutputTokens: 1000,
+      globalMaxOutputTokens: 1000,
+      maxSourceSummaries: 80,
+    });
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).not.toContain("sum_budget_");
+    expect(estimateTokens(text)).toBeLessThanOrEqual(1000);
+    expect((result.details as { summaryIds?: string[] }).summaryIds).toEqual([]);
   });
 
   it("combines complete prior daily rollups with live fallback for 7d", async () => {
