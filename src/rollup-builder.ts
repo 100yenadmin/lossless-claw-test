@@ -201,14 +201,20 @@ export class RollupBuilder {
       timezone: this.config.timezone,
       maxTokens: this.dailyMaxTokens,
     });
-    const existing = this.store.getRollup(conversationId, PERIOD_KIND, dateKey);
-    const rollupId = existing?.rollup_id ?? buildRollupId(PERIOD_KIND, dateKey);
     const builtAt = new Date();
 
     await withDatabaseTransaction(
       this.store.db,
       "BEGIN IMMEDIATE",
       async () => {
+        const existing = this.store.getRollup(
+          conversationId,
+          PERIOD_KIND,
+          dateKey,
+        );
+        const rollupId =
+          existing?.rollup_id ?? buildRollupId(PERIOD_KIND, dateKey);
+
         if (
           existing?.rollup_id &&
           existing.source_fingerprint &&
@@ -623,9 +629,7 @@ function stripBulletPrefix(value: string): string {
 }
 
 function parseDateKey(dateKey: string): Date {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
-    throw new Error(`Invalid date key: ${dateKey}`);
-  }
+  assertValidDateKey(dateKey);
   return new Date(`${dateKey}T12:00:00.000Z`);
 }
 
@@ -640,25 +644,110 @@ function shiftDateKey(dateKey: string, dayDelta: number): string {
   return utcDate.toISOString().slice(0, 10);
 }
 
+function assertValidDateKey(dateKey: string): void {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
+    throw new Error(`Invalid date key: ${dateKey}`);
+  }
+  const probe = new Date(`${dateKey}T12:00:00.000Z`);
+  if (Number.isNaN(probe.getTime()) || probe.toISOString().slice(0, 10) !== dateKey) {
+    throw new Error(`Invalid date key: ${dateKey}`);
+  }
+}
+
+function parseTimeParts(time: string): { hour: number; minute: number; second: number } {
+  const match = /^(\d{2}):(\d{2}):(\d{2})$/.exec(time);
+  if (!match) {
+    throw new Error(`Invalid time: ${time}`);
+  }
+  const hour = Number.parseInt(match[1]!, 10);
+  const minute = Number.parseInt(match[2]!, 10);
+  const second = Number.parseInt(match[3]!, 10);
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) {
+    throw new Error(`Invalid time: ${time}`);
+  }
+  return { hour, minute, second };
+}
+
+function normalizeZonedParts(parts: {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+}): {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+} {
+  if (parts.hour !== 24) {
+    return parts;
+  }
+  const rolled = new Date(Date.UTC(parts.year, parts.month - 1, parts.day, 0, parts.minute, parts.second));
+  rolled.setUTCDate(rolled.getUTCDate() + 1);
+  return {
+    year: rolled.getUTCFullYear(),
+    month: rolled.getUTCMonth() + 1,
+    day: rolled.getUTCDate(),
+    hour: 0,
+    minute: rolled.getUTCMinutes(),
+    second: rolled.getUTCSeconds(),
+  };
+}
+
 function localDateTimeToUtc(
   dateKey: string,
   time: string,
   timezone: string,
 ): Date {
+  assertValidDateKey(dateKey);
   const [year, month, day] = dateKey
     .split("-")
     .map((part) => Number.parseInt(part, 10));
-  const [hour, minute, second] = time
-    .split(":")
-    .map((part) => Number.parseInt(part, 10));
-  const utcGuess = new Date(
+  const { hour, minute, second } = parseTimeParts(time);
+
+  let candidate = new Date(
     Date.UTC(year, month - 1, day, hour, minute, second, 0),
   );
-  const offsetMs = getTimeZoneOffsetMs(utcGuess, timezone);
-  return new Date(utcGuess.getTime() - offsetMs);
+
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const parts = getZonedDateTimeParts(candidate, timezone);
+    const deltaMs =
+      Date.UTC(year, month - 1, day, hour, minute, second, 0) -
+      Date.UTC(
+        parts.year,
+        parts.month - 1,
+        parts.day,
+        parts.hour,
+        parts.minute,
+        parts.second,
+        0,
+      );
+    if (deltaMs === 0) {
+      return candidate;
+    }
+    candidate = new Date(candidate.getTime() + deltaMs);
+  }
+
+  throw new Error(
+    `Nonexistent local time ${dateKey} ${time} in timezone ${timezone}`,
+  );
 }
 
-function getTimeZoneOffsetMs(date: Date, timezone: string): number {
+function getZonedDateTimeParts(
+  date: Date,
+  timezone: string,
+): {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+} {
   const formatter = new Intl.DateTimeFormat("en-US", {
     timeZone: timezone,
     year: "numeric",
@@ -671,15 +760,14 @@ function getTimeZoneOffsetMs(date: Date, timezone: string): number {
   });
   const parts = formatter.formatToParts(date);
   const lookup = new Map(parts.map((part) => [part.type, part.value]));
-  const localAsUtc = Date.UTC(
-    Number.parseInt(lookup.get("year") ?? "0", 10),
-    Number.parseInt(lookup.get("month") ?? "1", 10) - 1,
-    Number.parseInt(lookup.get("day") ?? "1", 10),
-    Number.parseInt(lookup.get("hour") ?? "0", 10),
-    Number.parseInt(lookup.get("minute") ?? "0", 10),
-    Number.parseInt(lookup.get("second") ?? "0", 10),
-  );
-  return localAsUtc - date.getTime();
+  return normalizeZonedParts({
+    year: Number.parseInt(lookup.get("year") ?? "0", 10),
+    month: Number.parseInt(lookup.get("month") ?? "1", 10),
+    day: Number.parseInt(lookup.get("day") ?? "1", 10),
+    hour: Number.parseInt(lookup.get("hour") ?? "0", 10),
+    minute: Number.parseInt(lookup.get("minute") ?? "0", 10),
+    second: Number.parseInt(lookup.get("second") ?? "0", 10),
+  });
 }
 
 function formatError(error: unknown): string {

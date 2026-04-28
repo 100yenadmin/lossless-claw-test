@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { getLcmDbFeatures } from "../src/db/features.js";
@@ -114,6 +114,40 @@ describe("LCM temporal rollup MVP", () => {
         .map((source) => source.source_id)
     ).toEqual(["sum_rollup_a", "sum_rollup_b"]);
   });
+
+  it("checks for an existing rollup inside buildDayRollup before writing", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "rollup-toctou",
+      sessionKey: "agent:main:rollup-toctou",
+      title: "Rollup TOCTOU",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_rollup_txn",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Completed the transactional lookup hardening.",
+      tokenCount: 10,
+      earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+      latestAt: new Date("2026-04-27T10:30:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    const spy = vi.spyOn(rollupStore, "getRollup");
+
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+
+    expect(spy).toHaveBeenCalledWith(
+      conversation.conversationId,
+      "day",
+      "2026-04-27"
+    );
+    expect(spy.mock.calls.length).toBe(1);
+  });
 });
 
 import {
@@ -200,6 +234,20 @@ describe("LCM sub-day window retrieval", () => {
     );
     expect(meridiemWindow.window?.startMinutes).toBe(16 * 60);
     expect(meridiemWindow.window?.endMinutes).toBe(20 * 60);
+
+    expect(() =>
+      __lcmRecentTestInternals.resolvePeriod(
+        "date:2026-03-08 2:30-3:30",
+        "America/New_York"
+      )
+    ).toThrow(/Nonexistent local time/);
+
+    expect(() =>
+      __lcmRecentTestInternals.resolvePeriod(
+        "date:2026-02-31",
+        "UTC"
+      )
+    ).toThrow(/real calendar date/);
   });
 
   it("falls back to leaf summaries inside the requested sub-day window", async () => {

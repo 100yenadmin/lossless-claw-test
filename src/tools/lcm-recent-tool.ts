@@ -145,6 +145,7 @@ function getZonedDayString(date: Date, timezone: string): string {
 }
 
 function getUtcDateForZonedMidnight(dayString: string, timezone: string): Date {
+  assertValidDateKey(dayString, 'period date');
   const [year, month, day] = dayString.split("-").map((part) => Number(part));
   const approxUtc = new Date(Date.UTC(year, month - 1, day, 0, 0, 0, 0));
   const dtf = new Intl.DateTimeFormat("en-US", {
@@ -181,6 +182,7 @@ function getUtcDateForZonedMidnight(dayString: string, timezone: string): Date {
 }
 
 function addDays(dayString: string, delta: number): string {
+  assertValidDateKey(dayString, 'period date');
   const [year, month, day] = dayString.split("-").map((part) => Number(part));
   const date = new Date(Date.UTC(year, month - 1, day + delta, 0, 0, 0, 0));
   return `${date.getUTCFullYear().toString().padStart(4, "0")}-${String(
@@ -199,6 +201,60 @@ function startOfWeekDayString(dayString: string): string {
 function startOfMonthDayString(dayString: string): string {
   const [year, month] = dayString.split("-");
   return `${year}-${month}-01`;
+}
+
+function assertValidDateKey(dateKey: string, label = 'date'): void {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
+    throw new Error(`${label} must be in the form "date:YYYY-MM-DD".`);
+  }
+  const probe = new Date(`${dateKey}T12:00:00.000Z`);
+  if (Number.isNaN(probe.getTime()) || probe.toISOString().slice(0, 10) !== dateKey) {
+    throw new Error(`${label} must be a real calendar date.`);
+  }
+}
+
+function parseTimeParts(time: string): { hour: number; minute: number; second: number } {
+  const match = /^(\d{2}):(\d{2}):(\d{2})$/.exec(time);
+  if (!match) {
+    throw new Error(`Invalid time: ${time}`);
+  }
+  const hour = Number.parseInt(match[1]!, 10);
+  const minute = Number.parseInt(match[2]!, 10);
+  const second = Number.parseInt(match[3]!, 10);
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) {
+    throw new Error(`Invalid time: ${time}`);
+  }
+  return { hour, minute, second };
+}
+
+function normalizeZonedParts(parts: {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+}): {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+} {
+  if (parts.hour != 24) {
+    return parts;
+  }
+  const rolled = new Date(Date.UTC(parts.year, parts.month - 1, parts.day, 0, parts.minute, parts.second));
+  rolled.setUTCDate(rolled.getUTCDate() + 1);
+  return {
+    year: rolled.getUTCFullYear(),
+    month: rolled.getUTCMonth() + 1,
+    day: rolled.getUTCDate(),
+    hour: 0,
+    minute: rolled.getUTCMinutes(),
+    second: rolled.getUTCSeconds(),
+  };
 }
 
 function getUtcDateForZonedLocalTime(
@@ -220,12 +276,11 @@ function localDateTimeToUtc(
   time: string,
   timezone: string
 ): Date {
+  assertValidDateKey(dateKey, 'period date');
   const [year, month, day] = dateKey
     .split("-")
     .map((part) => Number.parseInt(part, 10));
-  const [hour, minute, second] = time
-    .split(":")
-    .map((part) => Number.parseInt(part, 10));
+  const { hour, minute, second } = parseTimeParts(time);
   let candidate = new Date(
     Date.UTC(year, month - 1, day, hour, minute, second, 0)
   );
@@ -249,7 +304,9 @@ function localDateTimeToUtc(
     candidate = new Date(candidate.getTime() + deltaMs);
   }
 
-  return candidate;
+  throw new Error(
+    `Nonexistent local time ${dateKey} ${time} in timezone ${timezone}`
+  );
 }
 
 function getZonedDateTimeParts(
@@ -275,15 +332,14 @@ function getZonedDateTimeParts(
   });
   const parts = formatter.formatToParts(date);
   const lookup = new Map(parts.map((part) => [part.type, part.value]));
-  const rawHour = Number.parseInt(lookup.get("hour") ?? "0", 10);
-  return {
+  return normalizeZonedParts({
     year: Number.parseInt(lookup.get("year") ?? "0", 10),
     month: Number.parseInt(lookup.get("month") ?? "1", 10),
     day: Number.parseInt(lookup.get("day") ?? "1", 10),
-    hour: rawHour === 24 ? 0 : rawHour,
+    hour: Number.parseInt(lookup.get("hour") ?? "0", 10),
     minute: Number.parseInt(lookup.get("minute") ?? "0", 10),
     second: Number.parseInt(lookup.get("second") ?? "0", 10),
-  };
+  });
 }
 
 function parseClockToken(raw: string): number | null {
@@ -395,13 +451,9 @@ function parseBaseDay(
   }
   if (base.startsWith("date:")) {
     const day = base.slice(5).trim();
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
-      return null;
-    }
-    if (
-      Number.isNaN(new Date(`${day}T12:00:00.000Z`).getTime()) ||
-      new Date(`${day}T12:00:00.000Z`).toISOString().slice(0, 10) !== day
-    ) {
+    try {
+      assertValidDateKey(day, 'period date');
+    } catch {
       return null;
     }
     return { day, label: day };
@@ -507,9 +559,7 @@ function resolvePeriod(period: string, timezone: string): PeriodResolution {
 
   if (normalized.startsWith("date:")) {
     const day = normalized.slice(5);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
-      throw new Error('period date must be in the form "date:YYYY-MM-DD".');
-    }
+    assertValidDateKey(day, 'period date');
     const start = getUtcDateForZonedMidnight(day, timezone);
     const end = getUtcDateForZonedMidnight(addDays(day, 1), timezone);
     return { label: day, kind: "day", periodKey: day, start, end };
