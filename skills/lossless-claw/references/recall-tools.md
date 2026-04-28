@@ -9,10 +9,17 @@ Use recall tools when the answer depends on historical evidence from compacted c
 | Recap by known time window                                         | `lcm_recent`                         | `lcm_describe` / `lcm_expand_query` for proof |
 | Keyword, PR, file, customer, error, or identifier search           | `lcm_grep`                           | `lcm_describe` / `lcm_expand_query`           |
 | Known summary or file ID                                           | `lcm_describe`                       | `lcm_expand` / `lcm_expand_query` if needed   |
-| Exact command, path, timestamp, root cause, or shipped-proof claim | `lcm_grep` or `lcm_recent` to narrow | `lcm_expand_query` before asserting           |
+| Exact command, path, timestamp, root cause, or shipped-proof claim | `lcm_recent` or `lcm_grep` to narrow | `lcm_describe` / `lcm_expand_query` before asserting |
 | Rollup freshness/provenance/debugging                              | `lcm_rollup_debug`                   | Source drilldown if needed                    |
 
 ## Tool selection
+
+Proof path:
+
+- `lcm_recent` is the best entry point for recap by time window, but it is **not** the final evidence layer.
+- When the user needs exact commands, file paths, timestamps, root causes, or proof of what shipped/was decided, verify the returned source IDs with `lcm_describe` or recover exact evidence with `lcm_expand_query`.
+- If the temporal-memory PR stack is not merged yet, or `lcm_recent` is unavailable in the current runtime, fall back to `lcm_grep` plus bounded expansion and say the temporal coverage is approximate.
+
 
 ### `lcm_recent`
 
@@ -34,6 +41,7 @@ Why use it:
 - It uses prebuilt day/week/month rollups when available.
 - It falls back to bounded source summaries for precise windows.
 - It keeps provenance available so you can drill down when exact evidence is needed.
+- It is the right entry tool for recap, not the last tool for proof.
 
 Important limits:
 
@@ -116,7 +124,7 @@ Examples: "what happened yesterday?", "what did we do after lunch?", "what did w
 
 Examples: "what happened after the restart?", "what changed since Eric broke?"
 
-1. If the event time is unknown, first locate it with `lcm_grep`, logs, diagnostics, or the relevant system source.
+1. Anchor the event time/window first. If it is unknown, locate it with `lcm_grep`, logs, diagnostics, or the relevant system source.
 2. Run `lcm_recent` over the known post-event local window, such as `last 3h` or `date:YYYY-MM-DD HH:MM-HH:MM`.
 3. Verify exact claims with `lcm_describe` or `lcm_expand_query`.
 
@@ -139,3 +147,15 @@ Examples: "what happened with Eric yesterday afternoon?", "what did we decide ab
 ## Important guardrail
 
 Do not infer exact details from summaries or rollups alone when the user needs evidence. Expand first or state that the answer still needs expansion.
+
+## End-to-end example
+
+Question: "What happened after the restart yesterday afternoon, and what exact command fixed it?"
+
+1. Anchor the restart time first from logs/diagnostics or `lcm_grep` if the time is not already known.
+2. Run `lcm_recent(period: "date:2026-04-27 14:00-18:00")` or the equivalent post-event window to get a recap and source IDs.
+3. Inspect the most relevant returned source IDs with `lcm_describe` to confirm which summary/file covers the fix.
+4. Run `lcm_expand_query` over those source IDs with a prompt like "What exact command fixed the issue after the restart, and when was it run?"
+5. Answer from the expanded evidence, not from the recap alone.
+
+If `lcm_recent` is unavailable, say so and approximate the same flow with `lcm_grep` plus bounded expansion.

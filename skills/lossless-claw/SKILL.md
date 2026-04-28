@@ -14,8 +14,10 @@ Start here:
 3. If they suspect summary corruption or truncation, use `/lossless doctor`.
 4. If they want high-confidence junk/session cleanup guidance, use `/lossless doctor clean` before recommending any deletes.
 5. If they ask how `/new`, `/reset`, or `/lossless rotate` interacts with LCM, read the session-lifecycle reference before answering.
-6. For clearly time-bounded questions like "what happened yesterday/this week," load `references/recall-tools.md` and prefer `lcm_recent`. For event-bounded questions like "after the restart," first anchor the event time if it is unknown.
-7. Load the relevant reference file instead of improvising details from memory.
+6. For clearly time-bounded questions like "what happened yesterday/this week," load `references/recall-tools.md` and prefer `lcm_recent`.
+7. For event-bounded questions like "after the restart," first anchor the event time/window if it is unknown, then use `lcm_recent`, then verify exact claims with `lcm_describe` or `lcm_expand_query`.
+8. If `lcm_recent` is unavailable in the current runtime or the temporal PR stack is not merged yet, fall back to `lcm_grep` plus bounded expansion and say coverage is approximate.
+9. Load the relevant reference file instead of improvising details from memory.
 
 Reference map:
 
@@ -33,4 +35,5 @@ Working rules:
 - Do not recommend advanced rewrite/backfill/transplant/dissolve flows unless the user explicitly asks for non-MVP internals.
 - For exact evidence retrieval from compacted history, guide the user toward recall tools instead of guessing from summaries.
 - For known timeline windows, start with `lcm_recent`; use `lcm_grep` for keyword/event discovery, `lcm_describe` for cheap source inspection, and `lcm_expand_query` for exact proof after narrowing.
+- Treat `lcm_recent` as recap/entry, not proof: verify exact commands, paths, timestamps, root causes, or shipped/decided claims with `lcm_describe` or `lcm_expand_query` before asserting them.
 - When users compare `/lossless` to `/status`, explain that they report different layers: `/lossless` shows LCM-side frontier/summary metrics, while `/status` shows the last assembled runtime prompt snapshot.
