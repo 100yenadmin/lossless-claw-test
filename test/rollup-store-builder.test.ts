@@ -36,6 +36,12 @@ describe("LCM temporal rollup MVP", () => {
     expect(
       db.prepare("SELECT name FROM sqlite_master WHERE type = 'view' AND name = 'daily_rollups'").get(),
     ).toBeTruthy();
+    expect(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'view' AND name = 'weekly_rollups'").get(),
+    ).toBeTruthy();
+    expect(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'view' AND name = 'monthly_rollups'").get(),
+    ).toBeTruthy();
   });
 
   it("builds a stable daily rollup and preserves rollup_id across rebuilds", async () => {
@@ -81,5 +87,19 @@ describe("LCM temporal rollup MVP", () => {
       "sum_rollup_a",
       "sum_rollup_b",
     ]);
+  });
+
+  it("rejects impossible date keys", async () => {
+    const { conversationStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "rollup-invalid-date",
+      sessionKey: "agent:main:rollup-invalid-date",
+      title: "Rollup invalid date",
+    });
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await expect(builder.buildDayRollup(conversation.conversationId, "2026-02-31")).rejects.toThrow(
+      "Invalid date key: 2026-02-31",
+    );
   });
 });

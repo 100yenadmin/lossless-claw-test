@@ -198,14 +198,25 @@ export class RollupBuilder {
       timezone: this.config.timezone,
       maxTokens: this.dailyMaxTokens,
     });
-    const existing = this.store.getRollup(conversationId, PERIOD_KIND, dateKey);
-    const rollupId = existing?.rollup_id ?? buildRollupId(PERIOD_KIND, dateKey);
     const builtAt = new Date();
+    const sourceSummaryIds = JSON.stringify(
+      summaries.map((summary) => summary.summaryId)
+    );
+    const coverageStart =
+      summaries[0]?.earliestAt?.toISOString() ??
+      summaries[0]?.createdAt.toISOString() ??
+      null;
+    const coverageEnd =
+      summaries[summaries.length - 1]?.latestAt?.toISOString() ??
+      summaries[summaries.length - 1]?.createdAt.toISOString() ??
+      null;
 
     await withDatabaseTransaction(
       this.store.db,
       "BEGIN IMMEDIATE",
       async () => {
+        const existing = this.store.getRollup(conversationId, PERIOD_KIND, dateKey);
+        const rollupId = existing?.rollup_id ?? buildRollupId(PERIOD_KIND, dateKey);
         this.store.upsertRollup({
           rollup_id: rollupId,
           conversation_id: conversationId,
@@ -216,20 +227,12 @@ export class RollupBuilder {
           timezone: this.config.timezone,
           content: draft.content,
           token_count: draft.summaryTokenCount,
-          source_summary_ids: JSON.stringify(
-            summaries.map((summary) => summary.summaryId)
-          ),
+          source_summary_ids: sourceSummaryIds,
           source_message_count: 0,
           source_token_count: totalSourceTokens,
-          status: "building",
-          coverage_start:
-            summaries[0]?.earliestAt?.toISOString() ??
-            summaries[0]?.createdAt.toISOString() ??
-            null,
-          coverage_end:
-            summaries[summaries.length - 1]?.latestAt?.toISOString() ??
-            summaries[summaries.length - 1]?.createdAt.toISOString() ??
-            null,
+          status: "ready",
+          coverage_start: coverageStart,
+          coverage_end: coverageEnd,
           summarizer_model: "concatenation-v1",
           source_fingerprint: fingerprint,
         });
@@ -242,34 +245,6 @@ export class RollupBuilder {
             ordinal: index,
           }))
         );
-
-        this.store.upsertRollup({
-          rollup_id: rollupId,
-          conversation_id: conversationId,
-          period_kind: PERIOD_KIND,
-          period_key: dateKey,
-          period_start: start.toISOString(),
-          period_end: end.toISOString(),
-          timezone: this.config.timezone,
-          content: draft.content,
-          token_count: draft.summaryTokenCount,
-          source_summary_ids: JSON.stringify(
-            summaries.map((summary) => summary.summaryId)
-          ),
-          source_message_count: 0,
-          source_token_count: totalSourceTokens,
-          status: "ready",
-          coverage_start:
-            summaries[0]?.earliestAt?.toISOString() ??
-            summaries[0]?.createdAt.toISOString() ??
-            null,
-          coverage_end:
-            summaries[summaries.length - 1]?.latestAt?.toISOString() ??
-            summaries[summaries.length - 1]?.createdAt.toISOString() ??
-            null,
-          summarizer_model: "concatenation-v1",
-          source_fingerprint: fingerprint,
-        });
 
         this.store.upsertState(conversationId, {
           timezone: this.config.timezone,
@@ -626,7 +601,18 @@ function parseDateKey(dateKey: string): Date {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
     throw new Error(`Invalid date key: ${dateKey}`);
   }
-  return new Date(`${dateKey}T12:00:00.000Z`);
+  const [year, month, day] = dateKey
+    .split("-")
+    .map((part) => Number.parseInt(part, 10));
+  const candidate = new Date(Date.UTC(year, month - 1, day, 12, 0, 0, 0));
+  if (
+    candidate.getUTCFullYear() !== year ||
+    candidate.getUTCMonth() + 1 !== month ||
+    candidate.getUTCDate() !== day
+  ) {
+    throw new Error(`Invalid date key: ${dateKey}`);
+  }
+  return candidate;
 }
 
 function shiftLocalDate(date: Date, timezone: string, dayDelta: number): Date {

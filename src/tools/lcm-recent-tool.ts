@@ -73,6 +73,19 @@ type PeriodResolution = {
   end: Date;
 };
 
+function isStrictIsoDay(day: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+    return false;
+  }
+  const [year, month, date] = day.split("-").map((part) => Number(part));
+  const candidate = new Date(Date.UTC(year, month - 1, date, 12, 0, 0, 0));
+  return (
+    candidate.getUTCFullYear() === year &&
+    candidate.getUTCMonth() + 1 === month &&
+    candidate.getUTCDate() === date
+  );
+}
+
 function parseJsonStringArray(value: string): string[] {
   try {
     const parsed = JSON.parse(value);
@@ -189,7 +202,7 @@ function resolvePeriod(period: string, timezone: string): PeriodResolution {
 
   if (normalized.startsWith("date:")) {
     const day = normalized.slice(5);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+    if (!isStrictIsoDay(day)) {
       throw new Error('period date must be in the form "date:YYYY-MM-DD".');
     }
     const start = getUtcDateForZonedMidnight(day, timezone);
@@ -313,7 +326,7 @@ export function createLcmRecentTool(input: {
     name: "lcm_recent",
     label: "LCM Recent",
     description:
-      "Retrieve recent activity summaries from pre-built temporal rollups. Returns daily, weekly, or monthly summaries without LLM calls. Use for questions like 'what happened today?', 'what did we do yesterday?', or recap requests. Falls back to time-bounded lcm_grep when no rollup exists.",
+      "Retrieve recent activity summaries from pre-built temporal rollups. Returns daily, weekly, or monthly summaries without LLM calls. Use for questions like 'what happened today?', 'what did we do yesterday?', or recap requests. Falls back to a direct time-bounded SQL query over leaf summaries when no rollup exists.",
     parameters: LcmRecentSchema,
     async execute(_toolCallId, params) {
       const lcm = input.lcm ?? (await input.getLcm?.());
