@@ -2,20 +2,31 @@
 
 Use recall tools when the answer depends on historical evidence from compacted conversation history.
 
+## Decision table
+
+| Need                                                               | Start with                           | Then verify with                              |
+| ------------------------------------------------------------------ | ------------------------------------ | --------------------------------------------- |
+| Recap by known time window                                         | `lcm_recent`                         | `lcm_describe` / `lcm_expand_query` for proof |
+| Keyword, PR, file, customer, error, or identifier search           | `lcm_grep`                           | `lcm_describe` / `lcm_expand_query`           |
+| Known summary or file ID                                           | `lcm_describe`                       | `lcm_expand` / `lcm_expand_query` if needed   |
+| Exact command, path, timestamp, root cause, or shipped-proof claim | `lcm_grep` or `lcm_recent` to narrow | `lcm_expand_query` before asserting           |
+| Rollup freshness/provenance/debugging                              | `lcm_rollup_debug`                   | Source drilldown if needed                    |
+
 ## Tool selection
 
 ### `lcm_recent`
 
-Use first for time-native episodic recall: when the user asks what happened **today**, **yesterday**, **this week**, **this month**, or inside a local-time window.
+Use first for **clearly time-bounded episodic recall**: when the user asks what happened **today**, **yesterday**, **this week**, **this month**, or inside a known local-time window.
 
 Good prompts for `lcm_recent`:
 
 - "What did we do yesterday?" → `period: "yesterday"`
 - "What happened yesterday afternoon?" → `period: "yesterday afternoon"`
-- "What happened after the restart?" → `period: "last 3h"` or the known clock range
 - "What were we doing between 4 and 8pm?" → `period: "yesterday 4-8pm"`
-- "What shipped this week?" → `period: "week"` or `period: "7d"`
-- "What were the open threads this month?" → `period: "month"`
+- "What happened while I was away this afternoon?" → use the known local window
+- "What happened in the last 3 hours?" → `period: "last 3h"`
+- "What did we work on this week?" → `period: "week"` or `period: "7d"`
+- "What themes or follow-ups came up this month?" → `period: "month"`
 
 Why use it:
 
@@ -23,6 +34,13 @@ Why use it:
 - It uses prebuilt day/week/month rollups when available.
 - It falls back to bounded source summaries for precise windows.
 - It keeps provenance available so you can drill down when exact evidence is needed.
+
+Important limits:
+
+- `lcm_recent` is a recap/narrowing tool, not final proof for exact commands, paths, timestamps, root causes, or shipped claims.
+- For event-bounded questions like "after the restart" or "since Eric broke," first anchor the event time/window if it is not already known. Use `lcm_grep`, diagnostics, logs, or other evidence to find the timestamp, then run `lcm_recent` over the post-event window.
+- Weekly/monthly `lcm_recent` is good for recap and themes. Verify specific "shipped" or "decided" claims with expansion before asserting them as facts.
+- If `lcm_recent` is not available in the current runtime, say so and approximate with `lcm_grep` plus bounded expansion; do not pretend a rollup was queried.
 
 Do not use it for:
 
@@ -34,19 +52,21 @@ Do not use it for:
 Use for:
 
 - finding whether a term, file name, error string, PR number, customer name, or identifier appears in compacted history
+- discovering the time window for event-bounded questions when the user did not provide one
 - narrowing the search space when the question is keyword-shaped rather than time-shaped
 
 Do not use it for:
 
-- timeline questions like "what happened yesterday afternoon?"; start with `lcm_recent` instead
+- timeline questions like "what happened yesterday afternoon?" when the window is already known; start with `lcm_recent` instead
 - answering detail-heavy questions by itself
 
 ### `lcm_describe`
 
 Use for:
 
-- inspecting a specific summary or stored-file record by ID
-- reading lineage and content for a known summary node
+- cheap inspection of a specific summary or stored-file record by ID
+- checking lineage and content for a known summary node before doing expensive expansion
+- verifying source IDs returned by `lcm_recent`
 
 Do not use it for:
 
@@ -66,6 +86,7 @@ This is the best recall tool when the user asks for:
 - precise timestamps
 - root-cause chains
 - proof or citations from the recovered history
+- a verified list of shipped/merged/decided items
 
 ### `lcm_expand`
 
@@ -85,11 +106,19 @@ Do not use it for normal user-facing recall unless you are debugging the LCM lay
 
 ### Time-shaped question
 
-Examples: "what happened yesterday?", "what did we do after lunch?", "what shipped this week?"
+Examples: "what happened yesterday?", "what did we do after lunch?", "what did we work on this week?"
 
 1. Start with `lcm_recent` for the smallest useful period/window.
 2. If the answer needs proof, inspect the returned source IDs with `lcm_describe` or expand them.
-3. Use `lcm_expand_query` only when synthesis across the returned sources is needed.
+3. Use `lcm_expand_query` when synthesis across the returned sources is needed.
+
+### Event-bounded question
+
+Examples: "what happened after the restart?", "what changed since Eric broke?"
+
+1. If the event time is unknown, first locate it with `lcm_grep`, logs, diagnostics, or the relevant system source.
+2. Run `lcm_recent` over the known post-event local window, such as `last 3h` or `date:YYYY-MM-DD HH:MM-HH:MM`.
+3. Verify exact claims with `lcm_describe` or `lcm_expand_query`.
 
 ### Keyword-shaped question
 
@@ -104,9 +133,9 @@ Examples: "find the Eric ENOTEMPTY incident", "where did we mention PR #15?"
 Examples: "what happened with Eric yesterday afternoon?", "what did we decide about LCM this week?"
 
 1. Start with `lcm_recent` to bound the period.
-2. If the result is too broad, use `lcm_grep` inside the likely topic terms or expand the returned sources.
-3. Finish with `lcm_expand_query` only if the user needs a synthesized answer with exact details.
+2. If the result is too broad, use topic terms with `lcm_grep` or expand the returned sources.
+3. Finish with `lcm_expand_query` if the user needs a synthesized answer with exact details.
 
 ## Important guardrail
 
-Do not infer exact details from summaries alone when the user needs evidence. Expand first or state that the answer still needs expansion.
+Do not infer exact details from summaries or rollups alone when the user needs evidence. Expand first or state that the answer still needs expansion.

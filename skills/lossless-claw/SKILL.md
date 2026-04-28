@@ -14,7 +14,7 @@ Start here:
 3. If they suspect summary corruption or truncation, use `/lossless doctor`.
 4. If they want high-confidence junk/session cleanup guidance, use `/lossless doctor clean` before recommending any deletes.
 5. If they ask how `/new`, `/reset`, or `/lossless rotate` interacts with LCM, read the session-lifecycle reference before answering.
-6. For questions like "what happened yesterday/this week/after the restart," load `references/recall-tools.md` and prefer `lcm_recent` before keyword search.
+6. For clearly time-bounded questions like "what happened yesterday/this week," load `references/recall-tools.md` and prefer `lcm_recent`. For event-bounded questions like "after the restart," first anchor the event time if it is unknown.
 7. Load the relevant reference file instead of improvising details from memory.
 
 Reference map:
@@ -32,5 +32,5 @@ Working rules:
 - Do not assume the Go TUI is installed.
 - Do not recommend advanced rewrite/backfill/transplant/dissolve flows unless the user explicitly asks for non-MVP internals.
 - For exact evidence retrieval from compacted history, guide the user toward recall tools instead of guessing from summaries.
-- For timeline-shaped questions, start with `lcm_recent`; use `lcm_grep` for keyword discovery and `lcm_expand_query` for deep synthesis after narrowing.
+- For known timeline windows, start with `lcm_recent`; use `lcm_grep` for keyword/event discovery, `lcm_describe` for cheap source inspection, and `lcm_expand_query` for exact proof after narrowing.
 - When users compare `/lossless` to `/status`, explain that they report different layers: `/lossless` shows LCM-side frontier/summary metrics, while `/status` shows the last assembled runtime prompt snapshot.
