@@ -56,6 +56,8 @@ export interface LeafSummaryForDayRow {
   earliest_at: string | null;
   latest_at: string | null;
   created_at: string;
+  updated_at: string | null;
+  source_message_count: number;
 }
 
 export class RollupStore {
@@ -465,7 +467,9 @@ export class RollupStore {
           token_count,
           earliest_at,
           latest_at,
-          created_at
+          created_at,
+          created_at AS updated_at,
+          source_message_token_count AS source_message_count
          FROM summaries
          WHERE conversation_id = ?
            AND kind = 'leaf'

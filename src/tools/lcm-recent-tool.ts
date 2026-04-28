@@ -6,10 +6,7 @@ import { RollupStore } from "../store/rollup-store.js";
 import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
-import {
-  parseIsoTimestampParam,
-  resolveLcmConversationScope,
-} from "./lcm-conversation-scope.js";
+import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 
 const LcmRecentSchema = Type.Object({
   period: Type.String({
@@ -382,6 +379,21 @@ function parseExplicitWindow(
   };
 }
 
+function assertValidPlainDate(day: string): void {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+    throw new Error(`Invalid plain date: ${day}`);
+  }
+  const [year, month, date] = day.split("-").map((part) => Number(part));
+  const utc = new Date(Date.UTC(year, month - 1, date, 0, 0, 0, 0));
+  if (
+    utc.getUTCFullYear() !== year ||
+    utc.getUTCMonth() + 1 !== month ||
+    utc.getUTCDate() !== date
+  ) {
+    throw new Error(`Invalid plain date: ${day}`);
+  }
+}
+
 function parseBaseDay(
   baseText: string,
   today: string
@@ -395,12 +407,11 @@ function parseBaseDay(
   }
   if (base.startsWith("date:")) {
     const day = base.slice(5).trim();
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
-      return null;
-    }
+    assertValidPlainDate(day);
     return { day, label: day };
   }
   if (/^\d{4}-\d{2}-\d{2}$/.test(base)) {
+    assertValidPlainDate(base);
     return { day: base, label: base };
   }
   return null;
@@ -501,8 +512,10 @@ function resolvePeriod(period: string, timezone: string): PeriodResolution {
 
   if (normalized.startsWith("date:")) {
     const day = normalized.slice(5);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
-      throw new Error('period date must be in the form "date:YYYY-MM-DD".');
+    try {
+      assertValidPlainDate(day);
+    } catch {
+      throw new Error('period date must be in the form "date:YYYY-MM-DD" with a real calendar date.');
     }
     const start = getUtcDateForZonedMidnight(day, timezone);
     const end = getUtcDateForZonedMidnight(addDays(day, 1), timezone);
@@ -681,13 +694,6 @@ export function createLcmRecentTool(input: {
         return jsonResult({
           error: error instanceof Error ? error.message : "Invalid period.",
         });
-      }
-
-      try {
-        parseIsoTimestampParam(p, "since");
-        parseIsoTimestampParam(p, "before");
-      } catch {
-        // Intentional no-op, imported helper kept aligned with surrounding tool conventions.
       }
 
       const db = getLcmDatabase(lcm);

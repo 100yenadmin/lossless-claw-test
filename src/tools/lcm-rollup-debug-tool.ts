@@ -89,7 +89,9 @@ export function createLcmRollupDebugTool(input: {
           ? Math.floor(p.limit)
           : 20;
       const periodKind =
-        typeof p.periodKind === "string" ? p.periodKind : undefined;
+        p.periodKind === "day" || p.periodKind === "week" || p.periodKind === "month"
+          ? p.periodKind
+          : undefined;
       const includeSources = p.includeSources === true;
       const state = store.getState(conversationId);
       const rollups = store.listRollups(conversationId, periodKind, limit);
@@ -130,8 +132,11 @@ export function createLcmRollupDebugTool(input: {
       }
       for (const rollup of rollups) {
         lines.push(
-          `- ${rollup.period_kind}:${rollup.period_key} status=${rollup.status} tokens=${rollup.token_count} sources=${rollup.source_summary_ids}`
+          `- ${rollup.period_kind}:${rollup.period_key} status=${rollup.status} tokens=${rollup.token_count}`
         );
+        if (includeSources) {
+          lines.push(`  - source summaries: ${rollup.source_summary_ids || "[]"}`);
+        }
         if (includeSources) {
           const sources = store.getRollupSources(rollup.rollup_id);
           lines.push(

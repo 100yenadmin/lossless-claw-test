@@ -69,6 +69,7 @@ describe("LCM temporal rollup MVP", () => {
       depth: 0,
       content: "Decided to restore the daily rollup MVP.",
       tokenCount: 10,
+      sourceMessageTokenCount: 10,
       earliestAt: new Date("2026-04-27T10:00:00.000Z"),
       latestAt: new Date("2026-04-27T10:30:00.000Z"),
     });
@@ -80,6 +81,7 @@ describe("LCM temporal rollup MVP", () => {
       content:
         "Completed a safe fallback audit and found the old wildcard path.",
       tokenCount: 12,
+      sourceMessageTokenCount: 12,
       earliestAt: new Date("2026-04-27T12:00:00.000Z"),
       latestAt: new Date("2026-04-27T12:30:00.000Z"),
     });
@@ -108,6 +110,7 @@ describe("LCM temporal rollup MVP", () => {
       "2026-04-27"
     );
     expect(second?.rollup_id).toBe(first?.rollup_id);
+    expect(second?.source_message_count).toBe(22);
     expect(
       rollupStore
         .getRollupSources(second!.rollup_id)
@@ -293,6 +296,69 @@ describe("LCM sub-day window retrieval", () => {
 });
 
 describe("LCM weekly and monthly rollups", () => {
+  it("rebuilds a day rollup when content changes without changing ids or tokens", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "fingerprint-rebuild",
+      sessionKey: "agent:main:fingerprint-rebuild",
+      title: "Fingerprint rebuild",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_same",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Alpha work item.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+      latestAt: new Date("2026-04-27T10:30:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    const first = rollupStore.getRollup(
+      conversation.conversationId,
+      "day",
+      "2026-04-27"
+    );
+    expect(first?.content).toContain("Alpha work item");
+
+    rollupStore.db
+      .prepare(
+        `UPDATE summaries
+         SET content = ?
+         WHERE summary_id = ?`
+      )
+      .run("Bravo work item.", "sum_same");
+
+    const result = await builder.buildDailyRollups(conversation.conversationId, {
+      forceCurrentDay: true,
+      daysBack: 2,
+    });
+    expect(result.built).toBeGreaterThan(0);
+    const second = rollupStore.getRollup(
+      conversation.conversationId,
+      "day",
+      "2026-04-27"
+    );
+    expect(second?.rollup_id).toBe(first?.rollup_id);
+    expect(second?.content).toContain("Bravo work item");
+    expect(second?.source_fingerprint).not.toBe(first?.source_fingerprint);
+  });
+
+  it("rejects invalid plain dates", async () => {
+    expect(() =>
+      __lcmRecentTestInternals.resolvePeriod("date:2026-02-30", "UTC")
+    ).toThrow(/real calendar date/i);
+    expect(() =>
+      __lcmRecentTestInternals.resolvePeriod("date:2026-13-01", "UTC")
+    ).toThrow(/real calendar date/i);
+  });
+
   it("builds aggregate week/month rollups from stable daily rollups", async () => {
     const { conversationStore, summaryStore, rollupStore } = createStores();
     const conversation = await conversationStore.createConversation({
@@ -313,6 +379,7 @@ describe("LCM weekly and monthly rollups", () => {
         depth: 0,
         content,
         tokenCount: 10,
+        sourceMessageTokenCount: 10,
         earliestAt: new Date(timestamp),
         latestAt: new Date(timestamp),
       });

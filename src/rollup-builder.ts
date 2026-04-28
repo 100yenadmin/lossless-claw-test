@@ -41,6 +41,8 @@ type SummaryRecord = {
   earliestAt: Date | null;
   latestAt: Date | null;
   createdAt: Date;
+  updatedAt: Date | null;
+  sourceMessageCount: number;
   kind: "leaf" | "condensed";
 };
 
@@ -196,10 +198,16 @@ export class RollupBuilder {
       0
     );
     const fingerprint = computeFingerprint(
-      sourceRollups.map(
-        (rollup) => `${rollup.rollup_id}:${rollup.source_fingerprint ?? ""}`
-      ),
-      sourceTokens
+      sourceRollups.map((rollup) => ({
+        id: rollup.rollup_id,
+        tokenCount: rollup.source_token_count,
+        content: rollup.content,
+        updatedAt: rollup.built_at,
+        earliestAt: rollup.coverage_start,
+        latestAt: rollup.coverage_end,
+        sourceCount: rollup.source_message_count,
+        sourceFingerprint: rollup.source_fingerprint,
+      }))
     );
     const existing = this.store.getRollup(
       conversationId,
@@ -327,13 +335,17 @@ export class RollupBuilder {
         continue;
       }
 
-      const totalTokens = leafSummaries.reduce(
-        (sum, summary) => sum + safeTokenCount(summary.tokenCount),
-        0
-      );
       const fingerprint = computeFingerprint(
-        leafSummaries.map((summary) => summary.summaryId),
-        totalTokens
+        leafSummaries.map((summary) => ({
+          id: summary.summaryId,
+          tokenCount: summary.tokenCount,
+          content: summary.content,
+          updatedAt: summary.updatedAt,
+          createdAt: summary.createdAt,
+          earliestAt: summary.earliestAt,
+          latestAt: summary.latestAt,
+          sourceCount: summary.sourceMessageCount,
+        }))
       );
 
       let existing: RollupRow | null = null;
@@ -394,9 +406,21 @@ export class RollupBuilder {
       (sum, summary) => sum + safeTokenCount(summary.tokenCount),
       0
     );
+    const sourceMessageCount = summaries.reduce(
+      (sum, summary) => sum + safeTokenCount(summary.sourceMessageCount),
+      0
+    );
     const fingerprint = computeFingerprint(
-      summaries.map((summary) => summary.summaryId),
-      totalSourceTokens
+      summaries.map((summary) => ({
+        id: summary.summaryId,
+        tokenCount: summary.tokenCount,
+        content: summary.content,
+        updatedAt: summary.updatedAt,
+        createdAt: summary.createdAt,
+        earliestAt: summary.earliestAt,
+        latestAt: summary.latestAt,
+        sourceCount: summary.sourceMessageCount,
+      }))
     );
     const draft = buildDailyRollupContent({
       dateKey,
@@ -430,7 +454,7 @@ export class RollupBuilder {
           source_summary_ids: JSON.stringify(
             summaries.map((summary) => summary.summaryId)
           ),
-          source_message_count: 0,
+          source_message_count: sourceMessageCount,
           source_token_count: totalSourceTokens,
           status: "building",
           coverage_start:
@@ -467,7 +491,7 @@ export class RollupBuilder {
           source_summary_ids: JSON.stringify(
             summaries.map((summary) => summary.summaryId)
           ),
-          source_message_count: 0,
+          source_message_count: sourceMessageCount,
           source_token_count: totalSourceTokens,
           status: "ready",
           coverage_start:
@@ -511,19 +535,56 @@ export class RollupBuilder {
         earliestAt: summary.earliest_at ? new Date(summary.earliest_at) : null,
         latestAt: summary.latest_at ? new Date(summary.latest_at) : null,
         createdAt: new Date(summary.created_at),
+        updatedAt: summary.updated_at ? new Date(summary.updated_at) : null,
+        sourceMessageCount: summary.source_message_count,
         kind: "leaf",
       }));
   }
 }
 
-export function computeFingerprint(
-  summaryIds: string[],
-  totalTokens: number
-): string {
-  const data =
-    [...summaryIds].sort().join(",") +
-    `:${Math.max(0, Math.floor(totalTokens))}`;
-  return crypto.createHash("sha256").update(data).digest("hex").slice(0, 16);
+type FingerprintSource = {
+  id: string;
+  tokenCount?: number | null;
+  content?: string | null;
+  updatedAt?: string | Date | null;
+  createdAt?: string | Date | null;
+  earliestAt?: string | Date | null;
+  latestAt?: string | Date | null;
+  sourceCount?: number | null;
+  sourceFingerprint?: string | null;
+};
+
+export function computeFingerprint(sources: FingerprintSource[]): string {
+  const normalized = [...sources]
+    .map((source) => ({
+      id: source.id,
+      tokenCount: safeTokenCount(source.tokenCount ?? 0),
+      contentHash: crypto
+        .createHash("sha256")
+        .update(source.content ?? "")
+        .digest("hex")
+        .slice(0, 16),
+      updatedAt: normalizeFingerprintDate(source.updatedAt),
+      createdAt: normalizeFingerprintDate(source.createdAt),
+      earliestAt: normalizeFingerprintDate(source.earliestAt),
+      latestAt: normalizeFingerprintDate(source.latestAt),
+      sourceCount: safeTokenCount(source.sourceCount ?? 0),
+      sourceFingerprint: source.sourceFingerprint ?? "",
+    }))
+    .sort((left, right) => left.id.localeCompare(right.id));
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify(normalized))
+    .digest("hex")
+    .slice(0, 16);
+}
+
+function normalizeFingerprintDate(value: string | Date | null | undefined): string {
+  if (value == null) {
+    return "";
+  }
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? "" : date.toISOString();
 }
 
 export function getLocalDateKey(date: Date, timezone: string): string {
