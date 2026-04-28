@@ -4656,7 +4656,7 @@ export class LcmContextEngine implements ContextEngine {
             ) {
               const rollupResult = await this.rollupBuilder.buildDailyRollups(
                 conversation.conversationId,
-                { daysBack: 7, forceCurrentDay: true }
+                { daysBack: 30, forceCurrentDay: true }
               );
               const aggregateResult =
                 await this.rollupBuilder.buildWeeklyMonthlyRollups(
