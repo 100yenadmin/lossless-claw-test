@@ -69,6 +69,10 @@ Use for:
 - narrowing the search space when the question is keyword-shaped rather than time-shaped
 - adding `since` and/or `before` ISO filters when you have an approximate timeframe
 
+Call shape:
+
+- `lcm_grep` requires a `conversationId` in current runtimes. If you do not know it, first identify the active/relevant conversation from the session context or use the LCM conversation-scoping helpers available in that runtime.
+
 Do not use it for:
 
 - timeline questions like "what happened yesterday afternoon?" when the window is already known and `lcm_recent` is available; start with `lcm_recent` instead. If `lcm_recent` is unavailable, use `lcm_grep` plus bounded expansion and state the coverage limit.

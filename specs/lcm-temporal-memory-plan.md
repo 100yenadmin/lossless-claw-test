@@ -95,7 +95,7 @@ Acceptance tests:
 
 - Fixed-time tests for Asia/Bangkok and a DST-observing timezone.
 - `yesterday 4-8pm` resolves to the correct UTC interval.
-- Boundaries are inclusive/exclusive consistently documented.
+- Boundaries are consistently documented as `[start, end)`.
 - Sub-day retrieval only includes evidence inside the requested local-time window unless explicitly marked as adjacent context.
 
 ### PR 3: weekly/monthly builders and admin/debug tools
