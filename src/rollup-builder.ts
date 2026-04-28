@@ -1,6 +1,11 @@
 import * as crypto from "node:crypto";
 import { withDatabaseTransaction } from "./transaction-mutex.js";
-import type { LeafSummaryForDayRow, RollupRow, RollupStateRow, RollupStore } from "./store/rollup-store.js";
+import type {
+  LeafSummaryForDayRow,
+  RollupRow,
+  RollupStateRow,
+  RollupStore,
+} from "./store/rollup-store.js";
 
 const DEFAULT_DAILY_TARGET_TOKENS = 5_000;
 const DEFAULT_DAILY_MAX_TOKENS = 15_000;
@@ -54,23 +59,20 @@ export class RollupBuilder {
   private readonly dailyTargetTokens: number;
   private readonly dailyMaxTokens: number;
 
-  constructor(
-    private store: RollupStore,
-    private config: RollupBuilderConfig,
-  ) {
+  constructor(private store: RollupStore, private config: RollupBuilderConfig) {
     this.dailyTargetTokens = normalizePositiveInt(
       config.dailyTargetTokens,
-      DEFAULT_DAILY_TARGET_TOKENS,
+      DEFAULT_DAILY_TARGET_TOKENS
     );
     this.dailyMaxTokens = Math.max(
       this.dailyTargetTokens,
-      normalizePositiveInt(config.dailyMaxTokens, DEFAULT_DAILY_MAX_TOKENS),
+      normalizePositiveInt(config.dailyMaxTokens, DEFAULT_DAILY_MAX_TOKENS)
     );
   }
 
   async buildDailyRollups(
     conversationId: number,
-    options: { forceCurrentDay?: boolean; daysBack?: number } = {},
+    options: { forceCurrentDay?: boolean; daysBack?: number } = {}
   ): Promise<BuildResult> {
     const result: BuildResult = { built: 0, skipped: 0, errors: [] };
     const daysBack = normalizePositiveInt(options.daysBack, 7);
@@ -91,6 +93,8 @@ export class RollupBuilder {
       return result;
     }
 
+    const scannedAt = new Date();
+
     for (let offset = 0; offset < daysBack; offset += 1) {
       const candidateDate = shiftLocalDate(now, this.config.timezone, -offset);
       const dateKey = getLocalDateKey(candidateDate, this.config.timezone);
@@ -99,12 +103,17 @@ export class RollupBuilder {
         continue;
       }
 
-      const { start, end } = getLocalDayBounds(candidateDate, this.config.timezone);
+      const { start, end } = getLocalDayBounds(
+        candidateDate,
+        this.config.timezone
+      );
       let summaries: SummaryRecord[];
       try {
         summaries = this.getLeafSummariesForDay(conversationId, start, end);
       } catch (error) {
-        result.errors.push(`${dateKey}: leaf summary lookup failed: ${formatError(error)}`);
+        result.errors.push(
+          `${dateKey}: leaf summary lookup failed: ${formatError(error)}`
+        );
         continue;
       }
 
@@ -116,17 +125,22 @@ export class RollupBuilder {
         continue;
       }
 
-      const totalTokens = leafSummaries.reduce((sum, summary) => sum + safeTokenCount(summary.tokenCount), 0);
+      const totalTokens = leafSummaries.reduce(
+        (sum, summary) => sum + safeTokenCount(summary.tokenCount),
+        0
+      );
       const fingerprint = computeFingerprint(
         leafSummaries.map((summary) => summary.summaryId),
-        totalTokens,
+        totalTokens
       );
 
       let existing: RollupRow | null = null;
       try {
         existing = this.store.getRollup(conversationId, PERIOD_KIND, dateKey);
       } catch (error) {
-        result.errors.push(`${dateKey}: existing rollup lookup failed: ${formatError(error)}`);
+        result.errors.push(
+          `${dateKey}: existing rollup lookup failed: ${formatError(error)}`
+        );
         continue;
       }
 
@@ -147,10 +161,19 @@ export class RollupBuilder {
       }
     }
 
+    this.store.upsertState(conversationId, {
+      timezone: this.config.timezone,
+      last_rollup_check_at: scannedAt.toISOString(),
+      pending_rebuild: result.errors.length === 0 ? 0 : 1,
+    });
+
     return result;
   }
 
-  async buildDayRollup(conversationId: number, dateKey: string): Promise<boolean> {
+  async buildDayRollup(
+    conversationId: number,
+    dateKey: string
+  ): Promise<boolean> {
     const localDate = parseDateKey(dateKey);
     const { start, end } = getLocalDayBounds(localDate, this.config.timezone);
     const summaries = this.getLeafSummariesForDay(conversationId, start, end)
@@ -163,11 +186,11 @@ export class RollupBuilder {
 
     const totalSourceTokens = summaries.reduce(
       (sum, summary) => sum + safeTokenCount(summary.tokenCount),
-      0,
+      0
     );
     const fingerprint = computeFingerprint(
       summaries.map((summary) => summary.summaryId),
-      totalSourceTokens,
+      totalSourceTokens
     );
     const draft = buildDailyRollupContent({
       dateKey,
@@ -179,86 +202,97 @@ export class RollupBuilder {
     const rollupId = existing?.rollup_id ?? buildRollupId(PERIOD_KIND, dateKey);
     const builtAt = new Date();
 
-    await withDatabaseTransaction(this.store.db, "BEGIN IMMEDIATE", () => {
-      if (
-        existing?.rollup_id
-        && existing.source_fingerprint
-        && existing.source_fingerprint !== fingerprint
-      ) {
-        this.store.markStale(existing.rollup_id);
+    await withDatabaseTransaction(
+      this.store.db,
+      "BEGIN IMMEDIATE",
+      async () => {
+        this.store.upsertRollup({
+          rollup_id: rollupId,
+          conversation_id: conversationId,
+          period_kind: PERIOD_KIND,
+          period_key: dateKey,
+          period_start: start.toISOString(),
+          period_end: end.toISOString(),
+          timezone: this.config.timezone,
+          content: draft.content,
+          token_count: draft.summaryTokenCount,
+          source_summary_ids: JSON.stringify(
+            summaries.map((summary) => summary.summaryId)
+          ),
+          source_message_count: 0,
+          source_token_count: totalSourceTokens,
+          status: "building",
+          coverage_start:
+            summaries[0]?.earliestAt?.toISOString() ??
+            summaries[0]?.createdAt.toISOString() ??
+            null,
+          coverage_end:
+            summaries[summaries.length - 1]?.latestAt?.toISOString() ??
+            summaries[summaries.length - 1]?.createdAt.toISOString() ??
+            null,
+          summarizer_model: "concatenation-v1",
+          source_fingerprint: fingerprint,
+        });
+
+        await this.store.replaceRollupSources(
+          rollupId,
+          summaries.map((summary, index) => ({
+            type: "summary",
+            id: summary.summaryId,
+            ordinal: index,
+          }))
+        );
+
+        this.store.upsertRollup({
+          rollup_id: rollupId,
+          conversation_id: conversationId,
+          period_kind: PERIOD_KIND,
+          period_key: dateKey,
+          period_start: start.toISOString(),
+          period_end: end.toISOString(),
+          timezone: this.config.timezone,
+          content: draft.content,
+          token_count: draft.summaryTokenCount,
+          source_summary_ids: JSON.stringify(
+            summaries.map((summary) => summary.summaryId)
+          ),
+          source_message_count: 0,
+          source_token_count: totalSourceTokens,
+          status: "ready",
+          coverage_start:
+            summaries[0]?.earliestAt?.toISOString() ??
+            summaries[0]?.createdAt.toISOString() ??
+            null,
+          coverage_end:
+            summaries[summaries.length - 1]?.latestAt?.toISOString() ??
+            summaries[summaries.length - 1]?.createdAt.toISOString() ??
+            null,
+          summarizer_model: "concatenation-v1",
+          source_fingerprint: fingerprint,
+        });
+
+        this.store.upsertState(conversationId, {
+          timezone: this.config.timezone,
+          last_daily_build_at: builtAt.toISOString(),
+          last_rollup_check_at: builtAt.toISOString(),
+        });
       }
-
-      this.store.upsertRollup({
-        rollup_id: rollupId,
-        conversation_id: conversationId,
-        period_kind: PERIOD_KIND,
-        period_key: dateKey,
-        period_start: start.toISOString(),
-        period_end: end.toISOString(),
-        timezone: this.config.timezone,
-        content: draft.content,
-        token_count: draft.summaryTokenCount,
-        source_summary_ids: JSON.stringify(summaries.map((summary) => summary.summaryId)),
-        source_message_count: 0,
-        source_token_count: totalSourceTokens,
-        status: "building",
-        coverage_start:
-          summaries[0]?.earliestAt?.toISOString() ?? summaries[0]?.createdAt.toISOString() ?? null,
-        coverage_end:
-          summaries[summaries.length - 1]?.latestAt?.toISOString()
-          ?? summaries[summaries.length - 1]?.createdAt.toISOString()
-          ?? null,
-        summarizer_model: "concatenation-v1",
-        source_fingerprint: fingerprint,
-      });
-
-      this.store.replaceRollupSources(
-        rollupId,
-        summaries.map((summary, index) => ({
-          type: "summary",
-          id: summary.summaryId,
-          ordinal: index,
-        })),
-      );
-
-      this.store.upsertRollup({
-        rollup_id: rollupId,
-        conversation_id: conversationId,
-        period_kind: PERIOD_KIND,
-        period_key: dateKey,
-        period_start: start.toISOString(),
-        period_end: end.toISOString(),
-        timezone: this.config.timezone,
-        content: draft.content,
-        token_count: draft.summaryTokenCount,
-        source_summary_ids: JSON.stringify(summaries.map((summary) => summary.summaryId)),
-        source_message_count: 0,
-        source_token_count: totalSourceTokens,
-        status: "ready",
-        coverage_start:
-          summaries[0]?.earliestAt?.toISOString() ?? summaries[0]?.createdAt.toISOString() ?? null,
-        coverage_end:
-          summaries[summaries.length - 1]?.latestAt?.toISOString()
-          ?? summaries[summaries.length - 1]?.createdAt.toISOString()
-          ?? null,
-        summarizer_model: "concatenation-v1",
-        source_fingerprint: fingerprint,
-      });
-
-      this.store.upsertState(conversationId, {
-        timezone: this.config.timezone,
-        last_daily_build_at: builtAt.toISOString(),
-        last_rollup_check_at: builtAt.toISOString(),
-        pending_rebuild: 0,
-      });
-    });
+    );
 
     return true;
   }
 
-  private getLeafSummariesForDay(conversationId: number, start: Date, end: Date): SummaryRecord[] {
+  private getLeafSummariesForDay(
+    conversationId: number,
+    start: Date,
+    end: Date
+  ): SummaryRecord[] {
     return this.store
-      .getLeafSummariesForDay(conversationId, start.toISOString(), end.toISOString())
+      .getLeafSummariesForDay(
+        conversationId,
+        start.toISOString(),
+        end.toISOString()
+      )
       .map((summary: LeafSummaryForDayRow) => ({
         summaryId: summary.summary_id,
         content: summary.content,
@@ -271,8 +305,13 @@ export class RollupBuilder {
   }
 }
 
-export function computeFingerprint(summaryIds: string[], totalTokens: number): string {
-  const data = [...summaryIds].sort().join(",") + `:${Math.max(0, Math.floor(totalTokens))}`;
+export function computeFingerprint(
+  summaryIds: string[],
+  totalTokens: number
+): string {
+  const data =
+    [...summaryIds].sort().join(",") +
+    `:${Math.max(0, Math.floor(totalTokens))}`;
   return crypto.createHash("sha256").update(data).digest("hex").slice(0, 16);
 }
 
@@ -285,10 +324,17 @@ export function getLocalDateKey(date: Date, timezone: string): string {
   }).format(date);
 }
 
-export function getLocalDayBounds(date: Date, timezone: string): { start: Date; end: Date } {
+export function getLocalDayBounds(
+  date: Date,
+  timezone: string
+): { start: Date; end: Date } {
   const dateKey = getLocalDateKey(date, timezone);
   const start = localDateTimeToUtc(dateKey, "00:00:00", timezone);
-  const end = localDateTimeToUtc(shiftDateKey(dateKey, 1), "00:00:00", timezone);
+  const end = localDateTimeToUtc(
+    shiftDateKey(dateKey, 1),
+    "00:00:00",
+    timezone
+  );
   return { start, end };
 }
 
@@ -302,10 +348,12 @@ function buildDailyRollupContent(params: {
   timezone: string;
   maxTokens: number;
 }): RollupDraft {
-  const entries = params.summaries.map((summary) => buildTimelineEntry(summary, params.timezone));
-  const keyItems = extractKeyItems(params.summaries);
+  const entries = params.summaries.map((summary) =>
+    buildTimelineEntry(summary, params.timezone)
+  );
   const stats = buildStatistics(params.summaries, params.timezone);
 
+  let keyItems = extractKeyItems(params.summaries);
   let timelineEntries = [...entries];
   let omittedEntries = 0;
   let content = renderDailyRollup({
@@ -316,7 +364,10 @@ function buildDailyRollupContent(params: {
     stats,
   });
 
-  while (timelineEntries.length > 0 && estimateTokens(content) > params.maxTokens) {
+  while (
+    timelineEntries.length > 0 &&
+    estimateTokens(content) > params.maxTokens
+  ) {
     timelineEntries = timelineEntries.slice(1);
     omittedEntries += 1;
     content = renderDailyRollup({
@@ -328,12 +379,26 @@ function buildDailyRollupContent(params: {
     });
   }
 
-  if (timelineEntries.length === 0 && estimateTokens(content) > params.maxTokens) {
+  while (keyItems.length > 0 && estimateTokens(content) > params.maxTokens) {
+    keyItems = keyItems.slice(0, -1);
+    content = renderDailyRollup({
+      dateKey: params.dateKey,
+      entries: timelineEntries,
+      omittedEntries,
+      keyItems,
+      stats,
+    });
+  }
+
+  if (
+    timelineEntries.length === 0 &&
+    estimateTokens(content) > params.maxTokens
+  ) {
     const fallback = renderDailyRollup({
       dateKey: params.dateKey,
       entries: [],
       omittedEntries: entries.length,
-      keyItems,
+      keyItems: [],
       stats,
     });
     return {
@@ -387,7 +452,10 @@ function renderDailyRollup(params: {
   ].join("\n");
 }
 
-function buildTimelineEntry(summary: SummaryRecord, timezone: string): TimelineEntry {
+function buildTimelineEntry(
+  summary: SummaryRecord,
+  timezone: string
+): TimelineEntry {
   const sourceCreatedAt = summary.earliestAt ?? summary.createdAt;
   return {
     summaryId: summary.summaryId,
@@ -404,7 +472,10 @@ function summariseTimelineContent(content: string): string {
     return "(empty summary content)";
   }
 
-  const sentences = splitIntoSentences(normalized).slice(0, TIMELINE_SENTENCE_LIMIT);
+  const sentences = splitIntoSentences(normalized).slice(
+    0,
+    TIMELINE_SENTENCE_LIMIT
+  );
   const summary = sentences.length > 0 ? sentences.join(" ") : normalized;
   if (summary.length <= TIMELINE_MAX_CHARS) {
     return summary;
@@ -418,14 +489,26 @@ function extractKeyItems(summaries: SummaryRecord[]): {
   blockers: string[];
 } {
   const buckets = {
-    decisions: collectMatchingLines(summaries, /\b(decided|decision|chose|agreed)\b/i),
-    completed: collectMatchingLines(summaries, /\b(completed|done|finished|shipped|merged|deployed)\b/i),
-    blockers: collectMatchingLines(summaries, /\b(blocked|failed|error|issue|broken)\b/i),
+    decisions: collectMatchingLines(
+      summaries,
+      /\b(decided|decision|chose|agreed)\b/i
+    ),
+    completed: collectMatchingLines(
+      summaries,
+      /\b(completed|done|finished|shipped|merged|deployed)\b/i
+    ),
+    blockers: collectMatchingLines(
+      summaries,
+      /\b(blocked|failed|error|issue|broken)\b/i
+    ),
   };
   return buckets;
 }
 
-function collectMatchingLines(summaries: SummaryRecord[], pattern: RegExp): string[] {
+function collectMatchingLines(
+  summaries: SummaryRecord[],
+  pattern: RegExp
+): string[] {
   const seen = new Set<string>();
   const matches: string[] = [];
   for (const summary of summaries) {
@@ -451,7 +534,7 @@ function collectMatchingLines(summaries: SummaryRecord[], pattern: RegExp): stri
 
 function buildStatistics(
   summaries: SummaryRecord[],
-  timezone: string,
+  timezone: string
 ): { leafSummaries: number; timeSpan: string; totalSourceTokens: number } {
   const orderedTimes = summaries
     .map((summary) => summary.earliestAt ?? summary.createdAt)
@@ -463,16 +546,25 @@ function buildStatistics(
     .sort((left, right) => left.getTime() - right.getTime());
 
   const start = orderedTimes[0] ?? summaries[0]?.createdAt ?? new Date();
-  const end = latestTimes[latestTimes.length - 1] ?? summaries[summaries.length - 1]?.createdAt ?? start;
+  const end =
+    latestTimes[latestTimes.length - 1] ??
+    summaries[summaries.length - 1]?.createdAt ??
+    start;
 
   return {
     leafSummaries: summaries.length,
     timeSpan: `${formatTime(start, timezone)} — ${formatTime(end, timezone)}`,
-    totalSourceTokens: summaries.reduce((sum, summary) => sum + safeTokenCount(summary.tokenCount), 0),
+    totalSourceTokens: summaries.reduce(
+      (sum, summary) => sum + safeTokenCount(summary.tokenCount),
+      0
+    ),
   };
 }
 
-function compareSummariesChronologically(left: SummaryRecord, right: SummaryRecord): number {
+function compareSummariesChronologically(
+  left: SummaryRecord,
+  right: SummaryRecord
+): number {
   const leftTime = (left.earliestAt ?? left.createdAt).getTime();
   const rightTime = (right.earliestAt ?? right.createdAt).getTime();
   if (leftTime !== rightTime) {
@@ -495,10 +587,15 @@ function formatList(items: string[]): string {
 }
 
 function safeTokenCount(value: number): number {
-  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : 0;
 }
 
-function normalizePositiveInt(value: number | undefined, fallback: number): number {
+function normalizePositiveInt(
+  value: number | undefined,
+  fallback: number
+): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0
     ? Math.floor(value)
     : fallback;
@@ -543,10 +640,20 @@ function shiftDateKey(dateKey: string, dayDelta: number): string {
   return utcDate.toISOString().slice(0, 10);
 }
 
-function localDateTimeToUtc(dateKey: string, time: string, timezone: string): Date {
-  const [year, month, day] = dateKey.split("-").map((part) => Number.parseInt(part, 10));
-  const [hour, minute, second] = time.split(":").map((part) => Number.parseInt(part, 10));
-  const utcGuess = new Date(Date.UTC(year, month - 1, day, hour, minute, second, 0));
+function localDateTimeToUtc(
+  dateKey: string,
+  time: string,
+  timezone: string
+): Date {
+  const [year, month, day] = dateKey
+    .split("-")
+    .map((part) => Number.parseInt(part, 10));
+  const [hour, minute, second] = time
+    .split(":")
+    .map((part) => Number.parseInt(part, 10));
+  const utcGuess = new Date(
+    Date.UTC(year, month - 1, day, hour, minute, second, 0)
+  );
   const offsetMs = getTimeZoneOffsetMs(utcGuess, timezone);
   return new Date(utcGuess.getTime() - offsetMs);
 }
@@ -570,7 +677,7 @@ function getTimeZoneOffsetMs(date: Date, timezone: string): number {
     Number.parseInt(lookup.get("day") ?? "1", 10),
     Number.parseInt(lookup.get("hour") ?? "0", 10),
     Number.parseInt(lookup.get("minute") ?? "0", 10),
-    Number.parseInt(lookup.get("second") ?? "0", 10),
+    Number.parseInt(lookup.get("second") ?? "0", 10)
   );
   return localAsUtc - date.getTime();
 }

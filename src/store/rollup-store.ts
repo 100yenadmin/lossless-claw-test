@@ -59,7 +59,9 @@ export interface LeafSummaryForDayRow {
 export class RollupStore {
   constructor(public db: DatabaseSync) {}
 
-  upsertRollup(input: Omit<RollupRow, "built_at" | "invalidated_at" | "error_text">): void {
+  upsertRollup(
+    input: Omit<RollupRow, "built_at" | "invalidated_at" | "error_text">,
+  ): void {
     const rollupId = input.rollup_id || randomUUID();
 
     this.db
@@ -195,8 +197,13 @@ export class RollupStore {
     return row ?? null;
   }
 
-  listRollups(conversationId: number, periodKind?: string, limit = 50): RollupRow[] {
-    const normalizedLimit = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 50;
+  listRollups(
+    conversationId: number,
+    periodKind?: string,
+    limit = 50,
+  ): RollupRow[] {
+    const normalizedLimit =
+      Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 50;
     const sql = periodKind
       ? `SELECT
            rollup_id,
@@ -252,7 +259,9 @@ export class RollupStore {
 
     return (periodKind
       ? this.db.prepare(sql).all(conversationId, periodKind, normalizedLimit)
-      : this.db.prepare(sql).all(conversationId, normalizedLimit)) as unknown as RollupRow[];
+      : this.db
+          .prepare(sql)
+          .all(conversationId, normalizedLimit)) as unknown as RollupRow[];
   }
 
   markStale(rollupId: string): void {
@@ -267,12 +276,19 @@ export class RollupStore {
   }
 
   deleteRollup(rollupId: string): void {
-    this.db.prepare(`DELETE FROM lcm_rollups WHERE rollup_id = ?`).run(rollupId);
+    this.db
+      .prepare(`DELETE FROM lcm_rollups WHERE rollup_id = ?`)
+      .run(rollupId);
   }
 
-  replaceRollupSources(rollupId: string, sources: RollupSourceInput[]): void {
-    void withDatabaseTransaction(this.db, "BEGIN", () => {
-      this.db.prepare(`DELETE FROM lcm_rollup_sources WHERE rollup_id = ?`).run(rollupId);
+  async replaceRollupSources(
+    rollupId: string,
+    sources: RollupSourceInput[],
+  ): Promise<void> {
+    await withDatabaseTransaction(this.db, "BEGIN", () => {
+      this.db
+        .prepare(`DELETE FROM lcm_rollup_sources WHERE rollup_id = ?`)
+        .run(rollupId);
 
       if (sources.length === 0) {
         return;
@@ -289,7 +305,9 @@ export class RollupStore {
     });
   }
 
-  getRollupSources(rollupId: string): Array<{ source_type: string; source_id: string; ordinal: number }> {
+  getRollupSources(
+    rollupId: string,
+  ): Array<{ source_type: string; source_id: string; ordinal: number }> {
     return this.db
       .prepare(
         `SELECT source_type, source_id, ordinal
@@ -319,72 +337,57 @@ export class RollupStore {
     return row ?? null;
   }
 
-  upsertState(conversationId: number, updates: Partial<RollupStateRow>): void {
+  upsertState(
+    conversationId: number,
+    updates: Partial<
+      Pick<
+        RollupStateRow,
+        | "timezone"
+        | "last_message_at"
+        | "last_rollup_check_at"
+        | "last_daily_build_at"
+        | "pending_rebuild"
+      >
+    >,
+  ): void {
+    const existing = this.getState(conversationId);
+    const timezone = updates.timezone ?? existing?.timezone ?? "UTC";
+    const lastMessageAt =
+      updates.last_message_at ?? existing?.last_message_at ?? null;
+    const lastRollupCheckAt =
+      updates.last_rollup_check_at ?? existing?.last_rollup_check_at ?? null;
+    const lastDailyBuildAt =
+      updates.last_daily_build_at ?? existing?.last_daily_build_at ?? null;
+    const pendingRebuild =
+      updates.pending_rebuild ?? existing?.pending_rebuild ?? 0;
+
     this.db
       .prepare(
         `INSERT INTO lcm_rollup_state (
           conversation_id,
           timezone,
+          last_message_at,
+          last_rollup_check_at,
+          last_daily_build_at,
+          pending_rebuild,
           updated_at
-        ) VALUES (?, ?, datetime('now'))
-        ON CONFLICT(conversation_id) DO NOTHING`,
+        ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(conversation_id) DO UPDATE SET
+          timezone = excluded.timezone,
+          last_message_at = excluded.last_message_at,
+          last_rollup_check_at = excluded.last_rollup_check_at,
+          last_daily_build_at = excluded.last_daily_build_at,
+          pending_rebuild = excluded.pending_rebuild,
+          updated_at = datetime('now')`,
       )
-      .run(conversationId, updates.timezone ?? "UTC");
-
-    if (updates.timezone !== undefined) {
-      this.db
-        .prepare(
-          `UPDATE lcm_rollup_state
-           SET timezone = ?,
-               updated_at = datetime('now')
-           WHERE conversation_id = ?`,
-        )
-        .run(updates.timezone, conversationId);
-    }
-
-    if (updates.last_message_at !== undefined) {
-      this.db
-        .prepare(
-          `UPDATE lcm_rollup_state
-           SET last_message_at = ?,
-               updated_at = datetime('now')
-           WHERE conversation_id = ?`,
-        )
-        .run(updates.last_message_at, conversationId);
-    }
-
-    if (updates.last_rollup_check_at !== undefined) {
-      this.db
-        .prepare(
-          `UPDATE lcm_rollup_state
-           SET last_rollup_check_at = ?,
-               updated_at = datetime('now')
-           WHERE conversation_id = ?`,
-        )
-        .run(updates.last_rollup_check_at, conversationId);
-    }
-
-    if (updates.last_daily_build_at !== undefined) {
-      this.db
-        .prepare(
-          `UPDATE lcm_rollup_state
-           SET last_daily_build_at = ?,
-               updated_at = datetime('now')
-           WHERE conversation_id = ?`,
-        )
-        .run(updates.last_daily_build_at, conversationId);
-    }
-
-    if (updates.pending_rebuild !== undefined) {
-      this.db
-        .prepare(
-          `UPDATE lcm_rollup_state
-           SET pending_rebuild = ?,
-               updated_at = datetime('now')
-           WHERE conversation_id = ?`,
-        )
-        .run(updates.pending_rebuild, conversationId);
-    }
+      .run(
+        conversationId,
+        timezone,
+        lastMessageAt,
+        lastRollupCheckAt,
+        lastDailyBuildAt,
+        pendingRebuild,
+      );
   }
 
   getLeafSummariesForDay(
@@ -411,10 +414,14 @@ export class RollupStore {
          FROM summaries
          WHERE conversation_id = ?
            AND kind = 'leaf'
-           AND coalesce(latest_at, earliest_at, created_at) >= ?
-           AND coalesce(latest_at, earliest_at, created_at) < ?
-         ORDER BY coalesce(latest_at, earliest_at, created_at) ASC, created_at ASC`,
+           AND julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)
+           AND julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)
+         ORDER BY julianday(coalesce(earliest_at, latest_at, created_at)) ASC, created_at ASC`,
       )
-      .all(conversationId, dayStart, dayEnd) as unknown as LeafSummaryForDayRow[];
+      .all(
+        conversationId,
+        dayEnd,
+        dayStart,
+      ) as unknown as LeafSummaryForDayRow[];
   }
 }
