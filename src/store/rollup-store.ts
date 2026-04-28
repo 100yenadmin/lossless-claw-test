@@ -55,6 +55,7 @@ export interface LeafSummaryForDayRow {
   summary_id: string;
   content: string;
   token_count: number;
+  source_message_token_count: number;
   earliest_at: string | null;
   latest_at: string | null;
   created_at: string;
@@ -97,7 +98,7 @@ export class RollupStore {
           invalidated_at,
           error_text
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), NULL, NULL)
-        ON CONFLICT(conversation_id, period_kind, period_key) DO UPDATE SET
+        ON CONFLICT(conversation_id, period_kind, timezone, period_key) DO UPDATE SET
           period_start = excluded.period_start,
           period_end = excluded.period_end,
           timezone = excluded.timezone,
@@ -139,8 +140,14 @@ export class RollupStore {
   getRollup(
     conversationId: number,
     periodKind: string,
-    periodKey: string
+    periodKey: string,
+    timezone?: string
   ): RollupRow | null {
+    const timezoneClause = timezone == null ? "" : "AND timezone = ?";
+    const args =
+      timezone == null
+        ? [conversationId, periodKind, periodKey]
+        : [conversationId, periodKind, periodKey, timezone];
     const row = this.db
       .prepare(
         `SELECT
@@ -167,9 +174,12 @@ export class RollupStore {
         FROM lcm_rollups
         WHERE conversation_id = ?
           AND period_kind = ?
-          AND period_key = ?`
+          AND period_key = ?
+          ${timezoneClause}
+        ORDER BY built_at DESC
+        LIMIT 1`
       )
-      .get(conversationId, periodKind, periodKey) as RollupRow | undefined;
+      .get(...args) as RollupRow | undefined;
 
     return row ?? null;
   }
@@ -402,20 +412,13 @@ export class RollupStore {
       >
     >
   ): void {
-    const existing = this.getState(conversationId);
-    const timezone = updates.timezone ?? existing?.timezone ?? "UTC";
-    const lastMessageAt =
-      updates.last_message_at ?? existing?.last_message_at ?? null;
-    const lastRollupCheckAt =
-      updates.last_rollup_check_at ?? existing?.last_rollup_check_at ?? null;
-    const lastDailyBuildAt =
-      updates.last_daily_build_at ?? existing?.last_daily_build_at ?? null;
-    const lastWeeklyBuildAt =
-      updates.last_weekly_build_at ?? existing?.last_weekly_build_at ?? null;
-    const lastMonthlyBuildAt =
-      updates.last_monthly_build_at ?? existing?.last_monthly_build_at ?? null;
-    const pendingRebuild =
-      updates.pending_rebuild ?? existing?.pending_rebuild ?? 0;
+    const timezone = updates.timezone ?? null;
+    const lastMessageAt = updates.last_message_at ?? null;
+    const lastRollupCheckAt = updates.last_rollup_check_at ?? null;
+    const lastDailyBuildAt = updates.last_daily_build_at ?? null;
+    const lastWeeklyBuildAt = updates.last_weekly_build_at ?? null;
+    const lastMonthlyBuildAt = updates.last_monthly_build_at ?? null;
+    const pendingRebuild = updates.pending_rebuild ?? null;
 
     this.db
       .prepare(
@@ -429,19 +432,26 @@ export class RollupStore {
           last_monthly_build_at,
           pending_rebuild,
           updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        ) VALUES (?, COALESCE(?, 'UTC'), ?, ?, ?, ?, ?, COALESCE(?, 0), datetime('now'))
         ON CONFLICT(conversation_id) DO UPDATE SET
-          timezone = excluded.timezone,
-          last_message_at = excluded.last_message_at,
-          last_rollup_check_at = excluded.last_rollup_check_at,
-          last_daily_build_at = excluded.last_daily_build_at,
-          last_weekly_build_at = excluded.last_weekly_build_at,
-          last_monthly_build_at = excluded.last_monthly_build_at,
-          pending_rebuild = excluded.pending_rebuild,
+          timezone = CASE WHEN ? IS NULL THEN lcm_rollup_state.timezone ELSE excluded.timezone END,
+          last_message_at = CASE WHEN ? IS NULL THEN lcm_rollup_state.last_message_at ELSE excluded.last_message_at END,
+          last_rollup_check_at = CASE WHEN ? IS NULL THEN lcm_rollup_state.last_rollup_check_at ELSE excluded.last_rollup_check_at END,
+          last_daily_build_at = CASE WHEN ? IS NULL THEN lcm_rollup_state.last_daily_build_at ELSE excluded.last_daily_build_at END,
+          last_weekly_build_at = CASE WHEN ? IS NULL THEN lcm_rollup_state.last_weekly_build_at ELSE excluded.last_weekly_build_at END,
+          last_monthly_build_at = CASE WHEN ? IS NULL THEN lcm_rollup_state.last_monthly_build_at ELSE excluded.last_monthly_build_at END,
+          pending_rebuild = CASE WHEN ? IS NULL THEN lcm_rollup_state.pending_rebuild ELSE excluded.pending_rebuild END,
           updated_at = datetime('now')`
       )
       .run(
         conversationId,
+        timezone,
+        lastMessageAt,
+        lastRollupCheckAt,
+        lastDailyBuildAt,
+        lastWeeklyBuildAt,
+        lastMonthlyBuildAt,
+        pendingRebuild,
         timezone,
         lastMessageAt,
         lastRollupCheckAt,
@@ -463,10 +473,11 @@ export class RollupStore {
           summary_id,
           content,
           token_count,
-          earliest_at,
-          latest_at,
-          created_at,
-          created_at AS updated_at,
+          source_message_token_count,
+          strftime('%Y-%m-%dT%H:%M:%fZ', earliest_at) AS earliest_at,
+          strftime('%Y-%m-%dT%H:%M:%fZ', latest_at) AS latest_at,
+          strftime('%Y-%m-%dT%H:%M:%fZ', created_at) AS created_at,
+          strftime('%Y-%m-%dT%H:%M:%fZ', created_at) AS updated_at,
           COALESCE(
             NULLIF(
               (

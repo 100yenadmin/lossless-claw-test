@@ -1,12 +1,23 @@
 import { Type } from "@sinclair/typebox";
 import type { DatabaseSync } from "node:sqlite";
 import { formatTimestamp } from "../compaction.js";
+import { estimateTokens } from "../estimate-tokens.js";
 import type { LcmContextEngine } from "../engine.js";
 import type { RollupStore } from "../store/rollup-store.js";
 import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
+
+const DEFAULT_RECENT_OUTPUT_TOKENS = 24_000;
+const DEFAULT_RECENT_GLOBAL_MAX_TOKENS = 180_000;
+const ABSOLUTE_RECENT_GLOBAL_MAX_TOKENS = 300_000;
+const DETAIL_LEVEL_TOKEN_HINTS = new Map<number, number>([
+  [0, 12_000],
+  [1, 24_000],
+  [2, 80_000],
+  [3, 180_000],
+]);
 
 const LcmRecentSchema = Type.Object({
   period: Type.String({
@@ -26,6 +37,30 @@ const LcmRecentSchema = Type.Object({
   includeSources: Type.Optional(
     Type.Boolean({
       description: "Include source summary IDs.",
+    })
+  ),
+  maxOutputTokens: Type.Optional(
+    Type.Number({
+      description:
+        "Requested maximum output tokens for this call. Defaults to a GPT-5.4 Mini-safe compact budget; clamped by globalMaxOutputTokens.",
+    })
+  ),
+  globalMaxOutputTokens: Type.Optional(
+    Type.Number({
+      description:
+        "Global ceiling for this recall response. Use to reserve room for the caller's answer/output budget.",
+    })
+  ),
+  detailLevel: Type.Optional(
+    Type.Number({
+      description:
+        "Retrieval detail level: 0 compact rollup, 1 standard, 2 expanded source summaries, 3 deep source-summary bundle within budget.",
+    })
+  ),
+  maxSourceSummaries: Type.Optional(
+    Type.Number({
+      description:
+        "Maximum leaf summaries to include when using source-summary fallback/detail layers.",
     })
   ),
 });
@@ -61,8 +96,27 @@ type RecentSummaryFallbackRow = {
   kind: string;
   content: string;
   token_count: number;
+  source_message_token_count: number;
   created_at: string;
   effective_time: string;
+};
+
+type RecallBudget = {
+  requestedOutputTokens: number;
+  globalMaxOutputTokens: number;
+  effectiveOutputTokens: number;
+  detailLevel: number;
+  maxSourceSummaries: number;
+};
+
+type RecallAccounting = {
+  outputTokens: number;
+  sourceSummaryTokens: number;
+  sourceMessageTokens: number;
+  summariesIncluded: number;
+  summariesAvailable: number;
+  summariesOmitted: number;
+  truncated: boolean;
 };
 
 type PeriodResolution = {
@@ -653,6 +707,12 @@ function formatSourcesLine(
   return `*Sources: ${summaryIds.join(", ")}*`;
 }
 
+function formatDrilldownHint(includeSources: boolean): string {
+  return includeSources
+    ? "*Drill down: Use lcm_expand_query with these summaryIds for deeper recall*"
+    : "*Drill down: Re-run with includeSources=true to reveal summaryIds for expansion*";
+}
+
 function combineRollups(rollups: RollupRecord[]): {
   content: string;
   tokenCount: number;
@@ -673,6 +733,30 @@ function combineRollups(rollups: RollupRecord[]): {
     ? "ready"
     : "stale";
   return { content, tokenCount, status, sourceSummaryIds };
+}
+
+function renderFallbackRollupSection(
+  label: string,
+  summaries: RecentSummaryFallbackRow[],
+  timezone: string
+): { content: string; summaryIds: string[] } {
+  const lines = [`### ${label} (live fallback)`];
+  if (summaries.length === 0) {
+    lines.push("- No leaf summaries captured.");
+  } else {
+    for (const summary of summaries) {
+      lines.push(
+        `- [${summary.summary_id}] (${summary.kind}, ${formatDisplayTime(
+          summary.effective_time,
+          timezone
+        )}): ${summary.content.replace(/\n/g, " ").trim()}`
+      );
+    }
+  }
+  return {
+    content: lines.join("\n"),
+    summaryIds: summaries.map((summary) => summary.summary_id),
+  };
 }
 
 function getExpectedDayKeys(
@@ -715,8 +799,8 @@ function getRecentSummaryFallback(
         kind,
         content,
         token_count,
-        created_at,
-        coalesce(latest_at, earliest_at, created_at) AS effective_time
+        strftime('%Y-%m-%dT%H:%M:%fZ', created_at) AS created_at,
+        strftime('%Y-%m-%dT%H:%M:%fZ', coalesce(latest_at, earliest_at, created_at)) AS effective_time
        FROM summaries
        WHERE ${scopeClause}
          kind = 'leaf'
@@ -828,9 +912,7 @@ export function createLcmRecentTool(input: {
         }
         lines.push("---");
         lines.push(formatSourcesLine(summaryIds, includeSources));
-        lines.push(
-          "*Drill down: Use lcm_expand_query with matching summaryIds for deeper recall*"
-        );
+        lines.push(formatDrilldownHint(includeSources));
 
         return {
           content: [{ type: "text", text: lines.join("\n") }],
@@ -849,21 +931,28 @@ export function createLcmRecentTool(input: {
       let tokenCount = 0;
       let status: "ready" | "stale" | "fallback" = "fallback";
       let sourceSummaryIds: string[] = [];
+      let usedFallback = false;
 
       const currentDayKey = getZonedDayString(new Date(), timezone);
       const canUseStoredCurrentDay =
         resolution.periodKey == null || resolution.periodKey !== currentDayKey;
+      const hasPendingRebuild =
+        rollupStore.getState(conversationId)?.pending_rebuild === 1;
+      const canUseStoredResolvedRollup =
+        canUseStoredCurrentDay &&
+        (resolution.kind === "day" || !hasPendingRebuild);
 
       if (
         resolution.kind &&
         resolution.periodKey &&
         !resolution.window &&
-        canUseStoredCurrentDay
+        canUseStoredResolvedRollup
       ) {
         const rollup = rollupStore.getRollup(
           conversationId,
           resolution.kind,
-          resolution.periodKey
+          resolution.periodKey,
+          timezone
         );
         if (
           rollup &&
@@ -874,9 +963,14 @@ export function createLcmRecentTool(input: {
           status = rollup.status === "ready" ? "ready" : "stale";
           sourceSummaryIds = parseJsonStringArray(rollup.source_summary_ids);
         }
-      } else if (resolution.kind && !resolution.window) {
+      } else if (
+        resolution.kind &&
+        !resolution.window &&
+        (resolution.kind === "day" || !hasPendingRebuild)
+      ) {
         const rollups = rollupStore
           .listRollups(conversationId, resolution.kind, 200)
+          .filter((rollup) => rollup.timezone === timezone)
           .filter(
             (rollup) =>
               new Date(rollup.period_start) >= resolution.start &&
@@ -921,17 +1015,60 @@ export function createLcmRecentTool(input: {
         const usableKeys = new Set(
           usableRollups.map((rollup) => rollup.periodKey)
         );
+        const currentDayInWindow =
+          resolution.kind === "day" && expectedKeys.includes(currentDayKey);
+        const requiredKeys = currentDayInWindow
+          ? expectedKeys.filter((key) => key !== currentDayKey)
+          : expectedKeys;
         const hasCompleteCoverage =
           resolution.kind !== "day" ||
           (expectedKeys.length > 0 &&
-            !expectedKeys.includes(currentDayKey) &&
-            expectedKeys.every((key) => usableKeys.has(key)));
+            requiredKeys.every((key) => usableKeys.has(key)));
         if (usableRollups.length > 0 && hasCompleteCoverage) {
-          const combined = combineRollups(usableRollups);
+          const orderedRollups =
+            resolution.kind === "day"
+              ? requiredKeys
+                  .map((key) => usableRollups.find((rollup) => rollup.periodKey === key))
+                  .filter((rollup): rollup is RollupRecord => rollup != null)
+              : usableRollups.sort(
+                  (left, right) =>
+                    left.periodStart.getTime() - right.periodStart.getTime()
+                );
+          const combined = combineRollups(orderedRollups);
+          const liveSections: string[] = [];
+          const liveSummaryIds: string[] = [];
+          if (currentDayInWindow) {
+            const currentStart = getUtcDateForZonedMidnight(
+              currentDayKey,
+              timezone
+            );
+            const currentEnd = new Date(
+              Math.min(
+                resolution.end.getTime(),
+                getUtcDateForZonedMidnight(
+                  addDays(currentDayKey, 1),
+                  timezone
+                ).getTime()
+              )
+            );
+            const live = renderFallbackRollupSection(
+              currentDayKey,
+              getRecentSummaryFallback(db, conversationId, currentStart, currentEnd),
+              timezone
+            );
+            liveSections.push(live.content);
+            liveSummaryIds.push(...live.summaryIds);
+            usedFallback = true;
+          }
           rollupContent = combined.content;
+          if (liveSections.length > 0) {
+            rollupContent = [rollupContent, ...liveSections]
+              .filter((section) => section.trim().length > 0)
+              .join("\n\n");
+          }
           tokenCount = combined.tokenCount;
           status = combined.status;
-          sourceSummaryIds = combined.sourceSummaryIds;
+          sourceSummaryIds = [...combined.sourceSummaryIds, ...liveSummaryIds];
         }
       }
 
@@ -978,9 +1115,7 @@ export function createLcmRecentTool(input: {
         }
         lines.push("---");
         lines.push(formatSourcesLine(sourceSummaryIds, includeSources));
-        lines.push(
-          "*Drill down: Use lcm_expand_query with these summaryIds for deeper recall*"
-        );
+        lines.push(formatDrilldownHint(includeSources));
 
         return {
           content: [{ type: "text", text: lines.join("\n") }],
@@ -1008,15 +1143,13 @@ export function createLcmRecentTool(input: {
       lines.push("");
       lines.push("---");
       lines.push(formatSourcesLine(sourceSummaryIds, includeSources));
-      lines.push(
-        "*Drill down: Use lcm_expand_query with these summaryIds for deeper recall*"
-      );
+      lines.push(formatDrilldownHint(includeSources));
 
       return {
         content: [{ type: "text", text: lines.join("\n") }],
         details: {
           status,
-          usedFallback: false,
+          usedFallback,
           tokenCount,
           summaryIds: sourceSummaryIds,
         },

@@ -43,6 +43,7 @@ type SummaryRecord = {
   createdAt: Date;
   updatedAt: Date | null;
   sourceMessageCount: number;
+  sourceMessageTokenCount: number;
   kind: "leaf" | "condensed";
 };
 
@@ -185,11 +186,23 @@ export class RollupBuilder {
         bounds.end.toISOString()
       )
       .filter(
-        (rollup) => rollup.status === "ready" || rollup.status === "stale"
+        (rollup) =>
+          rollup.timezone === this.config.timezone &&
+          (rollup.status === "ready" || rollup.status === "stale")
       )
       .sort((left, right) => left.period_key.localeCompare(right.period_key));
 
+    const existing = this.store.getRollup(
+      conversationId,
+      periodKind,
+      periodKey,
+      this.config.timezone
+    );
     if (sourceRollups.length === 0) {
+      if (existing) {
+        this.store.deleteRollup(existing.rollup_id);
+        return true;
+      }
       return false;
     }
 
@@ -206,13 +219,9 @@ export class RollupBuilder {
         earliestAt: rollup.coverage_start,
         latestAt: rollup.coverage_end,
         sourceCount: rollup.source_message_count,
+        sourceTokenCount: rollup.source_token_count,
         sourceFingerprint: rollup.source_fingerprint,
       }))
-    );
-    const existing = this.store.getRollup(
-      conversationId,
-      periodKind,
-      periodKey
     );
     if (existing?.source_fingerprint === fingerprint) {
       return false;
@@ -330,6 +339,17 @@ export class RollupBuilder {
         .filter((summary) => summary.kind === "leaf")
         .sort(compareSummariesChronologically);
       if (leafSummaries.length === 0) {
+        const existing = this.store.getRollup(
+          conversationId,
+          DAY_PERIOD_KIND,
+          dateKey,
+          this.config.timezone
+        );
+        if (existing) {
+          this.store.deleteRollup(existing.rollup_id);
+          result.built += 1;
+          continue;
+        }
         result.skipped += 1;
         continue;
       }
@@ -344,6 +364,7 @@ export class RollupBuilder {
           earliestAt: summary.earliestAt,
           latestAt: summary.latestAt,
           sourceCount: summary.sourceMessageCount,
+          sourceTokenCount: summary.sourceMessageTokenCount,
         }))
       );
 
@@ -352,7 +373,8 @@ export class RollupBuilder {
         existing = this.store.getRollup(
           conversationId,
           DAY_PERIOD_KIND,
-          dateKey
+          dateKey,
+          this.config.timezone
         );
       } catch (error) {
         result.errors.push(
@@ -404,7 +426,7 @@ export class RollupBuilder {
     }
 
     const totalSourceTokens = summaries.reduce(
-      (sum, summary) => sum + safeTokenCount(summary.tokenCount),
+      (sum, summary) => sum + safeTokenCount(summary.sourceMessageTokenCount),
       0
     );
     const sourceMessageCount = summaries.reduce(
@@ -421,6 +443,7 @@ export class RollupBuilder {
         earliestAt: summary.earliestAt,
         latestAt: summary.latestAt,
         sourceCount: summary.sourceMessageCount,
+        sourceTokenCount: summary.sourceMessageTokenCount,
       }))
     );
     const draft = buildDailyRollupContent({
@@ -439,7 +462,8 @@ export class RollupBuilder {
         const existing = this.store.getRollup(
           conversationId,
           DAY_PERIOD_KIND,
-          dateKey
+          dateKey,
+          this.config.timezone
         );
         const rollupId =
           existing?.rollup_id ?? buildRollupId(DAY_PERIOD_KIND, dateKey);
@@ -501,6 +525,7 @@ export class RollupBuilder {
         summaryId: summary.summary_id,
         content: summary.content,
         tokenCount: summary.token_count,
+        sourceMessageTokenCount: summary.source_message_token_count,
         earliestAt: summary.earliest_at ? new Date(summary.earliest_at) : null,
         latestAt: summary.latest_at ? new Date(summary.latest_at) : null,
         createdAt: new Date(summary.created_at),
@@ -520,6 +545,7 @@ type FingerprintSource = {
   earliestAt?: string | Date | null;
   latestAt?: string | Date | null;
   sourceCount?: number | null;
+  sourceTokenCount?: number | null;
   sourceFingerprint?: string | null;
 };
 
@@ -538,6 +564,7 @@ export function computeFingerprint(sources: FingerprintSource[]): string {
       earliestAt: normalizeFingerprintDate(source.earliestAt),
       latestAt: normalizeFingerprintDate(source.latestAt),
       sourceCount: safeTokenCount(source.sourceCount ?? 0),
+      sourceTokenCount: safeTokenCount(source.sourceTokenCount ?? 0),
       sourceFingerprint: source.sourceFingerprint ?? "",
     }))
     .sort((left, right) => left.id.localeCompare(right.id));
@@ -877,7 +904,7 @@ function buildStatistics(
     leafSummaries: summaries.length,
     timeSpan: `${formatTime(start, timezone)} — ${formatTime(end, timezone)}`,
     totalSourceTokens: summaries.reduce(
-      (sum, summary) => sum + safeTokenCount(summary.tokenCount),
+      (sum, summary) => sum + safeTokenCount(summary.sourceMessageTokenCount),
       0
     ),
   };

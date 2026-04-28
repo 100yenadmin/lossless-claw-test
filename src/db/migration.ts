@@ -1136,7 +1136,7 @@ export function runLcmMigrations(
         built_at TEXT NOT NULL DEFAULT (datetime('now')),
         invalidated_at TEXT,
         error_text TEXT,
-        UNIQUE (conversation_id, period_kind, period_key)
+        UNIQUE (conversation_id, period_kind, timezone, period_key)
       );
 
       CREATE TABLE IF NOT EXISTS lcm_rollup_sources (
@@ -1176,10 +1176,6 @@ export function runLcmMigrations(
 
       CREATE INDEX IF NOT EXISTS lcm_rollup_sources_source_idx
       ON lcm_rollup_sources (source_id);
-
-      CREATE INDEX IF NOT EXISTS summaries_leaf_temporal_idx
-      ON summaries (conversation_id, kind, latest_at, earliest_at, created_at)
-      WHERE kind = 'leaf';
 
       CREATE INDEX IF NOT EXISTS summaries_leaf_effective_time_conv_idx
       ON summaries (
