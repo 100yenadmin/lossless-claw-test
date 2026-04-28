@@ -2,11 +2,11 @@ import { Type } from "@sinclair/typebox";
 import type { DatabaseSync } from "node:sqlite";
 import { formatTimestamp } from "../compaction.js";
 import type { LcmContextEngine } from "../engine.js";
-import { RollupStore } from "../store/rollup-store.js";
+import type { RollupStore } from "../store/rollup-store.js";
 import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
-import { parseIsoTimestampParam, resolveLcmConversationScope } from "./lcm-conversation-scope.js";
+import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 
 const LcmRecentSchema = Type.Object({
   period: Type.String({
@@ -107,14 +107,6 @@ function formatDisplayTime(
     return "-";
   }
   return formatTimestamp(date, timezone);
-}
-
-function getLcmDatabase(lcm: LcmContextEngine): DatabaseSync {
-  const candidate = lcm as unknown as { db?: DatabaseSync };
-  if (!candidate.db) {
-    throw new Error("LCM rollup database is unavailable.");
-  }
-  return candidate.db;
 }
 
 function getPartsInTimezone(date: Date, timezone: string): { year: number; month: number; day: number } {
@@ -283,6 +275,17 @@ function combineRollups(rollups: RollupRecord[]): {
   return { content, tokenCount, status, sourceSummaryIds };
 }
 
+function getExpectedDayKeys(start: Date, end: Date, timezone: string): string[] {
+  const keys: string[] = [];
+  let current = getZonedDayString(start, timezone);
+  const endKey = getZonedDayString(end, timezone);
+  while (current < endKey) {
+    keys.push(current);
+    current = addDays(current, 1);
+  }
+  return keys;
+}
+
 function getRecentSummaryFallback(
   db: DatabaseSync,
   conversationId: number | undefined,
@@ -291,8 +294,8 @@ function getRecentSummaryFallback(
 ): RecentSummaryFallbackRow[] {
   const scopeClause = conversationId == null ? "" : "conversation_id = ? AND";
   const args: Array<string | number> = conversationId == null
-    ? [start.toISOString(), end.toISOString()]
-    : [conversationId, start.toISOString(), end.toISOString()];
+    ? [end.toISOString(), start.toISOString()]
+    : [conversationId, end.toISOString(), start.toISOString()];
 
   return db
     .prepare(
@@ -306,9 +309,9 @@ function getRecentSummaryFallback(
        FROM summaries
        WHERE ${scopeClause}
          kind = 'leaf'
-         AND coalesce(latest_at, earliest_at, created_at) >= ?
-         AND coalesce(latest_at, earliest_at, created_at) < ?
-       ORDER BY coalesce(latest_at, earliest_at, created_at) DESC
+         AND julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)
+         AND julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)
+       ORDER BY julianday(coalesce(latest_at, earliest_at, created_at)) DESC
        LIMIT 20`,
     )
     .all(...args) as unknown as RecentSummaryFallbackRow[];
@@ -337,7 +340,8 @@ export function createLcmRecentTool(input: {
       const p = params as Record<string, unknown>;
       const includeSources = p.includeSources === true;
       const timezone = lcm.timezone;
-      const retrieval = lcm.getRetrieval();
+      const rollupStore = input.rollupStore ?? lcm.getRollupStore();
+      const db = rollupStore.db;
       const conversationScope = await resolveLcmConversationScope({
         lcm,
         deps: input.deps,
@@ -361,15 +365,6 @@ export function createLcmRecentTool(input: {
           error: error instanceof Error ? error.message : "Invalid period.",
         });
       }
-
-      try {
-        parseIsoTimestampParam(p, "since");
-        parseIsoTimestampParam(p, "before");
-      } catch {
-        // Intentional no-op, imported helper kept aligned with surrounding tool conventions.
-      }
-
-      const db = getLcmDatabase(lcm);
 
       if (conversationScope.allConversations) {
         const recentSummaries = getRecentSummaryFallback(
@@ -415,7 +410,6 @@ export function createLcmRecentTool(input: {
         };
       }
 
-      const rollupStore = input.rollupStore ?? new RollupStore(db);
       const conversationId = conversationScope.conversationId as number;
 
       let rollupContent: string | null = null;
@@ -456,8 +450,27 @@ export function createLcmRecentTool(input: {
           invalidatedAt: rollup.invalidated_at ? new Date(rollup.invalidated_at) : null,
           errorText: rollup.error_text,
         }));
-        if (usableRollups.length > 0) {
-          const combined = combineRollups(usableRollups);
+        const expectedDayKeys =
+          resolution.kind === "day"
+            ? getExpectedDayKeys(resolution.start, resolution.end, timezone)
+            : [];
+        const usableByKey = new Map(
+          usableRollups.map((rollup) => [rollup.periodKey, rollup])
+        );
+        const completeWindow =
+          resolution.kind !== "day" ||
+          expectedDayKeys.every((key) => usableByKey.has(key));
+        if (usableRollups.length > 0 && completeWindow) {
+          const orderedRollups =
+            resolution.kind === "day"
+              ? expectedDayKeys
+                  .map((key) => usableByKey.get(key))
+                  .filter((rollup): rollup is RollupRecord => rollup != null)
+              : usableRollups.sort(
+                  (left, right) =>
+                    left.periodStart.getTime() - right.periodStart.getTime()
+                );
+          const combined = combineRollups(orderedRollups);
           rollupContent = combined.content;
           tokenCount = combined.tokenCount;
           status = combined.status;

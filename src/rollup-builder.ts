@@ -35,9 +35,11 @@ type SummaryRecord = {
   summaryId: string;
   content: string;
   tokenCount: number;
+  sourceMessageCount: number;
   earliestAt: Date | null;
   latestAt: Date | null;
   createdAt: Date;
+  updatedAt: Date | null;
   kind: "leaf" | "condensed";
 };
 
@@ -55,17 +57,22 @@ type RollupDraft = {
   omittedEntries: number;
 };
 
+type KeyItems = {
+  decisions: string[];
+  completed: string[];
+  blockers: string[];
+};
+
 export class RollupBuilder {
-  private readonly dailyTargetTokens: number;
   private readonly dailyMaxTokens: number;
 
   constructor(private store: RollupStore, private config: RollupBuilderConfig) {
-    this.dailyTargetTokens = normalizePositiveInt(
+    const dailyTargetTokens = normalizePositiveInt(
       config.dailyTargetTokens,
       DEFAULT_DAILY_TARGET_TOKENS
     );
     this.dailyMaxTokens = Math.max(
-      this.dailyTargetTokens,
+      dailyTargetTokens,
       normalizePositiveInt(config.dailyMaxTokens, DEFAULT_DAILY_MAX_TOKENS)
     );
   }
@@ -125,13 +132,17 @@ export class RollupBuilder {
         continue;
       }
 
-      const totalTokens = leafSummaries.reduce(
-        (sum, summary) => sum + safeTokenCount(summary.tokenCount),
-        0
-      );
       const fingerprint = computeFingerprint(
-        leafSummaries.map((summary) => summary.summaryId),
-        totalTokens
+        leafSummaries.map((summary) => ({
+          id: summary.summaryId,
+          tokenCount: summary.tokenCount,
+          content: summary.content,
+          updatedAt: summary.updatedAt,
+          createdAt: summary.createdAt,
+          earliestAt: summary.earliestAt,
+          latestAt: summary.latestAt,
+          sourceCount: summary.sourceMessageCount,
+        }))
       );
 
       let existing: RollupRow | null = null;
@@ -188,9 +199,21 @@ export class RollupBuilder {
       (sum, summary) => sum + safeTokenCount(summary.tokenCount),
       0
     );
+    const sourceMessageCount = summaries.reduce(
+      (sum, summary) => sum + safeTokenCount(summary.sourceMessageCount),
+      0
+    );
     const fingerprint = computeFingerprint(
-      summaries.map((summary) => summary.summaryId),
-      totalSourceTokens
+      summaries.map((summary) => ({
+        id: summary.summaryId,
+        tokenCount: summary.tokenCount,
+        content: summary.content,
+        updatedAt: summary.updatedAt,
+        createdAt: summary.createdAt,
+        earliestAt: summary.earliestAt,
+        latestAt: summary.latestAt,
+        sourceCount: summary.sourceMessageCount,
+      }))
     );
     const draft = buildDailyRollupContent({
       dateKey,
@@ -202,14 +225,8 @@ export class RollupBuilder {
     const sourceSummaryIds = JSON.stringify(
       summaries.map((summary) => summary.summaryId)
     );
-    const coverageStart =
-      summaries[0]?.earliestAt?.toISOString() ??
-      summaries[0]?.createdAt.toISOString() ??
-      null;
-    const coverageEnd =
-      summaries[summaries.length - 1]?.latestAt?.toISOString() ??
-      summaries[summaries.length - 1]?.createdAt.toISOString() ??
-      null;
+    const coverageStart = minSummaryTime(summaries)?.toISOString() ?? null;
+    const coverageEnd = maxSummaryTime(summaries)?.toISOString() ?? null;
 
     await withDatabaseTransaction(
       this.store.db,
@@ -228,7 +245,7 @@ export class RollupBuilder {
           content: draft.content,
           token_count: draft.summaryTokenCount,
           source_summary_ids: sourceSummaryIds,
-          source_message_count: 0,
+          source_message_count: sourceMessageCount,
           source_token_count: totalSourceTokens,
           status: "ready",
           coverage_start: coverageStart,
@@ -272,22 +289,57 @@ export class RollupBuilder {
         summaryId: summary.summary_id,
         content: summary.content,
         tokenCount: summary.token_count,
+        sourceMessageCount: summary.source_message_count,
         earliestAt: summary.earliest_at ? new Date(summary.earliest_at) : null,
         latestAt: summary.latest_at ? new Date(summary.latest_at) : null,
         createdAt: new Date(summary.created_at),
+        updatedAt: summary.updated_at ? new Date(summary.updated_at) : null,
         kind: "leaf",
       }));
   }
 }
 
-export function computeFingerprint(
-  summaryIds: string[],
-  totalTokens: number
-): string {
-  const data =
-    [...summaryIds].sort().join(",") +
-    `:${Math.max(0, Math.floor(totalTokens))}`;
-  return crypto.createHash("sha256").update(data).digest("hex").slice(0, 16);
+type FingerprintSource = {
+  id: string;
+  tokenCount?: number | null;
+  content?: string | null;
+  updatedAt?: string | Date | null;
+  createdAt?: string | Date | null;
+  earliestAt?: string | Date | null;
+  latestAt?: string | Date | null;
+  sourceCount?: number | null;
+};
+
+export function computeFingerprint(sources: FingerprintSource[]): string {
+  const normalized = [...sources]
+    .map((source) => ({
+      id: source.id,
+      tokenCount: safeTokenCount(source.tokenCount ?? 0),
+      contentHash: crypto
+        .createHash("sha256")
+        .update(source.content ?? "")
+        .digest("hex")
+        .slice(0, 16),
+      updatedAt: normalizeFingerprintDate(source.updatedAt),
+      createdAt: normalizeFingerprintDate(source.createdAt),
+      earliestAt: normalizeFingerprintDate(source.earliestAt),
+      latestAt: normalizeFingerprintDate(source.latestAt),
+      sourceCount: safeTokenCount(source.sourceCount ?? 0),
+    }))
+    .sort((left, right) => left.id.localeCompare(right.id));
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify(normalized))
+    .digest("hex")
+    .slice(0, 16);
+}
+
+function normalizeFingerprintDate(value: string | Date | null | undefined): string {
+  if (value == null) {
+    return "";
+  }
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? "" : date.toISOString();
 }
 
 export function getLocalDateKey(date: Date, timezone: string): string {
@@ -354,8 +406,8 @@ function buildDailyRollupContent(params: {
     });
   }
 
-  while (keyItems.length > 0 && estimateTokens(content) > params.maxTokens) {
-    keyItems = keyItems.slice(0, -1);
+  while (countKeyItems(keyItems) > 0 && estimateTokens(content) > params.maxTokens) {
+    keyItems = trimLargestKeyItemBucket(keyItems);
     content = renderDailyRollup({
       dateKey: params.dateKey,
       entries: timelineEntries,
@@ -373,7 +425,7 @@ function buildDailyRollupContent(params: {
       dateKey: params.dateKey,
       entries: [],
       omittedEntries: entries.length,
-      keyItems: [],
+      keyItems: emptyKeyItems(),
       stats,
     });
     return {
@@ -394,7 +446,7 @@ function renderDailyRollup(params: {
   dateKey: string;
   entries: TimelineEntry[];
   omittedEntries: number;
-  keyItems: { decisions: string[]; completed: string[]; blockers: string[] };
+  keyItems: KeyItems;
   stats: { leafSummaries: number; timeSpan: string; totalSourceTokens: number };
 }): string {
   const timelineLines: string[] = [];
@@ -458,11 +510,7 @@ function summariseTimelineContent(content: string): string {
   return `${summary.slice(0, TIMELINE_MAX_CHARS - 1).trimEnd()}…`;
 }
 
-function extractKeyItems(summaries: SummaryRecord[]): {
-  decisions: string[];
-  completed: string[];
-  blockers: string[];
-} {
+function extractKeyItems(summaries: SummaryRecord[]): KeyItems {
   const buckets = {
     decisions: collectMatchingLines(
       summaries,
@@ -478,6 +526,33 @@ function extractKeyItems(summaries: SummaryRecord[]): {
     ),
   };
   return buckets;
+}
+
+function emptyKeyItems(): KeyItems {
+  return { decisions: [], completed: [], blockers: [] };
+}
+
+function countKeyItems(keyItems: KeyItems): number {
+  return (
+    keyItems.decisions.length +
+    keyItems.completed.length +
+    keyItems.blockers.length
+  );
+}
+
+function trimLargestKeyItemBucket(keyItems: KeyItems): KeyItems {
+  const buckets: Array<keyof KeyItems> = ["decisions", "completed", "blockers"];
+  const largest = buckets.reduce((current, candidate) =>
+    keyItems[candidate].length > keyItems[current].length ? candidate : current
+  );
+  return {
+    decisions:
+      largest === "decisions" ? keyItems.decisions.slice(0, -1) : keyItems.decisions,
+    completed:
+      largest === "completed" ? keyItems.completed.slice(0, -1) : keyItems.completed,
+    blockers:
+      largest === "blockers" ? keyItems.blockers.slice(0, -1) : keyItems.blockers,
+  };
 }
 
 function collectMatchingLines(
@@ -534,6 +609,28 @@ function buildStatistics(
       0
     ),
   };
+}
+
+function minSummaryTime(summaries: SummaryRecord[]): Date | null {
+  return minDate(summaries.map((summary) => summary.earliestAt ?? summary.createdAt));
+}
+
+function maxSummaryTime(summaries: SummaryRecord[]): Date | null {
+  return maxDate(summaries.map((summary) => summary.latestAt ?? summary.createdAt));
+}
+
+function minDate(dates: Date[]): Date | null {
+  return dates.reduce<Date | null>(
+    (min, date) => (min == null || date < min ? date : min),
+    null
+  );
+}
+
+function maxDate(dates: Date[]): Date | null {
+  return dates.reduce<Date | null>(
+    (max, date) => (max == null || date > max ? date : max),
+    null
+  );
 }
 
 function compareSummariesChronologically(

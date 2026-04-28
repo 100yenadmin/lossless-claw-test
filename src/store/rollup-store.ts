@@ -54,6 +54,8 @@ export interface LeafSummaryForDayRow {
   earliest_at: string | null;
   latest_at: string | null;
   created_at: string;
+  updated_at: string | null;
+  source_message_count: number;
 }
 
 export class RollupStore {
@@ -394,14 +396,7 @@ export class RollupStore {
     conversationId: number,
     dayStart: string,
     dayEnd: string,
-  ): Array<{
-    summary_id: string;
-    content: string;
-    token_count: number;
-    earliest_at: string | null;
-    latest_at: string | null;
-    created_at: string;
-  }> {
+  ): LeafSummaryForDayRow[] {
     return this.db
       .prepare(
         `SELECT
@@ -410,7 +405,16 @@ export class RollupStore {
           token_count,
           earliest_at,
           latest_at,
-          created_at
+          created_at,
+          created_at AS updated_at,
+          COALESCE(
+            NULLIF((
+              SELECT COUNT(*)
+              FROM summary_messages sm
+              WHERE sm.summary_id = summaries.summary_id
+            ), 0),
+            1
+          ) AS source_message_count
          FROM summaries
          WHERE conversation_id = ?
            AND kind = 'leaf'
