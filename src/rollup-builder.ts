@@ -35,6 +35,7 @@ type SummaryRecord = {
   summaryId: string;
   content: string;
   tokenCount: number;
+  sourceMessageCount: number;
   earliestAt: Date | null;
   latestAt: Date | null;
   createdAt: Date;
@@ -56,19 +57,18 @@ type RollupDraft = {
 };
 
 export class RollupBuilder {
-  private readonly dailyTargetTokens: number;
   private readonly dailyMaxTokens: number;
 
   constructor(
     private store: RollupStore,
     private config: RollupBuilderConfig,
   ) {
-    this.dailyTargetTokens = normalizePositiveInt(
+    const dailyTargetTokens = normalizePositiveInt(
       config.dailyTargetTokens,
       DEFAULT_DAILY_TARGET_TOKENS,
     );
     this.dailyMaxTokens = Math.max(
-      this.dailyTargetTokens,
+      dailyTargetTokens,
       normalizePositiveInt(config.dailyMaxTokens, DEFAULT_DAILY_MAX_TOKENS),
     );
   }
@@ -99,15 +99,14 @@ export class RollupBuilder {
     const scannedAt = new Date();
 
     for (let offset = 0; offset < daysBack; offset += 1) {
-      const candidateDate = shiftLocalDate(now, this.config.timezone, -offset);
-      const dateKey = getLocalDateKey(candidateDate, this.config.timezone);
+      const dateKey = shiftDateKey(todayKey, -offset);
       if (!forceCurrentDay && dateKey === todayKey) {
         result.skipped += 1;
         continue;
       }
 
-      const { start, end } = getLocalDayBounds(
-        candidateDate,
+      const { start, end } = getLocalDayBoundsForDateKey(
+        dateKey,
         this.config.timezone,
       );
       let summaries: SummaryRecord[];
@@ -132,10 +131,7 @@ export class RollupBuilder {
         (sum, summary) => sum + safeTokenCount(summary.tokenCount),
         0,
       );
-      const fingerprint = computeFingerprint(
-        leafSummaries.map((summary) => summary.summaryId),
-        totalTokens,
-      );
+      const fingerprint = computeFingerprint(leafSummaries);
 
       let existing: RollupRow | null = null;
       try {
@@ -177,8 +173,10 @@ export class RollupBuilder {
     conversationId: number,
     dateKey: string,
   ): Promise<boolean> {
-    const localDate = parseDateKey(dateKey);
-    const { start, end } = getLocalDayBounds(localDate, this.config.timezone);
+    const { start, end } = getLocalDayBoundsForDateKey(
+      dateKey,
+      this.config.timezone,
+    );
     const summaries = this.getLeafSummariesForDay(conversationId, start, end)
       .filter((summary) => summary.kind === "leaf")
       .sort(compareSummariesChronologically);
@@ -191,10 +189,11 @@ export class RollupBuilder {
       (sum, summary) => sum + safeTokenCount(summary.tokenCount),
       0,
     );
-    const fingerprint = computeFingerprint(
-      summaries.map((summary) => summary.summaryId),
-      totalSourceTokens,
+    const sourceMessageCount = summaries.reduce(
+      (sum, summary) => sum + Math.max(1, summary.sourceMessageCount),
+      0,
     );
+    const fingerprint = computeFingerprint(summaries);
     const draft = buildDailyRollupContent({
       dateKey,
       summaries,
@@ -202,6 +201,7 @@ export class RollupBuilder {
       maxTokens: this.dailyMaxTokens,
     });
     const builtAt = new Date();
+    const coverage = getCoverageBounds(summaries);
 
     await withDatabaseTransaction(
       this.store.db,
@@ -215,14 +215,6 @@ export class RollupBuilder {
         const rollupId =
           existing?.rollup_id ?? buildRollupId(PERIOD_KIND, dateKey);
 
-        if (
-          existing?.rollup_id &&
-          existing.source_fingerprint &&
-          existing.source_fingerprint !== fingerprint
-        ) {
-          this.store.markStale(existing.rollup_id);
-        }
-
         this.store.upsertRollup({
           rollup_id: rollupId,
           conversation_id: conversationId,
@@ -236,17 +228,11 @@ export class RollupBuilder {
           source_summary_ids: JSON.stringify(
             summaries.map((summary) => summary.summaryId),
           ),
-          source_message_count: 0,
+          source_message_count: sourceMessageCount,
           source_token_count: totalSourceTokens,
-          status: "building",
-          coverage_start:
-            summaries[0]?.earliestAt?.toISOString() ??
-            summaries[0]?.createdAt.toISOString() ??
-            null,
-          coverage_end:
-            summaries[summaries.length - 1]?.latestAt?.toISOString() ??
-            summaries[summaries.length - 1]?.createdAt.toISOString() ??
-            null,
+          status: "ready",
+          coverage_start: coverage.start?.toISOString() ?? null,
+          coverage_end: coverage.end?.toISOString() ?? null,
           summarizer_model: "concatenation-v1",
           source_fingerprint: fingerprint,
         });
@@ -259,34 +245,6 @@ export class RollupBuilder {
             ordinal: index,
           })),
         );
-
-        this.store.upsertRollup({
-          rollup_id: rollupId,
-          conversation_id: conversationId,
-          period_kind: PERIOD_KIND,
-          period_key: dateKey,
-          period_start: start.toISOString(),
-          period_end: end.toISOString(),
-          timezone: this.config.timezone,
-          content: draft.content,
-          token_count: draft.summaryTokenCount,
-          source_summary_ids: JSON.stringify(
-            summaries.map((summary) => summary.summaryId),
-          ),
-          source_message_count: 0,
-          source_token_count: totalSourceTokens,
-          status: "ready",
-          coverage_start:
-            summaries[0]?.earliestAt?.toISOString() ??
-            summaries[0]?.createdAt.toISOString() ??
-            null,
-          coverage_end:
-            summaries[summaries.length - 1]?.latestAt?.toISOString() ??
-            summaries[summaries.length - 1]?.createdAt.toISOString() ??
-            null,
-          summarizer_model: "concatenation-v1",
-          source_fingerprint: fingerprint,
-        });
 
         this.store.upsertState(conversationId, {
           timezone: this.config.timezone,
@@ -317,18 +275,40 @@ export class RollupBuilder {
         earliestAt: summary.earliest_at ? new Date(summary.earliest_at) : null,
         latestAt: summary.latest_at ? new Date(summary.latest_at) : null,
         createdAt: new Date(summary.created_at),
+        sourceMessageCount: summary.source_message_count,
         kind: "leaf",
       }));
   }
 }
 
 export function computeFingerprint(
-  summaryIds: string[],
-  totalTokens: number,
+  summaries: Array<
+    Pick<
+      SummaryRecord,
+      | "summaryId"
+      | "content"
+      | "tokenCount"
+      | "sourceMessageCount"
+      | "earliestAt"
+      | "latestAt"
+      | "createdAt"
+    >
+  >,
 ): string {
-  const data =
-    [...summaryIds].sort().join(",") +
-    `:${Math.max(0, Math.floor(totalTokens))}`;
+  const data = summaries
+    .map((summary) =>
+      [
+        summary.summaryId,
+        safeTokenCount(summary.tokenCount),
+        Math.max(1, summary.sourceMessageCount),
+        summary.earliestAt?.toISOString() ?? "",
+        summary.latestAt?.toISOString() ?? "",
+        summary.createdAt.toISOString(),
+        crypto.createHash("sha256").update(summary.content).digest("hex"),
+      ].join("\u001f"),
+    )
+    .sort()
+    .join("\u001e");
   return crypto.createHash("sha256").update(data).digest("hex").slice(0, 16);
 }
 
@@ -346,6 +326,14 @@ export function getLocalDayBounds(
   timezone: string,
 ): { start: Date; end: Date } {
   const dateKey = getLocalDateKey(date, timezone);
+  return getLocalDayBoundsForDateKey(dateKey, timezone);
+}
+
+function getLocalDayBoundsForDateKey(
+  dateKey: string,
+  timezone: string,
+): { start: Date; end: Date } {
+  assertValidDateKey(dateKey);
   const start = localDateTimeToUtc(dateKey, "00:00:00", timezone);
   const end = localDateTimeToUtc(
     shiftDateKey(dateKey, 1),
@@ -372,12 +360,13 @@ function buildDailyRollupContent(params: {
   const stats = buildStatistics(params.summaries, params.timezone);
 
   let timelineEntries = [...entries];
+  let retainedKeyItems = keyItems;
   let omittedEntries = 0;
   let content = renderDailyRollup({
     dateKey: params.dateKey,
     entries: timelineEntries,
     omittedEntries,
-    keyItems,
+    keyItems: retainedKeyItems,
     stats,
   });
 
@@ -391,7 +380,7 @@ function buildDailyRollupContent(params: {
       dateKey: params.dateKey,
       entries: timelineEntries,
       omittedEntries,
-      keyItems,
+      keyItems: retainedKeyItems,
       stats,
     });
   }
@@ -400,18 +389,16 @@ function buildDailyRollupContent(params: {
     timelineEntries.length === 0 &&
     estimateTokens(content) > params.maxTokens
   ) {
-    const fallback = renderDailyRollup({
-      dateKey: params.dateKey,
-      entries: [],
-      omittedEntries: entries.length,
-      keyItems,
-      stats,
-    });
-    return {
-      content: fallback,
-      summaryTokenCount: estimateTokens(fallback),
-      omittedEntries: entries.length,
-    };
+    while (countKeyItems(retainedKeyItems) > 0 && estimateTokens(content) > params.maxTokens) {
+      retainedKeyItems = trimLargestKeyItemBucket(retainedKeyItems);
+      content = renderDailyRollup({
+        dateKey: params.dateKey,
+        entries: [],
+        omittedEntries: entries.length,
+        keyItems: retainedKeyItems,
+        stats,
+      });
+    }
   }
 
   return {
@@ -511,6 +498,29 @@ function extractKeyItems(summaries: SummaryRecord[]): {
   return buckets;
 }
 
+type KeyItems = {
+  decisions: string[];
+  completed: string[];
+  blockers: string[];
+};
+
+function countKeyItems(items: KeyItems): number {
+  return items.decisions.length + items.completed.length + items.blockers.length;
+}
+
+function trimLargestKeyItemBucket(items: KeyItems): KeyItems {
+  const next: KeyItems = {
+    decisions: [...items.decisions],
+    completed: [...items.completed],
+    blockers: [...items.blockers],
+  };
+  const largestBucket = (Object.keys(next) as Array<keyof KeyItems>).sort(
+    (left, right) => next[right].length - next[left].length,
+  )[0];
+  next[largestBucket] = next[largestBucket].slice(1);
+  return next;
+}
+
 function collectMatchingLines(
   summaries: SummaryRecord[],
   pattern: RegExp,
@@ -579,6 +589,23 @@ function compareSummariesChronologically(
   return left.summaryId.localeCompare(right.summaryId);
 }
 
+function getCoverageBounds(
+  summaries: SummaryRecord[],
+): { start: Date | null; end: Date | null } {
+  const starts = summaries
+    .map((summary) => summary.earliestAt ?? summary.createdAt)
+    .filter((value): value is Date => value instanceof Date)
+    .sort((left, right) => left.getTime() - right.getTime());
+  const ends = summaries
+    .map((summary) => summary.latestAt ?? summary.createdAt)
+    .filter((value): value is Date => value instanceof Date)
+    .sort((left, right) => left.getTime() - right.getTime());
+  return {
+    start: starts[0] ?? null,
+    end: ends[ends.length - 1] ?? null,
+  };
+}
+
 function formatTime(date: Date, timezone: string): string {
   return new Intl.DateTimeFormat("en-GB", {
     timeZone: timezone,
@@ -626,16 +653,6 @@ function splitIntoSentences(value: string): string[] {
 
 function stripBulletPrefix(value: string): string {
   return value.replace(/^[-*•\d.)\s]+/, "").trim();
-}
-
-function parseDateKey(dateKey: string): Date {
-  assertValidDateKey(dateKey);
-  return new Date(`${dateKey}T12:00:00.000Z`);
-}
-
-function shiftLocalDate(date: Date, timezone: string, dayDelta: number): Date {
-  const dateKey = getLocalDateKey(date, timezone);
-  return parseDateKey(shiftDateKey(dateKey, dayDelta));
 }
 
 function shiftDateKey(dateKey: string, dayDelta: number): string {

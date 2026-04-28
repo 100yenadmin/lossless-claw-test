@@ -4500,24 +4500,33 @@ export class LcmContextEngine implements ContextEngine {
 
         let deferredCompactionResult: ContextEngineMaintenanceResult | null =
           null;
-        try {
-          const rollupState = this.rollupStore.getState(
-            conversation.conversationId,
-          );
-          if (rollupState?.pending_rebuild === 1) {
-            const rollupResult = await this.rollupBuilder.buildDailyRollups(
+        const finish = async (
+          result: ContextEngineMaintenanceResult,
+        ): Promise<ContextEngineMaintenanceResult> => {
+          try {
+            const rollupState = this.rollupStore.getState(
               conversation.conversationId,
-              { daysBack: 7, forceCurrentDay: true },
             );
-            this.deps.log.info(
-              `[lcm] maintain: daily rollups conversation=${conversation.conversationId} ${sessionLabel} built=${rollupResult.built} skipped=${rollupResult.skipped} errors=${rollupResult.errors.length}`,
+            if (
+              !rollupState ||
+              rollupState.pending_rebuild === 1 ||
+              result.changed
+            ) {
+              const rollupResult = await this.rollupBuilder.buildDailyRollups(
+                conversation.conversationId,
+                { daysBack: 7, forceCurrentDay: true },
+              );
+              this.deps.log.info(
+                `[lcm] maintain: daily rollups conversation=${conversation.conversationId} ${sessionLabel} built=${rollupResult.built} skipped=${rollupResult.skipped} errors=${rollupResult.errors.length}`,
+              );
+            }
+          } catch (error) {
+            this.deps.log.warn(
+              `[lcm] maintain: daily rollup build failed conversation=${conversation.conversationId} ${sessionLabel}: ${describeLogError(error)}`,
             );
           }
-        } catch (error) {
-          this.deps.log.warn(
-            `[lcm] maintain: daily rollup build failed conversation=${conversation.conversationId} ${sessionLabel}: ${describeLogError(error)}`,
-          );
-        }
+          return result;
+        };
 
         const maintenance =
           await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
@@ -4571,26 +4580,26 @@ export class LcmContextEngine implements ContextEngine {
         }
 
         if (!this.config.transcriptGcEnabled) {
-          return (
+          return finish(
             deferredCompactionResult ?? {
               changed: false,
               bytesFreed: 0,
               rewrittenEntries: 0,
               reason: "transcript GC disabled",
-            }
+            },
           );
         }
 
         if (
           typeof params.runtimeContext?.rewriteTranscriptEntries !== "function"
         ) {
-          return (
+          return finish(
             deferredCompactionResult ?? {
               changed: false,
               bytesFreed: 0,
               rewrittenEntries: 0,
               reason: "runtime rewrite helper unavailable",
-            }
+            },
           );
         }
 
@@ -4604,13 +4613,13 @@ export class LcmContextEngine implements ContextEngine {
           this.deps.log.info(
             `[lcm] maintain: no transcript GC candidates conversation=${conversation.conversationId} ${sessionLabel} duration=${formatDurationMs(Date.now() - startedAt)}`,
           );
-          return (
+          return finish(
             deferredCompactionResult ?? {
               changed: false,
               bytesFreed: 0,
               rewrittenEntries: 0,
               reason: "no transcript GC candidates",
-            }
+            },
           );
         }
 
@@ -4642,13 +4651,13 @@ export class LcmContextEngine implements ContextEngine {
           this.deps.log.info(
             `[lcm] maintain: no matching transcript entries conversation=${conversation.conversationId} ${sessionLabel} candidates=${candidates.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
           );
-          return (
+          return finish(
             deferredCompactionResult ?? {
               changed: false,
               bytesFreed: 0,
               rewrittenEntries: 0,
               reason: "no matching transcript entries",
-            }
+            },
           );
         }
 
@@ -4681,7 +4690,7 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.info(
           `[lcm] maintain: done conversation=${conversation.conversationId} ${sessionLabel} candidates=${candidates.length} replacements=${replacements.length} changed=${combinedResult.changed} rewrittenEntries=${combinedResult.rewrittenEntries} bytesFreed=${combinedResult.bytesFreed} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
-        return combinedResult;
+        return finish(combinedResult);
       },
       { operationName: "maintain", context: sessionLabel },
     );

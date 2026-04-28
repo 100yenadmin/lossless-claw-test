@@ -2,7 +2,7 @@ import { Type } from "@sinclair/typebox";
 import type { DatabaseSync } from "node:sqlite";
 import { formatTimestamp } from "../compaction.js";
 import type { LcmContextEngine } from "../engine.js";
-import { RollupStore } from "../store/rollup-store.js";
+import type { RollupStore } from "../store/rollup-store.js";
 import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
@@ -108,16 +108,15 @@ function formatDisplayTime(
   return formatTimestamp(date, timezone);
 }
 
-function getLcmDatabase(lcm: LcmContextEngine): DatabaseSync {
-  const store = lcm.getRollupStore?.();
+function getLcmRollupStore(
+  lcm: LcmContextEngine,
+  inputStore?: RollupStore
+): RollupStore {
+  const store = inputStore ?? lcm.getRollupStore?.();
   if (store?.db) {
-    return store.db;
+    return store;
   }
-  const candidate = lcm as unknown as { db?: DatabaseSync };
-  if (!candidate.db) {
-    throw new Error("LCM rollup database is unavailable.");
-  }
-  return candidate.db;
+  throw new Error("LCM rollup database is unavailable.");
 }
 
 function getPartsInTimezone(
@@ -262,6 +261,16 @@ function getUtcDateForZonedLocalTime(
   timezone: string,
   minutesAfterMidnight: number
 ): Date {
+  if (
+    !Number.isInteger(minutesAfterMidnight) ||
+    minutesAfterMidnight < 0 ||
+    minutesAfterMidnight > 24 * 60
+  ) {
+    throw new Error("Window bounds must be within the local day.");
+  }
+  if (minutesAfterMidnight === 24 * 60) {
+    return getUtcDateForZonedLocalTime(addDays(dayString, 1), timezone, 0);
+  }
   const hour = Math.floor(minutesAfterMidnight / 60);
   const minute = minutesAfterMidnight % 60;
   return localDateTimeToUtc(
@@ -459,6 +468,11 @@ function parseBaseDay(
     return { day, label: day };
   }
   if (/^\d{4}-\d{2}-\d{2}$/.test(base)) {
+    try {
+      assertValidDateKey(base, 'period date');
+    } catch {
+      return null;
+    }
     return { day: base, label: base };
   }
   return null;
@@ -650,6 +664,27 @@ function combineRollups(rollups: RollupRecord[]): {
   return { content, tokenCount, status, sourceSummaryIds };
 }
 
+function getExpectedDayKeys(
+  start: Date,
+  end: Date,
+  timezone: string
+): string[] {
+  if (end <= start) {
+    return [];
+  }
+  const keys: string[] = [];
+  let cursor = getZonedDayString(start, timezone);
+  const lastKey = getZonedDayString(new Date(end.getTime() - 1), timezone);
+  for (let guard = 0; guard < 370; guard += 1) {
+    keys.push(cursor);
+    if (cursor === lastKey) {
+      return keys;
+    }
+    cursor = addDays(cursor, 1);
+  }
+  return keys;
+}
+
 function getRecentSummaryFallback(
   db: DatabaseSync,
   conversationId: number | undefined,
@@ -738,7 +773,8 @@ export function createLcmRecentTool(input: {
         });
       }
 
-      const db = getLcmDatabase(lcm);
+      const rollupStore = getLcmRollupStore(lcm, input.rollupStore);
+      const db = rollupStore.db;
 
       if (conversationScope.allConversations) {
         const recentSummaries = getRecentSummaryFallback(
@@ -796,7 +832,6 @@ export function createLcmRecentTool(input: {
         };
       }
 
-      const rollupStore = input.rollupStore ?? new RollupStore(db);
       const conversationId = conversationScope.conversationId as number;
 
       let rollupContent: string | null = null;
@@ -804,7 +839,16 @@ export function createLcmRecentTool(input: {
       let status: "ready" | "stale" | "fallback" = "fallback";
       let sourceSummaryIds: string[] = [];
 
-      if (resolution.kind && resolution.periodKey && !resolution.window) {
+      const currentDayKey = getZonedDayString(new Date(), timezone);
+      const canUseStoredCurrentDay =
+        resolution.periodKey == null || resolution.periodKey !== currentDayKey;
+
+      if (
+        resolution.kind &&
+        resolution.periodKey &&
+        !resolution.window &&
+        canUseStoredCurrentDay
+      ) {
         const rollup = rollupStore.getRollup(
           conversationId,
           resolution.kind,
@@ -819,7 +863,7 @@ export function createLcmRecentTool(input: {
           status = rollup.status === "ready" ? "ready" : "stale";
           sourceSummaryIds = parseJsonStringArray(rollup.source_summary_ids);
         }
-      } else if (resolution.kind) {
+      } else if (resolution.kind && !resolution.window) {
         const rollups = rollupStore
           .listRollups(conversationId, resolution.kind, 200)
           .filter(
@@ -859,7 +903,19 @@ export function createLcmRecentTool(input: {
               : null,
             errorText: rollup.error_text,
           }));
-        if (usableRollups.length > 0) {
+        const expectedKeys =
+          resolution.kind === "day"
+            ? getExpectedDayKeys(resolution.start, resolution.end, timezone)
+            : [];
+        const usableKeys = new Set(
+          usableRollups.map((rollup) => rollup.periodKey)
+        );
+        const hasCompleteCoverage =
+          resolution.kind !== "day" ||
+          (expectedKeys.length > 0 &&
+            !expectedKeys.includes(currentDayKey) &&
+            expectedKeys.every((key) => usableKeys.has(key)));
+        if (usableRollups.length > 0 && hasCompleteCoverage) {
           const combined = combineRollups(usableRollups);
           rollupContent = combined.content;
           tokenCount = combined.tokenCount;
