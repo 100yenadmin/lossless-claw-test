@@ -169,6 +169,42 @@ describe("LCM temporal rollup MVP", () => {
       rollupStore.getRollup(conversation.conversationId, "day", "2026-04-27")
     ).toBeNull();
   });
+
+  it("builds daily rollups when local midnight is skipped by DST", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "midnight-gap-day",
+      sessionKey: "agent:main:midnight-gap-day",
+      title: "Midnight gap day",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_midnight_gap",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Captured work after a skipped local midnight.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      earliestAt: new Date("2026-04-23T22:30:00.000Z"),
+      latestAt: new Date("2026-04-23T22:45:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, {
+      timezone: "Africa/Cairo",
+    });
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-24")
+    ).resolves.toBe(true);
+    expect(
+      rollupStore.getRollup(
+        conversation.conversationId,
+        "day",
+        "2026-04-24",
+        "Africa/Cairo"
+      )?.content
+    ).toContain("skipped local midnight");
+  });
 });
 
 import {
@@ -277,6 +313,14 @@ describe("LCM sub-day window retrieval", () => {
     );
     expect(midnightTransition.start.toISOString()).toBe(
       "2026-03-27T22:00:00.000Z"
+    );
+
+    const skippedMidnight = __lcmRecentTestInternals.resolvePeriod(
+      "date:2026-04-24",
+      "Africa/Cairo"
+    );
+    expect(skippedMidnight.start.toISOString()).toBe(
+      "2026-04-23T22:00:00.000Z"
     );
   });
 
@@ -409,13 +453,13 @@ describe("LCM sub-day window retrieval", () => {
     const result = await tool.execute("call-budget", {
       period: "date:2026-04-27 10:00-11:30",
       includeSources: false,
-      maxOutputTokens: 1000,
-      globalMaxOutputTokens: 1000,
+      maxOutputTokens: 250,
+      globalMaxOutputTokens: 250,
       maxSourceSummaries: 80,
     });
     const text = (result.content[0] as { text: string }).text;
     expect(text).not.toContain("sum_budget_");
-    expect(estimateTokens(text)).toBeLessThanOrEqual(1000);
+    expect(estimateTokens(text)).toBeLessThanOrEqual(250);
     expect((result.details as { summaryIds?: string[] }).summaryIds).toEqual([]);
   });
 
@@ -646,6 +690,51 @@ describe("LCM weekly and monthly rollups", () => {
       rollupStore.getRollup(conversation.conversationId, "month", "2026-04")
         ?.rollup_id
     ).toBe(firstMonthId);
+  });
+
+  it("treats missing no-activity days as covered for aggregate rollups", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "aggregate-quiet-days",
+      sessionKey: "agent:main:aggregate-quiet-days",
+      title: "Aggregate quiet days",
+    });
+
+    for (const [day, content] of [
+      ["2026-04-27", "Monday work happened."],
+      ["2026-04-29", "Wednesday follow-up happened."],
+    ] as const) {
+      await summaryStore.insertSummary({
+        summaryId: `sum_quiet_${day}`,
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content,
+        tokenCount: 10,
+        sourceMessageTokenCount: 10,
+        latestAt: new Date(`${day}T10:00:00.000Z`),
+      });
+    }
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-29")
+    ).resolves.toBe(true);
+    await expect(
+      builder.buildWeeklyRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+
+    const week = rollupStore.getRollup(
+      conversation.conversationId,
+      "week",
+      "2026-04-27"
+    );
+    expect(week?.status).toBe("ready");
+    expect(week?.source_message_count).toBe(2);
+    expect(week?.content).toContain("Wednesday follow-up happened");
   });
 
   it("uses local UTC+13 day keys for week and month aggregation", async () => {

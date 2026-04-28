@@ -195,7 +195,21 @@ function getZonedDayString(date: Date, timezone: string): string {
 }
 
 function getUtcDateForZonedMidnight(dayString: string, timezone: string): Date {
-  return localDateTimeToUtc(dayString, "00:00:00", timezone);
+  try {
+    return localDateTimeToUtc(dayString, "00:00:00", timezone);
+  } catch (error) {
+    for (let minuteOfDay = 1; minuteOfDay < 24 * 60; minuteOfDay += 1) {
+      const hour = Math.floor(minuteOfDay / 60);
+      const minute = minuteOfDay % 60;
+      const time = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00`;
+      try {
+        return localDateTimeToUtc(dayString, time, timezone);
+      } catch {
+        // Day boundaries use the first representable instant on DST-skipped-midnight days.
+      }
+    }
+    throw error;
+  }
 }
 
 function addDays(dayString: string, delta: number): string {
@@ -695,13 +709,13 @@ function resolveRecallBudget(params: Record<string, unknown>): RecallBudget {
   const requestedOutputTokens = clampInt(
     params.maxOutputTokens,
     requestedFromDetail,
-    1_000,
+    1,
     ABSOLUTE_RECENT_GLOBAL_MAX_TOKENS
   );
   const globalMaxOutputTokens = clampInt(
     params.globalMaxOutputTokens,
     DEFAULT_RECENT_GLOBAL_MAX_TOKENS,
-    1_000,
+    1,
     ABSOLUTE_RECENT_GLOBAL_MAX_TOKENS
   );
   const maxSourceSummariesDefault = detailLevel >= 3 ? 500 : detailLevel >= 2 ? 120 : 40;
@@ -1095,7 +1109,6 @@ export function createLcmRecentTool(input: {
           )} — ${formatDisplayTime(resolution.end, timezone)}`
         );
         lines.push("**Status:** fallback");
-        lines.push(`**Token count:** ${estimateTokens(rendered.content)}`);
         lines.push("");
         if (recentSummaries.length === 0) {
           lines.push(
@@ -1300,7 +1313,6 @@ export function createLcmRecentTool(input: {
           )} — ${formatDisplayTime(resolution.end, timezone)}`
         );
         lines.push("**Status:** fallback");
-        lines.push(`**Token count:** ${estimateTokens(rendered.content)}`);
         lines.push("");
         if (recentSummaries.length === 0) {
           lines.push(
@@ -1344,13 +1356,17 @@ export function createLcmRecentTool(input: {
         )} — ${formatDisplayTime(resolution.end, timezone)}`
       );
       lines.push(`**Status:** ${status}`);
-      lines.push(`**Token count:** ${tokenCount}`);
       lines.push("");
       lines.push(rollupContent.trim());
       lines.push("");
       lines.push("---");
       lines.push(formatSourcesLine(sourceSummaryIds, includeSources));
-      lines.push(formatDrilldownHint(includeSources, "high"));
+      lines.push(
+        formatDrilldownHint(
+          includeSources,
+          usedFallback || status !== "ready" ? "medium" : "high"
+        )
+      );
       const response = enforceResponseBudget(lines.join("\n"), budget);
 
       return {

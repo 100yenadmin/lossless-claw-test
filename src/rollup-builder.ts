@@ -218,7 +218,18 @@ export class RollupBuilder {
     const sourceDayKeys = new Set(
       sourceRollups.map((rollup) => rollup.period_key)
     );
-    if (!expectedDayKeys.every((key) => sourceDayKeys.has(key))) {
+    const missingActiveDayKeys = expectedDayKeys.filter((key) => {
+      if (sourceDayKeys.has(key)) {
+        return false;
+      }
+      const dayBounds = getLocalDayBoundsForDateKey(key, this.config.timezone);
+      return this.getLeafSummariesForDay(
+        conversationId,
+        dayBounds.start,
+        dayBounds.end
+      ).some((summary) => summary.kind === "leaf");
+    });
+    if (missingActiveDayKeys.length > 0) {
       if (existing) {
         this.store.deleteRollup(existing.rollup_id);
       }
@@ -638,13 +649,30 @@ function getLocalDayBoundsForDateKey(
   timezone: string
 ): { start: Date; end: Date } {
   assertValidDateKey(dateKey);
-  const start = localDateTimeToUtc(dateKey, "00:00:00", timezone);
-  const end = localDateTimeToUtc(
+  const start = localDayBoundaryToUtc(dateKey, timezone);
+  const end = localDayBoundaryToUtc(
     shiftDateKey(dateKey, 1),
-    "00:00:00",
     timezone
   );
   return { start, end };
+}
+
+function localDayBoundaryToUtc(dateKey: string, timezone: string): Date {
+  try {
+    return localDateTimeToUtc(dateKey, "00:00:00", timezone);
+  } catch (error) {
+    for (let minuteOfDay = 1; minuteOfDay < 24 * 60; minuteOfDay += 1) {
+      const hour = Math.floor(minuteOfDay / 60);
+      const minute = minuteOfDay % 60;
+      const time = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00`;
+      try {
+        return localDateTimeToUtc(dateKey, time, timezone);
+      } catch {
+        // Keep walking forward until the first real local instant for the day.
+      }
+    }
+    throw error;
+  }
 }
 
 function isTimestampAtOrBefore(
