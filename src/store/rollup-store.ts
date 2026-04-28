@@ -487,7 +487,7 @@ export class RollupStore {
           strftime('%Y-%m-%dT%H:%M:%fZ', earliest_at) AS earliest_at,
           strftime('%Y-%m-%dT%H:%M:%fZ', latest_at) AS latest_at,
           strftime('%Y-%m-%dT%H:%M:%fZ', created_at) AS created_at,
-          strftime('%Y-%m-%dT%H:%M:%fZ', created_at) AS updated_at,
+          NULL AS updated_at,
           COALESCE(
             NULLIF(
               (

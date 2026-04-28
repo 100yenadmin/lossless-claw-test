@@ -1510,6 +1510,50 @@ describe("LCM weekly and monthly rollups", () => {
     }
   });
 
+  it("reports final sweep-state write failures without aborting built rollups", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "rollup-final-state-error",
+      sessionKey: "agent:main:rollup-final-state-error",
+      title: "Rollup final state error",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_final_state_error",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Built work should survive a final state write failure.",
+      tokenCount: 10,
+      latestAt: new Date("2026-04-27T10:00:00.000Z"),
+    });
+
+    const originalUpsertState = rollupStore.upsertState.bind(rollupStore);
+    const upsertSpy = vi
+      .spyOn(rollupStore, "upsertState")
+      .mockImplementation((conversationId, input) => {
+        if (input.pending_rebuild != null) {
+          throw new Error("state write failed");
+        }
+        originalUpsertState(conversationId, input);
+      });
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    const result = await builder.buildDailyRollups(conversation.conversationId, {
+      forceCurrentDay: true,
+      daysBack: 2,
+    });
+    upsertSpy.mockRestore();
+
+    expect(result.built).toBe(1);
+    expect(result.errors).toEqual([
+      "final sweep state update failed: state write failed",
+    ]);
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "day", "2026-04-27")
+    ).toBeTruthy();
+  });
+
   it("hides debug source IDs unless includeSources is true", async () => {
     const { conversationStore, summaryStore, rollupStore } = createStores();
     const conversation = await conversationStore.createConversation({
