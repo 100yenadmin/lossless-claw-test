@@ -195,40 +195,7 @@ function getZonedDayString(date: Date, timezone: string): string {
 }
 
 function getUtcDateForZonedMidnight(dayString: string, timezone: string): Date {
-  assertValidPlainDate(dayString);
-  const [year, month, day] = dayString.split("-").map((part) => Number(part));
-  const approxUtc = new Date(Date.UTC(year, month - 1, day, 0, 0, 0, 0));
-  const dtf = new Intl.DateTimeFormat("en-US", {
-    timeZone: timezone,
-    hour12: false,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-  const parts = dtf.formatToParts(approxUtc);
-  const zonedYear = Number(parts.find((part) => part.type === "year")?.value);
-  const zonedMonth = Number(parts.find((part) => part.type === "month")?.value);
-  const zonedDay = Number(parts.find((part) => part.type === "day")?.value);
-  const zonedHour = Number(parts.find((part) => part.type === "hour")?.value);
-  const zonedMinute = Number(
-    parts.find((part) => part.type === "minute")?.value
-  );
-  const zonedSecond = Number(
-    parts.find((part) => part.type === "second")?.value
-  );
-  const asUtc = Date.UTC(
-    zonedYear,
-    zonedMonth - 1,
-    zonedDay,
-    zonedHour,
-    zonedMinute,
-    zonedSecond
-  );
-  const desiredUtc = Date.UTC(year, month - 1, day, 0, 0, 0, 0);
-  return new Date(approxUtc.getTime() - (asUtc - desiredUtc));
+  return localDateTimeToUtc(dayString, "00:00:00", timezone);
 }
 
 function addDays(dayString: string, delta: number): string {
@@ -707,40 +674,207 @@ function formatSourcesLine(
   return `*Sources: ${summaryIds.join(", ")}*`;
 }
 
-function formatDrilldownHint(includeSources: boolean): string {
+function formatDrilldownHint(
+  includeSources: boolean,
+  confidence: "none" | "low" | "medium" | "high"
+): string {
+  if (confidence === "high") {
+    return includeSources
+      ? "*Confidence: high for recap coverage. For proof/exact wording, use lcm_expand_query with these summaryIds.*"
+      : "*Confidence: high for recap coverage. Re-run with includeSources=true if exact proof is needed.*";
+  }
   return includeSources
-    ? "*Drill down: Use lcm_expand_query with these summaryIds for deeper recall*"
-    : "*Drill down: Re-run with includeSources=true to reveal summaryIds for expansion*";
+    ? "*Confidence: partial. Dive deeper with lcm_expand_query on these summaryIds or request a larger maxOutputTokens/detailLevel.*"
+    : "*Confidence: partial. Re-run with includeSources=true, higher detailLevel, or a larger maxOutputTokens to inspect source summaries.*";
 }
 
-function combineRollups(rollups: RollupRecord[]): {
+function resolveRecallBudget(params: Record<string, unknown>): RecallBudget {
+  const detailLevel = clampInt(params.detailLevel, 1, 0, 3);
+  const requestedFromDetail =
+    DETAIL_LEVEL_TOKEN_HINTS.get(detailLevel) ?? DEFAULT_RECENT_OUTPUT_TOKENS;
+  const requestedOutputTokens = clampInt(
+    params.maxOutputTokens,
+    requestedFromDetail,
+    1_000,
+    ABSOLUTE_RECENT_GLOBAL_MAX_TOKENS
+  );
+  const globalMaxOutputTokens = clampInt(
+    params.globalMaxOutputTokens,
+    DEFAULT_RECENT_GLOBAL_MAX_TOKENS,
+    1_000,
+    ABSOLUTE_RECENT_GLOBAL_MAX_TOKENS
+  );
+  const maxSourceSummariesDefault = detailLevel >= 3 ? 500 : detailLevel >= 2 ? 120 : 40;
+  return {
+    requestedOutputTokens,
+    globalMaxOutputTokens,
+    effectiveOutputTokens: Math.min(requestedOutputTokens, globalMaxOutputTokens),
+    detailLevel,
+    maxSourceSummaries: clampInt(
+      params.maxSourceSummaries,
+      maxSourceSummariesDefault,
+      1,
+      1_000
+    ),
+  };
+}
+
+function clampInt(
+  value: unknown,
+  fallback: number,
+  min: number,
+  max: number
+): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.min(max, Math.max(min, Math.floor(value)))
+    : fallback;
+}
+
+function buildAccounting(
+  text: string,
+  summaries: RecentSummaryFallbackRow[],
+  availableCount: number,
+  truncated: boolean
+): RecallAccounting {
+  const summariesIncluded = summaries.length;
+  return {
+    outputTokens: estimateTokens(text),
+    sourceSummaryTokens: summaries.reduce(
+      (sum, summary) => sum + safeTokenCount(summary.token_count),
+      0
+    ),
+    sourceMessageTokens: summaries.reduce(
+      (sum, summary) => sum + safeTokenCount(summary.source_message_token_count),
+      0
+    ),
+    summariesIncluded,
+    summariesAvailable: availableCount,
+    summariesOmitted: Math.max(0, availableCount - summariesIncluded),
+    truncated,
+  };
+}
+
+function confidenceForAccounting(
+  accounting: RecallAccounting,
+  status: "ready" | "stale" | "fallback"
+): "none" | "low" | "medium" | "high" {
+  if (accounting.summariesAvailable === 0 && accounting.outputTokens === 0) {
+    return "none";
+  }
+  if (accounting.truncated || accounting.summariesOmitted > 0 || status === "fallback") {
+    return accounting.summariesIncluded > 0 ? "medium" : "low";
+  }
+  return status === "stale" ? "medium" : "high";
+}
+
+function formatBudgetLines(budget: RecallBudget, accounting: RecallAccounting): string[] {
+  return [
+    `**Budget:** requested=${budget.requestedOutputTokens} global=${budget.globalMaxOutputTokens} effective=${budget.effectiveOutputTokens} detailLevel=${budget.detailLevel}`,
+    `**Ingested:** output≈${accounting.outputTokens} tokens; source summaries=${accounting.summariesIncluded}/${accounting.summariesAvailable}; source-summary tokens=${accounting.sourceSummaryTokens}; source-message tokens=${accounting.sourceMessageTokens}; omitted=${accounting.summariesOmitted}`,
+  ];
+}
+
+function combineRollups(rollups: RollupRecord[], budget: RecallBudget): {
   content: string;
   tokenCount: number;
   status: "ready" | "stale";
   sourceSummaryIds: string[];
+  sourceSummaryTokens: number;
+  sourceMessageTokens: number;
+  sourceCount: number;
+  omittedRollups: number;
+  truncated: boolean;
 } {
-  const content = rollups
+  let retained = [...rollups];
+  let omittedRollups = 0;
+  let content = retained
     .map((rollup) => `### ${rollup.periodKey}\n\n${rollup.content.trim()}`)
     .join("\n\n");
-  const tokenCount = rollups.reduce(
-    (sum, rollup) => sum + rollup.tokenCount,
-    0
-  );
+  while (retained.length > 1 && estimateTokens(content) > budget.effectiveOutputTokens) {
+    retained = retained.slice(1);
+    omittedRollups += 1;
+    content = retained
+      .map((rollup) => `### ${rollup.periodKey}\n\n${rollup.content.trim()}`)
+      .join("\n\n");
+  }
+  if (omittedRollups > 0) {
+    content = `(${omittedRollups} earlier rollups omitted to fit budget)\n\n${content}`;
+  }
+  if (estimateTokens(content) > budget.effectiveOutputTokens) {
+    content = truncateToEstimatedTokens(content, budget.effectiveOutputTokens);
+  }
+  const tokenCount = estimateTokens(content);
   const sourceSummaryIds = [
-    ...new Set(rollups.flatMap((rollup) => rollup.sourceSummaryIds)),
+    ...new Set(retained.flatMap((rollup) => rollup.sourceSummaryIds)),
   ];
-  const status = rollups.every((rollup) => rollup.status === "ready")
+  const status = retained.every((rollup) => rollup.status === "ready")
     ? "ready"
     : "stale";
-  return { content, tokenCount, status, sourceSummaryIds };
+  return {
+    content,
+    tokenCount,
+    status,
+    sourceSummaryIds,
+    sourceSummaryTokens: retained.reduce((sum, rollup) => sum + rollup.tokenCount, 0),
+    sourceMessageTokens: retained.reduce((sum, rollup) => sum + rollup.sourceTokenCount, 0),
+    sourceCount: retained.reduce((sum, rollup) => sum + rollup.sourceSummaryIds.length, 0),
+    omittedRollups,
+    truncated: omittedRollups > 0 || tokenCount >= budget.effectiveOutputTokens,
+  };
 }
 
 function renderFallbackRollupSection(
   label: string,
   summaries: RecentSummaryFallbackRow[],
-  timezone: string
-): { content: string; summaryIds: string[] } {
-  const lines = [`### ${label} (live fallback)`];
+  timezone: string,
+  budget: RecallBudget
+): { content: string; summaryIds: string[]; retainedSummaries: RecentSummaryFallbackRow[]; accounting: RecallAccounting } {
+  const rendered = renderFallbackContent(label, summaries, timezone, budget);
+  return {
+    content: rendered.content,
+    summaryIds: rendered.retainedSummaries.map((summary) => summary.summary_id),
+    retainedSummaries: rendered.retainedSummaries,
+    accounting: buildAccounting(
+      rendered.content,
+      rendered.retainedSummaries,
+      summaries.length,
+      rendered.truncated
+    ),
+  };
+}
+
+function renderFallbackContent(
+  label: string,
+  summaries: RecentSummaryFallbackRow[],
+  timezone: string,
+  budget: RecallBudget
+): { content: string; retainedSummaries: RecentSummaryFallbackRow[]; truncated: boolean } {
+  const retainedSummaries = summaries.slice(0, budget.maxSourceSummaries);
+  let truncated = retainedSummaries.length < summaries.length;
+  let lines = buildFallbackLines(label, retainedSummaries, timezone, truncated ? summaries.length - retainedSummaries.length : 0);
+  while (retainedSummaries.length > 1 && estimateTokens(lines.join("\n")) > budget.effectiveOutputTokens) {
+    retainedSummaries.pop();
+    truncated = true;
+    lines = buildFallbackLines(label, retainedSummaries, timezone, summaries.length - retainedSummaries.length);
+  }
+  let content = lines.join("\n");
+  if (estimateTokens(content) > budget.effectiveOutputTokens) {
+    content = truncateToEstimatedTokens(content, budget.effectiveOutputTokens);
+    truncated = true;
+  }
+  return { content, retainedSummaries, truncated };
+}
+
+function buildFallbackLines(
+  label: string,
+  summaries: RecentSummaryFallbackRow[],
+  timezone: string,
+  omitted: number
+): string[] {
+  const lines = [`### ${label} (source-summary layer)`];
+  if (omitted > 0) {
+    lines.push(`- (${omitted} summaries omitted to fit budget)`);
+  }
   if (summaries.length === 0) {
     lines.push("- No leaf summaries captured.");
   } else {
@@ -749,14 +883,35 @@ function renderFallbackRollupSection(
         `- [${summary.summary_id}] (${summary.kind}, ${formatDisplayTime(
           summary.effective_time,
           timezone
-        )}): ${summary.content.replace(/\n/g, " ").trim()}`
+        )}, summaryTokens=${summary.token_count}, sourceTokens=${summary.source_message_token_count}): ${summary.content.replace(/\n/g, " ").trim()}`
       );
     }
   }
-  return {
-    content: lines.join("\n"),
-    summaryIds: summaries.map((summary) => summary.summary_id),
-  };
+  return lines;
+}
+
+function safeTokenCount(value: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : 0;
+}
+
+function truncateToEstimatedTokens(text: string, maxTokens: number): string {
+  if (estimateTokens(text) <= maxTokens) {
+    return text;
+  }
+  const suffix = "\n…(truncated to requested budget)";
+  let low = 0;
+  let high = text.length;
+  while (low < high) {
+    const mid = Math.floor((low + high + 1) / 2);
+    if (estimateTokens(`${text.slice(0, mid)}${suffix}`) <= maxTokens) {
+      low = mid;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return `${text.slice(0, low).trimEnd()}${suffix}`;
 }
 
 function getExpectedDayKeys(
@@ -799,6 +954,7 @@ function getRecentSummaryFallback(
         kind,
         content,
         token_count,
+        source_message_token_count,
         strftime('%Y-%m-%dT%H:%M:%fZ', created_at) AS created_at,
         strftime('%Y-%m-%dT%H:%M:%fZ', coalesce(latest_at, earliest_at, created_at)) AS effective_time
        FROM summaries
@@ -807,7 +963,7 @@ function getRecentSummaryFallback(
          AND julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)
          AND julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)
        ORDER BY julianday(coalesce(earliest_at, latest_at, created_at)) DESC
-       LIMIT 20`
+       LIMIT 1000`
     )
     .all(...args) as unknown as RecentSummaryFallbackRow[];
 }
@@ -840,6 +996,7 @@ export function createLcmRecentTool(input: {
 
       const p = params as Record<string, unknown>;
       const includeSources = p.includeSources === true;
+      const budget = resolveRecallBudget(p);
       const timezone = lcm.timezone;
       const conversationScope = await resolveLcmConversationScope({
         lcm,
@@ -1034,7 +1191,7 @@ export function createLcmRecentTool(input: {
                   (left, right) =>
                     left.periodStart.getTime() - right.periodStart.getTime()
                 );
-          const combined = combineRollups(orderedRollups);
+          const combined = combineRollups(orderedRollups, budget);
           const liveSections: string[] = [];
           const liveSummaryIds: string[] = [];
           if (currentDayInWindow) {
@@ -1054,7 +1211,8 @@ export function createLcmRecentTool(input: {
             const live = renderFallbackRollupSection(
               currentDayKey,
               getRecentSummaryFallback(db, conversationId, currentStart, currentEnd),
-              timezone
+              timezone,
+              budget
             );
             liveSections.push(live.content);
             liveSummaryIds.push(...live.summaryIds);
@@ -1066,7 +1224,7 @@ export function createLcmRecentTool(input: {
               .filter((section) => section.trim().length > 0)
               .join("\n\n");
           }
-          tokenCount = combined.tokenCount;
+          tokenCount = estimateTokens(rollupContent);
           status = combined.status;
           sourceSummaryIds = [...combined.sourceSummaryIds, ...liveSummaryIds];
         }

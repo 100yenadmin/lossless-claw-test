@@ -232,6 +232,14 @@ describe("LCM sub-day window retrieval", () => {
     );
     expect(nightWindow.start.toISOString()).toBe("2026-04-27T10:00:00.000Z");
     expect(nightWindow.end.toISOString()).toBe("2026-04-27T12:00:00.000Z");
+
+    const midnightTransition = __lcmRecentTestInternals.resolvePeriod(
+      "date:2026-03-28",
+      "Asia/Gaza"
+    );
+    expect(midnightTransition.start.toISOString()).toBe(
+      "2026-03-27T22:00:00.000Z"
+    );
   });
 
   it("falls back to leaf summaries inside the requested sub-day window", async () => {
@@ -472,34 +480,39 @@ describe("LCM weekly and monthly rollups", () => {
       title: "Aggregate rollups",
     });
 
-    for (const [summaryId, timestamp, content] of [
-      ["sum_mon", "2026-04-27T10:00:00.000Z", "Monday decision completed."],
-      ["sum_tue", "2026-04-28T10:00:00.000Z", "Tuesday rollout shipped."],
-      ["sum_may", "2026-05-01T10:00:00.000Z", "May follow-up issue created."],
-    ] as const) {
+    const aggregateDays = [
+      ...Array.from({ length: 30 }, (_, index) =>
+        `2026-04-${String(index + 1).padStart(2, "0")}`
+      ),
+      "2026-05-01",
+      "2026-05-02",
+      "2026-05-03",
+    ];
+    const specialContent = new Map([
+      ["2026-04-27", "Monday decision completed."],
+      ["2026-04-28", "Tuesday rollout shipped."],
+      ["2026-05-01", "May follow-up issue created."],
+    ]);
+    for (const day of aggregateDays) {
       await summaryStore.insertSummary({
-        summaryId,
+        summaryId: `sum_${day}`,
         conversationId: conversation.conversationId,
         kind: "leaf",
         depth: 0,
-        content,
+        content: specialContent.get(day) ?? `Routine aggregate coverage for ${day}.`,
         tokenCount: 10,
         sourceMessageTokenCount: 10,
-        earliestAt: new Date(timestamp),
-        latestAt: new Date(timestamp),
+        earliestAt: new Date(`${day}T10:00:00.000Z`),
+        latestAt: new Date(`${day}T10:00:00.000Z`),
       });
     }
 
     const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
-    await expect(
-      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
-    ).resolves.toBe(true);
-    await expect(
-      builder.buildDayRollup(conversation.conversationId, "2026-04-28")
-    ).resolves.toBe(true);
-    await expect(
-      builder.buildDayRollup(conversation.conversationId, "2026-05-01")
-    ).resolves.toBe(true);
+    for (const day of aggregateDays) {
+      await expect(
+        builder.buildDayRollup(conversation.conversationId, day)
+      ).resolves.toBe(true);
+    }
 
     await expect(
       builder.buildWeeklyRollup(conversation.conversationId, "2026-04-27")
@@ -515,12 +528,12 @@ describe("LCM weekly and monthly rollups", () => {
     );
     expect(week?.status).toBe("ready");
     expect(week?.content).toContain("Weekly Summary: 2026-04-27");
-    expect(week?.source_message_count).toBe(3);
+    expect(week?.source_message_count).toBe(7);
     expect(
       rollupStore
         .getRollupSources(week!.rollup_id)
         .map((source) => source.source_type)
-    ).toEqual(["rollup", "rollup", "rollup"]);
+    ).toEqual(Array.from({ length: 7 }, () => "rollup"));
 
     const month = rollupStore.getRollup(
       conversation.conversationId,
@@ -529,8 +542,8 @@ describe("LCM weekly and monthly rollups", () => {
     );
     expect(month?.status).toBe("ready");
     expect(month?.content).toContain("Monthly Summary: 2026-04");
-    expect(month?.source_message_count).toBe(2);
-    expect(rollupStore.getRollupSources(month!.rollup_id)).toHaveLength(2);
+    expect(month?.source_message_count).toBe(30);
+    expect(rollupStore.getRollupSources(month!.rollup_id)).toHaveLength(30);
 
     const firstMonthId = month?.rollup_id;
     await expect(
@@ -550,39 +563,50 @@ describe("LCM weekly and monthly rollups", () => {
       title: "Aggregate UTC+13",
     });
 
-    await summaryStore.insertSummary({
-      summaryId: "sum_auckland",
-      conversationId: conversation.conversationId,
-      kind: "leaf",
-      depth: 0,
-      content: "Completed the Pacific/Auckland aggregate key fix.",
-      tokenCount: 10,
-      sourceMessageTokenCount: 10,
-      earliestAt: new Date("2026-04-26T12:30:00.000Z"),
-      latestAt: new Date("2026-04-26T13:00:00.000Z"),
-    });
+    const aggregateDays = Array.from(
+      { length: 31 },
+      (_, index) => `2026-01-${String(index + 1).padStart(2, "0")}`
+    );
+    for (const day of aggregateDays) {
+      await summaryStore.insertSummary({
+        summaryId: `sum_auckland_${day}`,
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content:
+          day === "2026-01-05"
+            ? "Completed the Pacific/Auckland aggregate key fix."
+            : `Routine Pacific/Auckland aggregate coverage for ${day}.`,
+        tokenCount: 10,
+        sourceMessageTokenCount: 10,
+        earliestAt: new Date(`${day}T00:30:00+13:00`),
+        latestAt: new Date(`${day}T01:00:00+13:00`),
+      });
+    }
 
     const builder = new RollupBuilder(rollupStore, {
       timezone: "Pacific/Auckland",
     });
+    for (const day of aggregateDays) {
+      await expect(
+        builder.buildDayRollup(conversation.conversationId, day)
+      ).resolves.toBe(true);
+    }
     await expect(
-      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+      builder.buildWeeklyRollup(conversation.conversationId, "2026-01-05")
     ).resolves.toBe(true);
     await expect(
-      builder.buildWeeklyRollup(conversation.conversationId, "2026-04-27")
-    ).resolves.toBe(true);
-    await expect(
-      builder.buildMonthlyRollup(conversation.conversationId, "2026-04")
+      builder.buildMonthlyRollup(conversation.conversationId, "2026-01")
     ).resolves.toBe(true);
 
     expect(
-      rollupStore.getRollup(conversation.conversationId, "week", "2026-04-27")
+      rollupStore.getRollup(conversation.conversationId, "week", "2026-01-05")
         ?.content
-    ).toContain("2026-04-27");
+    ).toContain("2026-01-05");
     expect(
-      rollupStore.getRollup(conversation.conversationId, "month", "2026-04")
+      rollupStore.getRollup(conversation.conversationId, "month", "2026-01")
         ?.source_message_count
-      ).toBe(1);
+    ).toBe(31);
   });
 
   it("does not serve stored aggregate rollups while rebuild is pending", async () => {

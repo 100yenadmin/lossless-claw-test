@@ -205,6 +205,16 @@ export class RollupBuilder {
       }
       return false;
     }
+    const expectedDayKeys = getAggregateDayKeys(periodKind, periodKey);
+    const sourceDayKeys = new Set(
+      sourceRollups.map((rollup) => rollup.period_key)
+    );
+    if (!expectedDayKeys.every((key) => sourceDayKeys.has(key))) {
+      if (existing) {
+        this.store.deleteRollup(existing.rollup_id);
+      }
+      return false;
+    }
 
     const sourceTokens = sourceRollups.reduce(
       (sum, rollup) => sum + safeTokenCount(rollup.source_token_count),
@@ -400,10 +410,14 @@ export class RollupBuilder {
       }
     }
 
+    const latestState = this.store.getState(conversationId);
+    const shouldClearPending =
+      result.errors.length === 0 &&
+      isTimestampAtOrBefore(latestState?.last_message_at, scannedAt);
     this.store.upsertState(conversationId, {
       timezone: this.config.timezone,
       last_rollup_check_at: scannedAt.toISOString(),
-      pending_rebuild: result.errors.length === 0 ? 0 : 1,
+      pending_rebuild: result.errors.length === 0 && shouldClearPending ? 0 : 1,
     });
 
     return result;
@@ -612,6 +626,17 @@ function getLocalDayBoundsForDateKey(
     timezone
   );
   return { start, end };
+}
+
+function isTimestampAtOrBefore(
+  value: string | null | undefined,
+  boundary: Date
+): boolean {
+  if (!value) {
+    return true;
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) || parsed <= boundary;
 }
 
 function buildRollupId(periodKind: string, periodKey: string): string {
@@ -1026,6 +1051,38 @@ function getWeekBounds(
   };
 }
 
+function getAggregateDayKeys(
+  periodKind: "week" | "month",
+  periodKey: string
+): string[] {
+  const startKey = periodKind === WEEK_PERIOD_KIND ? periodKey : `${periodKey}-01`;
+  const endKey =
+    periodKind === WEEK_PERIOD_KIND
+      ? shiftDateKey(periodKey, 7)
+      : getNextMonthStartKey(periodKey);
+  const keys: string[] = [];
+  for (let key = startKey, guard = 0; key < endKey && guard < 370; guard += 1) {
+    keys.push(key);
+    key = shiftDateKey(key, 1);
+  }
+  return keys;
+}
+
+function getNextMonthStartKey(monthKey: string): string {
+  if (!/^\d{4}-\d{2}$/.test(monthKey)) {
+    throw new Error(`Invalid month key: ${monthKey}`);
+  }
+  const [year, month] = monthKey
+    .split("-")
+    .map((part) => Number.parseInt(part, 10));
+  if (!Number.isFinite(year) || month < 1 || month > 12) {
+    throw new Error(`Invalid month key: ${monthKey}`);
+  }
+  return month === 12
+    ? `${year + 1}-01-01`
+    : `${year}-${String(month + 1).padStart(2, "0")}-01`;
+}
+
 function getMonthBounds(
   monthKey: string,
   timezone: string
@@ -1039,13 +1096,10 @@ function getMonthBounds(
   if (!Number.isFinite(year) || month < 1 || month > 12) {
     throw new Error(`Invalid month key: ${monthKey}`);
   }
-  const nextMonth =
-    month === 12
-      ? `${year + 1}-01`
-      : `${year}-${String(month + 1).padStart(2, "0")}`;
+  const nextMonth = getNextMonthStartKey(monthKey);
   return {
     start: localDateTimeToUtc(`${monthKey}-01`, "00:00:00", timezone),
-    end: localDateTimeToUtc(`${nextMonth}-01`, "00:00:00", timezone),
+    end: localDateTimeToUtc(nextMonth, "00:00:00", timezone),
   };
 }
 
