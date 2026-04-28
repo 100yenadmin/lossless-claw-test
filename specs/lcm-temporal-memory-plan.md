@@ -149,8 +149,8 @@ Scope:
 
 Acceptance tests:
 
-- Tarzan/Indigo onboarding window reconstructs phases, final state, blockers, artifacts, and confidence.
-- Eric Wilder incident reconstructs root cause, repair actions, final verification, and follow-up ticket.
+- A multi-party onboarding window reconstructs phases, final state, blockers, artifacts, and confidence.
+- A named production incident reconstructs root cause, repair actions, final verification, and follow-up ticket.
 - Emotional first-occurrence scenario returns moderate confidence when primary evidence is indirect and names the evidence gap.
 
 ## Non-goals for the first PR

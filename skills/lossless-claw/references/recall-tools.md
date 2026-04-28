@@ -42,16 +42,16 @@ Good prompts for `lcm_recent`:
 
 Why use it:
 
-- It answers timeline-shaped questions without keyword guessing.
-- It uses prebuilt day/week/month rollups when available.
-- It falls back to bounded source summaries for precise windows.
-- It keeps provenance available so you can drill down when exact evidence is needed.
-- It is the right entry tool for recap, not the last tool for proof.
+- Answers timeline-shaped questions without keyword guessing.
+- Uses prebuilt day/week/month rollups when available.
+- Falls back to bounded source summaries for precise windows.
+- Keeps provenance available so you can drill down when exact evidence is needed.
+- Serves as the right entry tool for recap, not the last tool for proof.
 
 Important limits:
 
 - `lcm_recent` is a recap/narrowing tool, not final proof for exact commands, paths, timestamps, root causes, or shipped claims.
-- For event-bounded questions like "after the restart" or "since Eric broke," first anchor the event time/window if it is not already known. Use `lcm_grep`, diagnostics, logs, or other evidence to find the timestamp, then run `lcm_recent` over the post-event window.
+- For event-bounded questions like "after the restart" or "since the dependency broke," first anchor the event time/window if it is not already known. Use `lcm_grep`, diagnostics, logs, or other evidence to find the timestamp, then run `lcm_recent` over the post-event window.
 - Weekly/monthly `lcm_recent` is good for recap and themes. Verify specific "shipped" or "decided" claims with expansion before asserting them as facts.
 - If `lcm_recent` is not available in the current runtime, say so and approximate with `lcm_grep` plus bounded expansion; do not pretend a rollup was queried.
 
@@ -128,7 +128,7 @@ Examples: "what happened yesterday?", "what did we do after lunch?", "what did w
 
 ### Event-bounded question
 
-Examples: "what happened after the restart?", "what changed since Eric broke?"
+Examples: "what happened after the restart?", "what changed since the dependency broke?"
 
 1. Anchor the event time/window first. If it is unknown, locate it with `lcm_grep`, logs, diagnostics, or the relevant system source.
 2. If `lcm_recent` is available, run it over the known post-event local window, such as `last 3h` or `date:YYYY-MM-DD HH:MM-HH:MM`; otherwise use bounded `lcm_grep`.
@@ -136,7 +136,7 @@ Examples: "what happened after the restart?", "what changed since Eric broke?"
 
 ### Keyword-shaped question
 
-Examples: "find the Eric ENOTEMPTY incident", "where did we mention PR #15?"
+Examples: "find the ENOTEMPTY incident", "where did we mention PR #15?"
 
 1. Start with `lcm_grep` using 1-3 distinctive terms.
 2. Use `lcm_describe` when you have a promising summary/file ID.
@@ -144,7 +144,7 @@ Examples: "find the Eric ENOTEMPTY incident", "where did we mention PR #15?"
 
 ### Mixed time + topic question
 
-Examples: "what happened with Eric yesterday afternoon?", "what did we decide about LCM this week?"
+Examples: "what happened with the incident yesterday afternoon?", "what did we decide about LCM this week?"
 
 1. If `lcm_recent` is available, start with it to bound the period; otherwise start with `lcm_grep` using the topic plus approximate time filters.
 2. If the result is too broad, use topic terms with `lcm_grep` or expand the returned sources.
