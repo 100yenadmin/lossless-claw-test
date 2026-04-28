@@ -519,6 +519,18 @@ describe("LCM sub-day window retrieval", () => {
     expect(skippedMidnightNight.end.toISOString()).toBe(
       "2026-04-23T22:00:00.000Z"
     );
+
+    const explicitEndOfDay = __lcmRecentTestInternals.resolvePeriod(
+      "date:2026-04-23 22:00-24:00",
+      "Africa/Cairo"
+    );
+    expect(explicitEndOfDay.window?.endMinutes).toBe(24 * 60);
+    expect(explicitEndOfDay.start.toISOString()).toBe(
+      "2026-04-23T20:00:00.000Z"
+    );
+    expect(explicitEndOfDay.end.toISOString()).toBe(
+      "2026-04-23T22:00:00.000Z"
+    );
   });
 
   it("falls back to leaf summaries inside the requested sub-day window", async () => {
@@ -669,9 +681,13 @@ describe("LCM sub-day window retrieval", () => {
       const text = (result.content[0] as { text: string }).text;
       expect(text).toContain("Fresh same-day work");
       expect(text).not.toContain("STALE CURRENT DAY ROLLUP");
-      expect((result.details as { usedFallback?: boolean }).usedFallback).toBe(
-        true
-      );
+      expect(
+        (result.details as { status?: string; usedFallback?: boolean }).status
+      ).toBe("fallback");
+      expect(
+        (result.details as { status?: string; usedFallback?: boolean })
+          .usedFallback
+      ).toBe(true);
     } finally {
       vi.useRealTimers();
     }
