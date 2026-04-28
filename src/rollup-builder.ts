@@ -80,6 +80,7 @@ export class RollupBuilder {
     conversationId: number
   ): Promise<BuildResult> {
     const result: BuildResult = { built: 0, skipped: 0, errors: [] };
+    const weeklyErrorStart = result.errors.length;
     const weeks = this.collectAggregateKeys(conversationId, WEEK_PERIOD_KIND);
     for (const weekKey of weeks) {
       try {
@@ -96,7 +97,9 @@ export class RollupBuilder {
         );
       }
     }
+    const weeklySucceeded = result.errors.length === weeklyErrorStart;
 
+    const monthlyErrorStart = result.errors.length;
     const months = this.collectAggregateKeys(conversationId, MONTH_PERIOD_KIND);
     for (const monthKey of months) {
       try {
@@ -113,12 +116,13 @@ export class RollupBuilder {
         );
       }
     }
+    const monthlySucceeded = result.errors.length === monthlyErrorStart;
 
     const builtAt = new Date().toISOString();
     this.store.upsertState(conversationId, {
       timezone: this.config.timezone,
-      last_weekly_build_at: builtAt,
-      last_monthly_build_at: builtAt,
+      ...(weeklySucceeded ? { last_weekly_build_at: builtAt } : {}),
+      ...(monthlySucceeded ? { last_monthly_build_at: builtAt } : {}),
       last_rollup_check_at: builtAt,
       ...(result.errors.length > 0 ? { pending_rebuild: 1 } : {}),
     });
@@ -259,7 +263,7 @@ export class RollupBuilder {
         sourceFingerprint: rollup.source_fingerprint,
       }))
     );
-    if (existing?.source_fingerprint === fingerprint) {
+    if (existing?.source_fingerprint === fingerprint && existing.status === "ready") {
       return false;
     }
 
@@ -425,7 +429,7 @@ export class RollupBuilder {
         continue;
       }
 
-      if (existing?.source_fingerprint === fingerprint) {
+      if (existing?.source_fingerprint === fingerprint && existing.status === "ready") {
         result.skipped += 1;
         continue;
       }

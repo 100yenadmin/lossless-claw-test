@@ -760,6 +760,26 @@ function clampInt(
     : fallback;
 }
 
+function confidenceForAccounting(
+  accounting: RecallAccounting,
+  status: "ready" | "stale" | "fallback"
+): "none" | "low" | "medium" | "high" {
+  if (accounting.summariesAvailable === 0 && accounting.outputTokens === 0) {
+    return "none";
+  }
+  if (accounting.truncated || accounting.summariesOmitted > 0 || status === "fallback") {
+    return accounting.summariesIncluded > 0 ? "medium" : "low";
+  }
+  return status === "stale" ? "medium" : "high";
+}
+
+function formatBudgetLines(budget: RecallBudget, accounting: RecallAccounting): string[] {
+  return [
+    `**Budget:** requested=${budget.requestedOutputTokens} global=${budget.globalMaxOutputTokens} effective=${budget.effectiveOutputTokens} detailLevel=${budget.detailLevel}`,
+    `**Ingested:** output≈${accounting.outputTokens} tokens; source summaries=${accounting.summariesIncluded}/${accounting.summariesAvailable}; source-summary tokens=${accounting.sourceSummaryTokens}; source-message tokens=${accounting.sourceMessageTokens}; omitted=${accounting.summariesOmitted}`,
+  ];
+}
+
 function buildAccounting(
   text: string,
   summaries: RecentSummaryFallbackRow[],
@@ -1131,16 +1151,14 @@ export function createLcmRecentTool(input: {
           resolution.start,
           resolution.end
         );
-        const rendered = renderFallbackContent(
+        const rendered = renderFallbackRollupSection(
           resolution.label,
-          fallback.summaries,
+          fallback,
           timezone,
           budget,
           includeSources
         );
-        const summaryIds = rendered.retainedSummaries.map(
-          (summary) => summary.summary_id
-        );
+        const confidence = confidenceForAccounting(rendered.accounting, "fallback");
 
         const lines: string[] = [];
         lines.push(`## Recent Activity: ${resolution.label}`);
@@ -1151,6 +1169,8 @@ export function createLcmRecentTool(input: {
           )} — ${formatDisplayTime(resolution.end, timezone)}`
         );
         lines.push("**Status:** fallback");
+        lines.push(`**Confidence:** ${confidence}`);
+        lines.push(...formatBudgetLines(budget, rendered.accounting));
         lines.push("");
         if (fallback.summaries.length === 0) {
           lines.push(
@@ -1165,8 +1185,8 @@ export function createLcmRecentTool(input: {
           lines.push("");
         }
         lines.push("---");
-        lines.push(formatSourcesLine(summaryIds, includeSources));
-        lines.push(formatDrilldownHint(includeSources, "medium"));
+        lines.push(formatSourcesLine(rendered.summaryIds, includeSources));
+        lines.push(formatDrilldownHint(includeSources, confidence));
         const response = enforceResponseBudget(lines.join("\n"), budget);
 
         return {
@@ -1174,10 +1194,16 @@ export function createLcmRecentTool(input: {
           details: {
             status: "fallback",
             usedFallback: true,
+            confidence,
+            budget,
+            accounting: rendered.accounting,
             totalMatches: fallback.availableCount,
             tokenCount: response.tokenCount,
-            truncated: response.truncated || rendered.truncated || fallback.sqlTruncated,
-            summaryIds: includeSources ? summaryIds : [],
+            truncated:
+              response.truncated ||
+              rendered.accounting.truncated ||
+              fallback.sqlTruncated,
+            summaryIds: includeSources ? rendered.summaryIds : [],
           },
         };
       }

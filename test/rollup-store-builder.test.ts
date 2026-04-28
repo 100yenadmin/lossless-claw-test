@@ -882,6 +882,57 @@ describe("LCM weekly and monthly rollups", () => {
     ).resolves.toBe(true);
   });
 
+  it("rebuilds stale day and aggregate rows even when fingerprints match", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "stale-fingerprint-rebuild",
+      sessionKey: "agent:main:stale-fingerprint-rebuild",
+      title: "Stale fingerprint rebuild",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_stale_rebuild",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Stale rollup should become ready again.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+      latestAt: new Date("2026-04-27T10:00:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await builder.buildDayRollup(conversation.conversationId, "2026-04-27");
+    const day = rollupStore.getRollup(conversation.conversationId, "day", "2026-04-27");
+    rollupStore.markStale(day!.rollup_id);
+
+    const daily = await builder.buildDailyRollups(conversation.conversationId, {
+      forceCurrentDay: true,
+      daysBack: 2,
+    });
+    expect(daily.built).toBeGreaterThan(0);
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "day", "2026-04-27")
+        ?.status
+    ).toBe("ready");
+
+    await builder.buildWeeklyRollup(conversation.conversationId, "2026-04-27");
+    const week = rollupStore.getRollup(
+      conversation.conversationId,
+      "week",
+      "2026-04-27"
+    );
+    rollupStore.markStale(week!.rollup_id);
+    await expect(
+      builder.buildWeeklyRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "week", "2026-04-27")
+        ?.status
+    ).toBe("ready");
+  });
+
   it("builds aggregate week/month rollups from stable daily rollups", async () => {
     const { conversationStore, summaryStore, rollupStore } = createStores();
     const conversation = await conversationStore.createConversation({
@@ -1182,6 +1233,67 @@ describe("LCM weekly and monthly rollups", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("updates aggregate phase timestamps only for successful phases", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "aggregate-phase-state",
+      sessionKey: "agent:main:aggregate-phase-state",
+      title: "Aggregate phase state",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_phase_state",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Monthly phase can still build if weekly phase fails.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+      latestAt: new Date("2026-04-27T10:00:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await builder.buildDayRollup(conversation.conversationId, "2026-04-27");
+    const originalBuildAggregate = (
+      builder as unknown as {
+        buildAggregateRollup: (
+          conversationId: number,
+          periodKind: "week" | "month",
+          periodKey: string
+        ) => Promise<boolean>;
+      }
+    ).buildAggregateRollup.bind(builder);
+    const aggregateSpy = vi
+      .spyOn(
+        builder as unknown as {
+          buildAggregateRollup: (
+            conversationId: number,
+            periodKind: "week" | "month",
+            periodKey: string
+          ) => Promise<boolean>;
+        },
+        "buildAggregateRollup"
+      )
+      .mockImplementation(async (conversationId, periodKind, periodKey) => {
+        if (periodKind === "week") {
+          throw new Error("week phase failed");
+        }
+        return originalBuildAggregate(conversationId, periodKind, periodKey);
+      });
+
+    const result = await builder.buildWeeklyMonthlyRollups(
+      conversation.conversationId
+    );
+    aggregateSpy.mockRestore();
+
+    expect(result.errors).toHaveLength(1);
+    const state = rollupStore.getState(conversation.conversationId);
+    expect(state?.last_weekly_build_at).toBeNull();
+    expect(state?.last_monthly_build_at).toBeTruthy();
+    expect(state?.pending_rebuild).toBe(1);
   });
 
   it("removes orphaned aggregate rollups when source days disappear", async () => {
