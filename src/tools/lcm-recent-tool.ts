@@ -1032,7 +1032,7 @@ function getRecentSummaryFallback(
          kind = 'leaf'
          AND julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)
          AND julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)
-       ORDER BY julianday(coalesce(earliest_at, latest_at, created_at)) DESC
+       ORDER BY julianday(coalesce(latest_at, earliest_at, created_at)) DESC
        LIMIT ${FALLBACK_SQL_LIMIT + 1}`
     )
     .all(...args) as unknown as RecentSummaryFallbackRow[];

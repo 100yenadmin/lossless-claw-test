@@ -426,8 +426,71 @@ describe("LCM sub-day window retrieval", () => {
     expect(text).not.toContain("sum_before_window");
     expect(text).not.toContain("sum_after_window");
     expect((result.details as { summaryIds?: string[] }).summaryIds).toEqual([
-      "sum_inside_window",
       "sum_spanning_window",
+      "sum_inside_window",
+    ]);
+  });
+
+  it("orders fallback rows by the displayed effective time", async () => {
+    const { db, conversationStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "fallback-effective-order",
+      sessionKey: "agent:main:fallback-effective-order",
+      title: "Fallback effective order",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_late_effective",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Late effective fallback should appear first.",
+      tokenCount: 8,
+      sourceMessageTokenCount: 8,
+      earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+      latestAt: new Date("2026-04-27T11:55:00.000Z"),
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_early_effective",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Earlier effective fallback should appear second.",
+      tokenCount: 8,
+      sourceMessageTokenCount: 8,
+      earliestAt: new Date("2026-04-27T11:00:00.000Z"),
+      latestAt: new Date("2026-04-27T11:05:00.000Z"),
+    });
+
+    const lcm = {
+      timezone: "UTC",
+      getRollupStore: () => new RollupStore(db),
+      getConversationStore: () => ({
+        getConversationBySessionId: async () => ({
+          conversationId: conversation.conversationId,
+          sessionId: "fallback-effective-order",
+          title: null,
+          bootstrappedAt: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }),
+        getConversationBySessionKey: async () => null,
+      }),
+    };
+    const tool = createLcmRecentTool({
+      deps: makeRecentDeps(),
+      lcm: lcm as never,
+      sessionId: "fallback-effective-order",
+    });
+
+    const result = await tool.execute("call-effective-order", {
+      period: "date:2026-04-27 10:00-12:00",
+      includeSources: true,
+    });
+
+    expect((result.details as { summaryIds?: string[] }).summaryIds).toEqual([
+      "sum_late_effective",
+      "sum_early_effective",
     ]);
   });
 
