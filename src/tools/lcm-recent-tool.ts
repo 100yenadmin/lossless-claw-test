@@ -247,7 +247,7 @@ function getUtcDateForZonedLocalTime(
     throw new Error("Window bounds must be within the local day.");
   }
   if (minutesAfterMidnight === 24 * 60) {
-    return getUtcDateForZonedLocalTime(addDays(dayString, 1), timezone, 0);
+    return getUtcDateForZonedMidnight(addDays(dayString, 1), timezone);
   }
   const hour = Math.floor(minutesAfterMidnight / 60);
   const minute = minutesAfterMidnight % 60;
@@ -1022,6 +1022,46 @@ function getRecentSummaryFallback(
     .all(...args) as unknown as RecentSummaryFallbackRow[];
 }
 
+function hasLeafSummariesInRange(
+  db: DatabaseSync,
+  conversationId: number | undefined,
+  start: Date,
+  end: Date
+): boolean {
+  const scopeClause = conversationId == null ? "" : "conversation_id = ? AND";
+  const args: Array<string | number> =
+    conversationId == null
+      ? [end.toISOString(), start.toISOString()]
+      : [conversationId, end.toISOString(), start.toISOString()];
+
+  const row = db
+    .prepare(
+      `SELECT 1 AS present
+       FROM summaries
+       WHERE ${scopeClause}
+         kind = 'leaf'
+         AND julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)
+         AND julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)
+       LIMIT 1`
+    )
+    .get(...args) as { present: 1 } | undefined;
+  return row != null;
+}
+
+function dayHasLeafSummaries(
+  db: DatabaseSync,
+  conversationId: number | undefined,
+  dayKey: string,
+  timezone: string
+): boolean {
+  return hasLeafSummariesInRange(
+    db,
+    conversationId,
+    getUtcDateForZonedMidnight(dayKey, timezone),
+    getUtcDateForZonedMidnight(addDays(dayKey, 1), timezone)
+  );
+}
+
 export const __lcmRecentTestInternals = {
   resolvePeriod,
   getUtcDateForZonedMidnight,
@@ -1238,7 +1278,11 @@ export function createLcmRecentTool(input: {
         const hasCompleteCoverage =
           resolution.kind !== "day" ||
           (expectedKeys.length > 0 &&
-            requiredKeys.every((key) => usableKeys.has(key)));
+            requiredKeys.every(
+              (key) =>
+                usableKeys.has(key) ||
+                !dayHasLeafSummaries(db, conversationId, key, timezone)
+            ));
         if (usableRollups.length > 0 && hasCompleteCoverage) {
           const orderedRollups =
             resolution.kind === "day"

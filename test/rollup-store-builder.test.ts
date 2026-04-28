@@ -322,6 +322,17 @@ describe("LCM sub-day window retrieval", () => {
     expect(skippedMidnight.start.toISOString()).toBe(
       "2026-04-23T22:00:00.000Z"
     );
+
+    const skippedMidnightNight = __lcmRecentTestInternals.resolvePeriod(
+      "date:2026-04-23 night",
+      "Africa/Cairo"
+    );
+    expect(skippedMidnightNight.start.toISOString()).toBe(
+      "2026-04-23T20:00:00.000Z"
+    );
+    expect(skippedMidnightNight.end.toISOString()).toBe(
+      "2026-04-23T22:00:00.000Z"
+    );
   });
 
   it("falls back to leaf summaries inside the requested sub-day window", async () => {
@@ -539,6 +550,69 @@ describe("LCM sub-day window retrieval", () => {
       expect((result.details as { usedFallback?: boolean }).usedFallback).toBe(
         true
       );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("treats inactive days as covered when combining 7d rollups", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const { conversationStore, summaryStore, rollupStore } = createStores();
+      const conversation = await conversationStore.createConversation({
+        sessionId: "seven-day-sparse",
+        sessionKey: "agent:main:seven-day-sparse",
+        title: "Seven day sparse",
+      });
+
+      for (let index = 0; index < 25; index += 1) {
+        await summaryStore.insertSummary({
+          summaryId: `sum_sparse_${index}`,
+          conversationId: conversation.conversationId,
+          kind: "leaf",
+          depth: 0,
+          content: `Sparse inactive-day item ${index}.`,
+          tokenCount: 8,
+          latestAt: new Date(`2026-04-22T10:${String(index).padStart(2, "0")}:00.000Z`),
+        });
+      }
+
+      const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+      await builder.buildDayRollup(conversation.conversationId, "2026-04-22");
+
+      const lcm = {
+        timezone: "UTC",
+        getRollupStore: () => rollupStore,
+        getConversationStore: () => ({
+          getConversationBySessionId: async () => ({
+            conversationId: conversation.conversationId,
+            sessionId: "seven-day-sparse",
+            title: null,
+            bootstrappedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          }),
+          getConversationBySessionKey: async () => null,
+        }),
+      };
+      const tool = createLcmRecentTool({
+        deps: makeRecentDeps(),
+        lcm: lcm as never,
+        sessionId: "seven-day-sparse",
+      });
+
+      const result = await tool.execute("call-7d-sparse", {
+        period: "7d",
+        includeSources: true,
+      });
+      const details = result.details as {
+        status?: string;
+        summaryIds?: string[];
+      };
+      expect(details.status).toBe("ready");
+      expect(details.summaryIds).toHaveLength(25);
     } finally {
       vi.useRealTimers();
     }
