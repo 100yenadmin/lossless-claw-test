@@ -557,7 +557,7 @@ describe("LCM sub-day window retrieval", () => {
       title: "Fallback SQL cap",
     });
 
-    for (let index = 0; index < 1001; index += 1) {
+    for (let index = 0; index < 1005; index += 1) {
       await summaryStore.insertSummary({
         summaryId: `sum_cap_${index}`,
         conversationId: conversation.conversationId,
@@ -601,7 +601,7 @@ describe("LCM sub-day window retrieval", () => {
       truncated?: boolean;
       summaryIds?: string[];
     };
-    expect(details.totalMatches).toBe(1001);
+    expect(details.totalMatches).toBe(1005);
     expect(details.truncated).toBe(true);
     expect(details.summaryIds).toEqual([]);
   });
@@ -1612,6 +1612,35 @@ describe("LCM weekly and monthly rollups", () => {
     });
     expect((invalid.content[0] as { text: string }).text).toContain(
       "periodKind must be one of"
+    );
+
+    for (let index = 0; index < 120; index += 1) {
+      rollupStore.upsertRollup({
+        rollup_id: `debug_extra_${index}`,
+        conversation_id: conversation.conversationId,
+        period_kind: "day",
+        period_key: `debug-${index}`,
+        period_start: "2026-04-27T00:00:00.000Z",
+        period_end: "2026-04-28T00:00:00.000Z",
+        timezone: "UTC",
+        content: `Debug extra ${index}`,
+        token_count: 1,
+        source_summary_ids: "[]",
+        source_message_count: 0,
+        source_token_count: 0,
+        status: "ready",
+        coverage_start: null,
+        coverage_end: null,
+        summarizer_model: "test",
+        source_fingerprint: `debug-extra-${index}`,
+      });
+    }
+    const capped = await tool.execute("debug-capped", {
+      periodKind: "day",
+      limit: 1000,
+    });
+    expect((capped.details as { rollups?: unknown[] }).rollups).toHaveLength(
+      100
     );
   });
 });

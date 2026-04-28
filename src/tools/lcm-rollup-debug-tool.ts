@@ -7,6 +7,8 @@ import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 
+const MAX_DEBUG_ROLLUPS = 100;
+
 const LcmRollupDebugSchema = Type.Object({
   conversationId: Type.Optional(
     Type.Number({
@@ -80,7 +82,7 @@ export function createLcmRollupDebugTool(input: {
       const conversationId = conversationScope.conversationId;
       const limit =
         typeof p.limit === "number" && Number.isFinite(p.limit) && p.limit > 0
-          ? Math.floor(p.limit)
+          ? Math.min(Math.floor(p.limit), MAX_DEBUG_ROLLUPS)
           : 20;
       let periodKind: "day" | "week" | "month" | undefined;
       if (p.periodKind != null) {

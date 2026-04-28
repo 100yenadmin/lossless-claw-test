@@ -2245,13 +2245,15 @@ function wirePluginHandlers(
       sessionKey: ctx.sessionKey,
     })
   );
-  api.registerTool((ctx) =>
-    createLcmRollupDebugTool({
-      deps,
-      getLcm: shared.waitForEngine,
-      sessionKey: ctx.sessionKey,
-    })
-  );
+  if (deps.config.rollupDebugEnabled) {
+    api.registerTool((ctx) =>
+      createLcmRollupDebugTool({
+        deps,
+        getLcm: shared.waitForEngine,
+        sessionKey: ctx.sessionKey,
+      })
+    );
+  }
 
   api.registerCommand(
     createLcmCommand({

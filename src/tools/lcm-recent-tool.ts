@@ -830,7 +830,8 @@ function combineRollups(rollups: RollupRecord[], budget: RecallBudget): {
   if (omittedRollups > 0) {
     content = `(${omittedRollups} earlier rollups omitted to fit budget)\n\n${content}`;
   }
-  if (estimateTokens(content) > budget.effectiveOutputTokens) {
+  const exceededBudget = estimateTokens(content) > budget.effectiveOutputTokens;
+  if (exceededBudget) {
     content = truncateToEstimatedTokens(content, budget.effectiveOutputTokens);
   }
   const tokenCount = estimateTokens(content);
@@ -849,7 +850,7 @@ function combineRollups(rollups: RollupRecord[], budget: RecallBudget): {
     sourceMessageTokens: retained.reduce((sum, rollup) => sum + rollup.sourceTokenCount, 0),
     sourceCount: retained.reduce((sum, rollup) => sum + rollup.sourceSummaryIds.length, 0),
     omittedRollups,
-    truncated: omittedRollups > 0 || tokenCount >= budget.effectiveOutputTokens,
+    truncated: omittedRollups > 0 || exceededBudget,
   };
 }
 
@@ -1037,9 +1038,23 @@ function getRecentSummaryFallback(
     )
     .all(...args) as unknown as RecentSummaryFallbackRow[];
   const sqlTruncated = rows.length > FALLBACK_SQL_LIMIT;
+  const availableCount = sqlTruncated
+    ? (
+        db
+          .prepare(
+            `SELECT COUNT(*) AS count
+             FROM summaries
+             WHERE ${scopeClause}
+               kind = 'leaf'
+               AND julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)
+               AND julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)`
+          )
+          .get(...args) as { count: number } | undefined
+      )?.count ?? rows.length
+    : rows.length;
   return {
     summaries: sqlTruncated ? rows.slice(0, FALLBACK_SQL_LIMIT) : rows,
-    availableCount: rows.length,
+    availableCount,
     sqlTruncated,
   };
 }
