@@ -20,7 +20,7 @@ LCM owns temporal evidence, provenance, and drilldown. Cortex owns curated durab
 
 ## Evidence base
 
-This plan is based on four local audits and prior architecture docs:
+This plan is based on local audits and prior architecture docs. These evidence files are external/private planning artifacts, not repo-tracked references in this PR:
 
 - `docs/audits/R-515-lcm-rollup-pr-stack-gap-report-2026-04-28.md`
 - `docs/audits/R-516-lcm-emotional-temporal-gap-report-2026-04-28.md`
@@ -64,6 +64,7 @@ Scope:
 - Add `lcm_recent` for `today`, `yesterday`, `date:YYYY-MM-DD`, `7d`, `30d`, `week`, and `month`, with honest fallback/coverage reporting.
 - Wire maintenance so daily rollups can actually build after relevant summaries/messages change.
 - Replace empty-query / wildcard all-conversations fallback with a safe bounded path.
+- Enforce baseline scope/privacy rules for all-conversation paths: explicit opt-in, no implicit cross-conversation aggregation, hard result caps, and output metadata when results are truncated.
 
 Acceptance tests:
 
@@ -73,6 +74,7 @@ Acceptance tests:
 - New summaries mark relevant daily rollups stale or pending rebuild.
 - `lcm_recent(today|yesterday|date:...)` returns rollup data when present and an explicit fallback when absent.
 - All-conversations mode is bounded, explicit, and does not use empty full-text wildcard search.
+- Bounded fallback uses concrete caps, such as at most 20 returned leaf summaries per request, deterministic ordering, and truncation/fallback status in output.
 
 ### PR 2: deterministic local-time windows and sub-day grammar
 
@@ -81,9 +83,11 @@ Purpose: make exact operational windows possible without manual UTC conversion.
 Scope:
 
 - Add timezone-aware range resolver for named periods and explicit intervals.
+- Use deterministic timezone precedence: explicit tool timezone when supported, then effective LCM/runtime timezone, then configured/system fallback.
 - Support examples such as `yesterday 4-8pm`, `yesterday between 16:00 and 20:00`, `last 90m`, `morning`, `afternoon`, `evening`, and date-bounded ranges.
 - Distinguish rollup retrieval from bounded evidence search: sub-day queries should drill into bounded summaries/messages rather than pretending a whole-day rollup is precise enough.
 - Return UTC window, local window, timezone, coverage, and fallback reason.
+- Treat intervals as `[start, end)`. Reject impossible calendar dates and nonexistent local wall-clock times instead of silently normalizing them.
 
 Acceptance tests:
 
