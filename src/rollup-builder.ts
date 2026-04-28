@@ -103,15 +103,14 @@ export class RollupBuilder {
     const scannedAt = new Date();
 
     for (let offset = 0; offset < daysBack; offset += 1) {
-      const candidateDate = shiftLocalDate(now, this.config.timezone, -offset);
-      const dateKey = getLocalDateKey(candidateDate, this.config.timezone);
+      const dateKey = shiftDateKey(todayKey, -offset);
       if (!forceCurrentDay && dateKey === todayKey) {
         result.skipped += 1;
         continue;
       }
 
-      const { start, end } = getLocalDayBounds(
-        candidateDate,
+      const { start, end } = getLocalDayBoundsForDateKey(
+        dateKey,
         this.config.timezone
       );
       let summaries: SummaryRecord[];
@@ -177,10 +176,14 @@ export class RollupBuilder {
       }
     }
 
+    const latestState = this.store.getState(conversationId);
+    const shouldClearPending =
+      result.errors.length === 0 &&
+      isTimestampAtOrBefore(latestState?.last_message_at, scannedAt);
     this.store.upsertState(conversationId, {
       timezone: this.config.timezone,
       last_rollup_check_at: scannedAt.toISOString(),
-      pending_rebuild: result.errors.length === 0 ? 0 : 1,
+      pending_rebuild: result.errors.length === 0 && shouldClearPending ? 0 : 1,
     });
 
     return result;
@@ -190,8 +193,10 @@ export class RollupBuilder {
     conversationId: number,
     dateKey: string
   ): Promise<boolean> {
-    const localDate = parseDateKey(dateKey);
-    const { start, end } = getLocalDayBounds(localDate, this.config.timezone);
+    const { start, end } = getLocalDayBoundsForDateKey(
+      dateKey,
+      this.config.timezone
+    );
     const summaries = this.getLeafSummariesForDay(conversationId, start, end)
       .filter((summary) => summary.kind === "leaf")
       .sort(compareSummariesChronologically);
@@ -366,6 +371,14 @@ export function getLocalDayBounds(
   timezone: string
 ): { start: Date; end: Date } {
   const dateKey = getLocalDateKey(date, timezone);
+  return getLocalDayBoundsForDateKey(dateKey, timezone);
+}
+
+function getLocalDayBoundsForDateKey(
+  dateKey: string,
+  timezone: string
+): { start: Date; end: Date } {
+  parseDateKey(dateKey);
   const start = localDateTimeToUtc(dateKey, "00:00:00", timezone);
   const end = localDateTimeToUtc(
     shiftDateKey(dateKey, 1),
@@ -373,6 +386,17 @@ export function getLocalDayBounds(
     timezone
   );
   return { start, end };
+}
+
+function isTimestampAtOrBefore(
+  value: string | null | undefined,
+  boundary: Date
+): boolean {
+  if (!value) {
+    return true;
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) || parsed <= boundary;
 }
 
 function buildRollupId(periodKind: string, periodKey: string): string {
@@ -720,11 +744,6 @@ function parseDateKey(dateKey: string): Date {
     throw new Error(`Invalid date key: ${dateKey}`);
   }
   return candidate;
-}
-
-function shiftLocalDate(date: Date, timezone: string, dayDelta: number): Date {
-  const dateKey = getLocalDateKey(date, timezone);
-  return parseDateKey(shiftDateKey(dateKey, dayDelta));
 }
 
 function shiftDateKey(dateKey: string, dayDelta: number): string {

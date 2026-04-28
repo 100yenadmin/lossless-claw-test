@@ -166,6 +166,41 @@ describe("LCM temporal rollup MVP", () => {
     ]);
   });
 
+  it("uses the requested local date key for UTC+13 daily rollups", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "rollup-utc-plus",
+      sessionKey: "agent:main:rollup-utc-plus",
+      title: "Rollup UTC plus",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_utc_plus",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Completed the UTC+13 daily boundary fix.",
+      tokenCount: 10,
+      earliestAt: new Date("2026-04-26T12:30:00.000Z"),
+      latestAt: new Date("2026-04-26T13:00:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, {
+      timezone: "Pacific/Auckland",
+    });
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    expect(
+      rollupStore.getRollup(
+        conversation.conversationId,
+        "day",
+        "2026-04-27",
+        "Pacific/Auckland"
+      )?.content
+    ).toContain("UTC+13 daily boundary fix");
+  });
+
   it("rejects impossible date keys", async () => {
     const { conversationStore, rollupStore } = createStores();
     const conversation = await conversationStore.createConversation({
