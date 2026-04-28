@@ -132,6 +132,43 @@ describe("LCM temporal rollup MVP", () => {
         .map((source) => source.source_id)
     ).toEqual(["sum_rollup_a", "sum_rollup_b"]);
   });
+
+  it("deletes an existing daily rollup when a direct rebuild finds no sources", async () => {
+    const { db, conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "empty-direct-day",
+      sessionKey: "agent:main:empty-direct-day",
+      title: "Empty direct day",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_empty_direct",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Temporary direct day rollup content.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+      latestAt: new Date("2026-04-27T10:30:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "day", "2026-04-27")
+    ).toBeTruthy();
+
+    db.prepare("DELETE FROM summaries WHERE summary_id = ?").run("sum_empty_direct");
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "day", "2026-04-27")
+    ).toBeNull();
+  });
 });
 
 import {
@@ -677,15 +714,36 @@ describe("LCM weekly and monthly rollups", () => {
         title: "Pending week",
       });
 
-      await summaryStore.insertSummary({
-        summaryId: "sum_week_old",
-        conversationId: conversation.conversationId,
-        kind: "leaf",
-        depth: 0,
-        content: "Original weekly aggregate content.",
-        tokenCount: 10,
-        latestAt: new Date("2026-04-27T10:00:00.000Z"),
-      });
+      const weekDays = [
+        "2026-04-27",
+        "2026-04-28",
+        "2026-04-29",
+        "2026-04-30",
+        "2026-05-01",
+        "2026-05-02",
+        "2026-05-03",
+      ];
+      for (const day of weekDays) {
+        await summaryStore.insertSummary({
+          summaryId: `sum_week_old_${day}`,
+          conversationId: conversation.conversationId,
+          kind: "leaf",
+          depth: 0,
+          content: `Original weekly aggregate content for ${day}.`,
+          tokenCount: 10,
+          latestAt: new Date(`${day}T10:00:00.000Z`),
+        });
+      }
+
+      const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+      for (const day of weekDays) {
+        await expect(
+          builder.buildDayRollup(conversation.conversationId, day)
+        ).resolves.toBe(true);
+      }
+      await expect(
+        builder.buildWeeklyRollup(conversation.conversationId, "2026-04-27")
+      ).resolves.toBe(true);
       await summaryStore.insertSummary({
         summaryId: "sum_week_new",
         conversationId: conversation.conversationId,
@@ -696,14 +754,12 @@ describe("LCM weekly and monthly rollups", () => {
         latestAt: now,
       });
 
-      const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
-      await builder.buildDayRollup(conversation.conversationId, "2026-04-27");
-      await builder.buildWeeklyRollup(conversation.conversationId, "2026-04-27");
-      db.prepare(
+      const update = db.prepare(
         `UPDATE lcm_rollups
          SET content = ?
          WHERE conversation_id = ? AND period_kind = 'week' AND period_key = ?`
       ).run("STALE WEEK ROLLUP SHOULD NOT BE USED", conversation.conversationId, "2026-04-27");
+      expect(update.changes).toBe(1);
       rollupStore.upsertState(conversation.conversationId, {
         timezone: "UTC",
         pending_rebuild: 1,
@@ -743,6 +799,64 @@ describe("LCM weekly and monthly rollups", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("removes orphaned aggregate rollups when source days disappear", async () => {
+    const { db, conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "orphaned-week",
+      sessionKey: "agent:main:orphaned-week",
+      title: "Orphaned week",
+    });
+    const weekDays = [
+      "2026-04-27",
+      "2026-04-28",
+      "2026-04-29",
+      "2026-04-30",
+      "2026-05-01",
+      "2026-05-02",
+      "2026-05-03",
+    ];
+    for (const day of weekDays) {
+      await summaryStore.insertSummary({
+        summaryId: `sum_orphan_${day}`,
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: `Temporary week coverage for ${day}.`,
+        tokenCount: 10,
+        sourceMessageTokenCount: 10,
+        latestAt: new Date(`${day}T10:00:00.000Z`),
+      });
+    }
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    for (const day of weekDays) {
+      await expect(
+        builder.buildDayRollup(conversation.conversationId, day)
+      ).resolves.toBe(true);
+    }
+    await expect(
+      builder.buildWeeklyRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "week", "2026-04-27")
+    ).not.toBeNull();
+
+    db.prepare("DELETE FROM summaries WHERE summary_id LIKE 'sum_orphan_%'").run();
+    for (const day of weekDays) {
+      await expect(
+        builder.buildDayRollup(conversation.conversationId, day)
+      ).resolves.toBe(true);
+    }
+    const result = await builder.buildWeeklyMonthlyRollups(
+      conversation.conversationId
+    );
+
+    expect(result.built).toBeGreaterThan(0);
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "week", "2026-04-27")
+    ).toBeNull();
   });
 
   it("removes stale rollups when a day becomes empty", async () => {

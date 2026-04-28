@@ -153,6 +153,15 @@ export class RollupBuilder {
       400
     );
     const keys = new Set<string>();
+    for (const rollup of this.store.listRollups(
+      conversationId,
+      periodKind,
+      400
+    )) {
+      if (rollup.timezone === this.config.timezone) {
+        keys.add(rollup.period_key);
+      }
+    }
     for (const rollup of dayRollups) {
       if (rollup.status !== "ready" && rollup.status !== "stale") {
         continue;
@@ -436,6 +445,16 @@ export class RollupBuilder {
       .sort(compareSummariesChronologically);
 
     if (summaries.length === 0) {
+      const existing = this.store.getRollup(
+        conversationId,
+        DAY_PERIOD_KIND,
+        dateKey,
+        this.config.timezone
+      );
+      if (existing) {
+        this.store.deleteRollup(existing.rollup_id);
+        return true;
+      }
       return false;
     }
 
