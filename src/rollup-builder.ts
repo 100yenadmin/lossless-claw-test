@@ -61,16 +61,15 @@ type RollupDraft = {
 };
 
 export class RollupBuilder {
-  private readonly dailyTargetTokens: number;
   private readonly dailyMaxTokens: number;
 
   constructor(private store: RollupStore, private config: RollupBuilderConfig) {
-    this.dailyTargetTokens = normalizePositiveInt(
+    const dailyTargetTokens = normalizePositiveInt(
       config.dailyTargetTokens,
       DEFAULT_DAILY_TARGET_TOKENS
     );
     this.dailyMaxTokens = Math.max(
-      this.dailyTargetTokens,
+      dailyTargetTokens,
       normalizePositiveInt(config.dailyMaxTokens, DEFAULT_DAILY_MAX_TOKENS)
     );
   }
@@ -119,6 +118,7 @@ export class RollupBuilder {
       last_weekly_build_at: builtAt,
       last_monthly_build_at: builtAt,
       last_rollup_check_at: builtAt,
+      ...(result.errors.length > 0 ? { pending_rebuild: 1 } : {}),
     });
 
     return result;
@@ -306,15 +306,14 @@ export class RollupBuilder {
     const scannedAt = new Date();
 
     for (let offset = 0; offset < daysBack; offset += 1) {
-      const candidateDate = shiftLocalDate(now, this.config.timezone, -offset);
-      const dateKey = getLocalDateKey(candidateDate, this.config.timezone);
+      const dateKey = shiftDateKey(todayKey, -offset);
       if (!forceCurrentDay && dateKey === todayKey) {
         result.skipped += 1;
         continue;
       }
 
-      const { start, end } = getLocalDayBounds(
-        candidateDate,
+      const { start, end } = getLocalDayBoundsForDateKey(
+        dateKey,
         this.config.timezone
       );
       let summaries: SummaryRecord[];
@@ -392,8 +391,10 @@ export class RollupBuilder {
     conversationId: number,
     dateKey: string
   ): Promise<boolean> {
-    const localDate = parseDateKey(dateKey);
-    const { start, end } = getLocalDayBounds(localDate, this.config.timezone);
+    const { start, end } = getLocalDayBoundsForDateKey(
+      dateKey,
+      this.config.timezone
+    );
     const summaries = this.getLeafSummariesForDay(conversationId, start, end)
       .filter((summary) => summary.kind === "leaf")
       .sort(compareSummariesChronologically);
@@ -407,7 +408,7 @@ export class RollupBuilder {
       0
     );
     const sourceMessageCount = summaries.reduce(
-      (sum, summary) => sum + safeTokenCount(summary.sourceMessageCount),
+      (sum, summary) => sum + Math.max(1, summary.sourceMessageCount),
       0
     );
     const fingerprint = computeFingerprint(
@@ -428,55 +429,20 @@ export class RollupBuilder {
       timezone: this.config.timezone,
       maxTokens: this.dailyMaxTokens,
     });
-    const existing = this.store.getRollup(
-      conversationId,
-      DAY_PERIOD_KIND,
-      dateKey
-    );
-    const rollupId =
-      existing?.rollup_id ?? buildRollupId(DAY_PERIOD_KIND, dateKey);
     const builtAt = new Date();
+    const coverage = getCoverageBounds(summaries);
 
     await withDatabaseTransaction(
       this.store.db,
       "BEGIN IMMEDIATE",
       async () => {
-        this.store.upsertRollup({
-          rollup_id: rollupId,
-          conversation_id: conversationId,
-          period_kind: DAY_PERIOD_KIND,
-          period_key: dateKey,
-          period_start: start.toISOString(),
-          period_end: end.toISOString(),
-          timezone: this.config.timezone,
-          content: draft.content,
-          token_count: draft.summaryTokenCount,
-          source_summary_ids: JSON.stringify(
-            summaries.map((summary) => summary.summaryId)
-          ),
-          source_message_count: sourceMessageCount,
-          source_token_count: totalSourceTokens,
-          status: "building",
-          coverage_start:
-            summaries[0]?.earliestAt?.toISOString() ??
-            summaries[0]?.createdAt.toISOString() ??
-            null,
-          coverage_end:
-            summaries[summaries.length - 1]?.latestAt?.toISOString() ??
-            summaries[summaries.length - 1]?.createdAt.toISOString() ??
-            null,
-          summarizer_model: "concatenation-v1",
-          source_fingerprint: fingerprint,
-        });
-
-        await this.store.replaceRollupSources(
-          rollupId,
-          summaries.map((summary, index) => ({
-            type: "summary",
-            id: summary.summaryId,
-            ordinal: index,
-          }))
+        const existing = this.store.getRollup(
+          conversationId,
+          DAY_PERIOD_KIND,
+          dateKey
         );
+        const rollupId =
+          existing?.rollup_id ?? buildRollupId(DAY_PERIOD_KIND, dateKey);
 
         this.store.upsertRollup({
           rollup_id: rollupId,
@@ -494,17 +460,20 @@ export class RollupBuilder {
           source_message_count: sourceMessageCount,
           source_token_count: totalSourceTokens,
           status: "ready",
-          coverage_start:
-            summaries[0]?.earliestAt?.toISOString() ??
-            summaries[0]?.createdAt.toISOString() ??
-            null,
-          coverage_end:
-            summaries[summaries.length - 1]?.latestAt?.toISOString() ??
-            summaries[summaries.length - 1]?.createdAt.toISOString() ??
-            null,
+          coverage_start: coverage.start?.toISOString() ?? null,
+          coverage_end: coverage.end?.toISOString() ?? null,
           summarizer_model: "concatenation-v1",
           source_fingerprint: fingerprint,
         });
+
+        await this.store.replaceRollupSources(
+          rollupId,
+          summaries.map((summary, index) => ({
+            type: "summary",
+            id: summary.summaryId,
+            ordinal: index,
+          }))
+        );
 
         this.store.upsertState(conversationId, {
           timezone: this.config.timezone,
@@ -601,6 +570,14 @@ export function getLocalDayBounds(
   timezone: string
 ): { start: Date; end: Date } {
   const dateKey = getLocalDateKey(date, timezone);
+  return getLocalDayBoundsForDateKey(dateKey, timezone);
+}
+
+function getLocalDayBoundsForDateKey(
+  dateKey: string,
+  timezone: string
+): { start: Date; end: Date } {
+  assertValidDateKey(dateKey);
   const start = localDateTimeToUtc(dateKey, "00:00:00", timezone);
   const end = localDateTimeToUtc(
     shiftDateKey(dateKey, 1),
@@ -686,12 +663,13 @@ function buildDailyRollupContent(params: {
   const stats = buildStatistics(params.summaries, params.timezone);
 
   let timelineEntries = [...entries];
+  let retainedKeyItems = keyItems;
   let omittedEntries = 0;
   let content = renderDailyRollup({
     dateKey: params.dateKey,
     entries: timelineEntries,
     omittedEntries,
-    keyItems,
+    keyItems: retainedKeyItems,
     stats,
   });
 
@@ -705,7 +683,7 @@ function buildDailyRollupContent(params: {
       dateKey: params.dateKey,
       entries: timelineEntries,
       omittedEntries,
-      keyItems,
+      keyItems: retainedKeyItems,
       stats,
     });
   }
@@ -714,18 +692,19 @@ function buildDailyRollupContent(params: {
     timelineEntries.length === 0 &&
     estimateTokens(content) > params.maxTokens
   ) {
-    const fallback = renderDailyRollup({
-      dateKey: params.dateKey,
-      entries: [],
-      omittedEntries: entries.length,
-      keyItems,
-      stats,
-    });
-    return {
-      content: fallback,
-      summaryTokenCount: estimateTokens(fallback),
-      omittedEntries: entries.length,
-    };
+    while (
+      countKeyItems(retainedKeyItems) > 0 &&
+      estimateTokens(content) > params.maxTokens
+    ) {
+      retainedKeyItems = trimLargestKeyItemBucket(retainedKeyItems);
+      content = renderDailyRollup({
+        dateKey: params.dateKey,
+        entries: [],
+        omittedEntries: entries.length,
+        keyItems: retainedKeyItems,
+        stats,
+      });
+    }
   }
 
   return {
@@ -825,6 +804,29 @@ function extractKeyItems(summaries: SummaryRecord[]): {
   return buckets;
 }
 
+type KeyItems = {
+  decisions: string[];
+  completed: string[];
+  blockers: string[];
+};
+
+function countKeyItems(items: KeyItems): number {
+  return items.decisions.length + items.completed.length + items.blockers.length;
+}
+
+function trimLargestKeyItemBucket(items: KeyItems): KeyItems {
+  const next: KeyItems = {
+    decisions: [...items.decisions],
+    completed: [...items.completed],
+    blockers: [...items.blockers],
+  };
+  const largestBucket = (Object.keys(next) as Array<keyof KeyItems>).sort(
+    (left, right) => next[right].length - next[left].length
+  )[0];
+  next[largestBucket] = next[largestBucket].slice(1);
+  return next;
+}
+
 function collectMatchingLines(
   summaries: SummaryRecord[],
   pattern: RegExp
@@ -893,6 +895,23 @@ function compareSummariesChronologically(
   return left.summaryId.localeCompare(right.summaryId);
 }
 
+function getCoverageBounds(
+  summaries: SummaryRecord[]
+): { start: Date | null; end: Date | null } {
+  const starts = summaries
+    .map((summary) => summary.earliestAt ?? summary.createdAt)
+    .filter((value): value is Date => value instanceof Date)
+    .sort((left, right) => left.getTime() - right.getTime());
+  const ends = summaries
+    .map((summary) => summary.latestAt ?? summary.createdAt)
+    .filter((value): value is Date => value instanceof Date)
+    .sort((left, right) => left.getTime() - right.getTime());
+  return {
+    start: starts[0] ?? null,
+    end: ends[ends.length - 1] ?? null,
+  };
+}
+
 function formatTime(date: Date, timezone: string): string {
   return new Intl.DateTimeFormat("en-GB", {
     timeZone: timezone,
@@ -958,20 +977,14 @@ function uniqueStrings(values: string[]): string[] {
 }
 
 function startOfWeekKey(dayKey: string, timezone: string): string {
-  const weekday = new Intl.DateTimeFormat("en-US", {
-    timeZone: timezone,
-    weekday: "short",
-  }).format(parseDateKey(dayKey));
-  const order = {
-    Mon: 0,
-    Tue: 1,
-    Wed: 2,
-    Thu: 3,
-    Fri: 4,
-    Sat: 5,
-    Sun: 6,
-  } as const;
-  const mondayOffset = -order[weekday as keyof typeof order];
+  void timezone;
+  assertValidDateKey(dayKey);
+  const [year, month, day] = dayKey
+    .split("-")
+    .map((part) => Number.parseInt(part, 10));
+  const date = new Date(Date.UTC(year, month - 1, day, 0, 0, 0, 0));
+  const weekday = date.getUTCDay();
+  const mondayOffset = weekday === 0 ? -6 : 1 - weekday;
   return shiftDateKey(dayKey, mondayOffset);
 }
 
@@ -979,6 +992,7 @@ function getWeekBounds(
   weekKey: string,
   timezone: string
 ): { start: Date; end: Date } {
+  assertValidDateKey(weekKey);
   return {
     start: localDateTimeToUtc(weekKey, "00:00:00", timezone),
     end: localDateTimeToUtc(shiftDateKey(weekKey, 7), "00:00:00", timezone),
@@ -995,6 +1009,9 @@ function getMonthBounds(
   const [year, month] = monthKey
     .split("-")
     .map((part) => Number.parseInt(part, 10));
+  if (!Number.isFinite(year) || month < 1 || month > 12) {
+    throw new Error(`Invalid month key: ${monthKey}`);
+  }
   const nextMonth =
     month === 12
       ? `${year + 1}-01`
@@ -1005,22 +1022,49 @@ function getMonthBounds(
   };
 }
 
-function parseDateKey(dateKey: string): Date {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
-    throw new Error(`Invalid date key: ${dateKey}`);
-  }
-  return new Date(`${dateKey}T12:00:00.000Z`);
-}
-
-function shiftLocalDate(date: Date, timezone: string, dayDelta: number): Date {
-  const dateKey = getLocalDateKey(date, timezone);
-  return parseDateKey(shiftDateKey(dateKey, dayDelta));
-}
-
 function shiftDateKey(dateKey: string, dayDelta: number): string {
+  assertValidDateKey(dateKey);
   const utcDate = new Date(`${dateKey}T00:00:00.000Z`);
   utcDate.setUTCDate(utcDate.getUTCDate() + dayDelta);
   return utcDate.toISOString().slice(0, 10);
+}
+
+function assertValidDateKey(dateKey: string): void {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
+    throw new Error(`Invalid date key: ${dateKey}`);
+  }
+  const probe = new Date(`${dateKey}T12:00:00.000Z`);
+  if (
+    Number.isNaN(probe.getTime()) ||
+    probe.toISOString().slice(0, 10) !== dateKey
+  ) {
+    throw new Error(`Invalid date key: ${dateKey}`);
+  }
+}
+
+function parseTimeParts(time: string): {
+  hour: number;
+  minute: number;
+  second: number;
+} {
+  const match = /^(\d{2}):(\d{2}):(\d{2})$/.exec(time);
+  if (!match) {
+    throw new Error(`Invalid time: ${time}`);
+  }
+  const hour = Number.parseInt(match[1]!, 10);
+  const minute = Number.parseInt(match[2]!, 10);
+  const second = Number.parseInt(match[3]!, 10);
+  if (
+    hour < 0 ||
+    hour > 23 ||
+    minute < 0 ||
+    minute > 59 ||
+    second < 0 ||
+    second > 59
+  ) {
+    throw new Error(`Invalid time: ${time}`);
+  }
+  return { hour, minute, second };
 }
 
 function localDateTimeToUtc(
@@ -1028,12 +1072,11 @@ function localDateTimeToUtc(
   time: string,
   timezone: string
 ): Date {
+  assertValidDateKey(dateKey);
   const [year, month, day] = dateKey
     .split("-")
     .map((part) => Number.parseInt(part, 10));
-  const [hour, minute, second] = time
-    .split(":")
-    .map((part) => Number.parseInt(part, 10));
+  const { hour, minute, second } = parseTimeParts(time);
   let candidate = new Date(
     Date.UTC(year, month - 1, day, hour, minute, second, 0)
   );
@@ -1057,7 +1100,9 @@ function localDateTimeToUtc(
     candidate = new Date(candidate.getTime() + deltaMs);
   }
 
-  return candidate;
+  throw new Error(
+    `Nonexistent local time ${dateKey} ${time} in timezone ${timezone}`
+  );
 }
 
 function getZonedDateTimeParts(
@@ -1083,14 +1128,45 @@ function getZonedDateTimeParts(
   });
   const parts = formatter.formatToParts(date);
   const lookup = new Map(parts.map((part) => [part.type, part.value]));
-  const rawHour = Number.parseInt(lookup.get("hour") ?? "0", 10);
-  return {
+  return normalizeZonedParts({
     year: Number.parseInt(lookup.get("year") ?? "0", 10),
     month: Number.parseInt(lookup.get("month") ?? "1", 10),
     day: Number.parseInt(lookup.get("day") ?? "1", 10),
-    hour: rawHour === 24 ? 0 : rawHour,
+    hour: Number.parseInt(lookup.get("hour") ?? "0", 10),
     minute: Number.parseInt(lookup.get("minute") ?? "0", 10),
     second: Number.parseInt(lookup.get("second") ?? "0", 10),
+  });
+}
+
+function normalizeZonedParts(parts: {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+}): {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+} {
+  if (parts.hour !== 24) {
+    return parts;
+  }
+  const rolled = new Date(
+    Date.UTC(parts.year, parts.month - 1, parts.day, 0, parts.minute, parts.second)
+  );
+  rolled.setUTCDate(rolled.getUTCDate() + 1);
+  return {
+    year: rolled.getUTCFullYear(),
+    month: rolled.getUTCMonth() + 1,
+    day: rolled.getUTCDate(),
+    hour: 0,
+    minute: rolled.getUTCMinutes(),
+    second: rolled.getUTCSeconds(),
   };
 }
 

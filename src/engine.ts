@@ -4641,6 +4641,57 @@ export class LcmContextEngine implements ContextEngine {
 
         let deferredCompactionResult: ContextEngineMaintenanceResult | null =
           null;
+        const finish = async (
+          result: ContextEngineMaintenanceResult
+        ): Promise<ContextEngineMaintenanceResult> => {
+          try {
+            const rollupState = this.rollupStore.getState(
+              conversation.conversationId
+            );
+            if (
+              !rollupState ||
+              rollupState.pending_rebuild === 1 ||
+              result.changed
+            ) {
+              const rollupResult = await this.rollupBuilder.buildDailyRollups(
+                conversation.conversationId,
+                { daysBack: 7, forceCurrentDay: true }
+              );
+              const aggregateResult =
+                await this.rollupBuilder.buildWeeklyMonthlyRollups(
+                  conversation.conversationId
+                );
+              const errorCount =
+                rollupResult.errors.length + aggregateResult.errors.length;
+              if (errorCount > 0) {
+                this.rollupStore.upsertState(conversation.conversationId, {
+                  timezone: this.config.timezone,
+                  pending_rebuild: 1,
+                });
+              }
+              this.deps.log.info(
+                `[lcm] maintain: rollups conversation=${
+                  conversation.conversationId
+                } ${sessionLabel} dailyBuilt=${
+                  rollupResult.built
+                } dailySkipped=${rollupResult.skipped} aggregateBuilt=${
+                  aggregateResult.built
+                } aggregateSkipped=${aggregateResult.skipped} errors=${errorCount}`
+              );
+            }
+          } catch (error) {
+            this.deps.log.warn(
+              `[lcm] maintain: rollup build failed conversation=${
+                conversation.conversationId
+              } ${sessionLabel}: ${describeLogError(error)}`
+            );
+            this.rollupStore.upsertState(conversation.conversationId, {
+              timezone: this.config.timezone,
+              pending_rebuild: 1,
+            });
+          }
+          return result;
+        };
         const maintenance =
           await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
             conversation.conversationId
@@ -4699,7 +4750,7 @@ export class LcmContextEngine implements ContextEngine {
         }
 
         if (!this.config.transcriptGcEnabled) {
-          return (
+          return finish(
             deferredCompactionResult ?? {
               changed: false,
               bytesFreed: 0,
@@ -4712,7 +4763,7 @@ export class LcmContextEngine implements ContextEngine {
         if (
           typeof params.runtimeContext?.rewriteTranscriptEntries !== "function"
         ) {
-          return (
+          return finish(
             deferredCompactionResult ?? {
               changed: false,
               bytesFreed: 0,
@@ -4736,7 +4787,7 @@ export class LcmContextEngine implements ContextEngine {
               Date.now() - startedAt
             )}`
           );
-          return (
+          return finish(
             deferredCompactionResult ?? {
               changed: false,
               bytesFreed: 0,
@@ -4778,7 +4829,7 @@ export class LcmContextEngine implements ContextEngine {
               candidates.length
             } duration=${formatDurationMs(Date.now() - startedAt)}`
           );
-          return (
+          return finish(
             deferredCompactionResult ?? {
               changed: false,
               bytesFreed: 0,
@@ -4816,43 +4867,6 @@ export class LcmContextEngine implements ContextEngine {
             }
           : result;
 
-        try {
-          const rollupState = this.rollupStore.getState(
-            conversation.conversationId
-          );
-          if (
-            !rollupState ||
-            rollupState.pending_rebuild === 1 ||
-            combinedResult.changed
-          ) {
-            const rollupResult = await this.rollupBuilder.buildDailyRollups(
-              conversation.conversationId,
-              { daysBack: 7, forceCurrentDay: true }
-            );
-            const aggregateResult =
-              await this.rollupBuilder.buildWeeklyMonthlyRollups(
-                conversation.conversationId
-              );
-            this.deps.log.info(
-              `[lcm] maintain: rollups conversation=${
-                conversation.conversationId
-              } ${sessionLabel} dailyBuilt=${rollupResult.built} dailySkipped=${
-                rollupResult.skipped
-              } aggregateBuilt=${aggregateResult.built} aggregateSkipped=${
-                aggregateResult.skipped
-              } errors=${
-                rollupResult.errors.length + aggregateResult.errors.length
-              }`
-            );
-          }
-        } catch (error) {
-          this.deps.log.warn(
-            `[lcm] maintain: rollup build failed conversation=${
-              conversation.conversationId
-            } ${sessionLabel}: ${describeLogError(error)}`
-          );
-        }
-
         this.deps.log.info(
           `[lcm] maintain: done conversation=${
             conversation.conversationId
@@ -4864,7 +4878,7 @@ export class LcmContextEngine implements ContextEngine {
             Date.now() - startedAt
           )}`
         );
-        return combinedResult;
+        return finish(combinedResult);
       },
       { operationName: "maintain", context: sessionLabel }
     );

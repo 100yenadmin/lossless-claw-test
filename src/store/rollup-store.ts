@@ -49,6 +49,8 @@ export interface RollupSourceInput {
   ordinal: number;
 }
 
+const ROLLUP_STATUSES = new Set(["building", "ready", "stale", "failed"]);
+
 export interface LeafSummaryForDayRow {
   summary_id: string;
   content: string;
@@ -67,6 +69,9 @@ export class RollupStore {
     input: Omit<RollupRow, "built_at" | "invalidated_at" | "error_text">
   ): void {
     const rollupId = input.rollup_id || randomUUID();
+    if (!ROLLUP_STATUSES.has(input.status)) {
+      throw new Error(`Invalid rollup status: ${input.status}`);
+    }
 
     this.db
       .prepare(
@@ -451,14 +456,7 @@ export class RollupStore {
     conversationId: number,
     dayStart: string,
     dayEnd: string
-  ): Array<{
-    summary_id: string;
-    content: string;
-    token_count: number;
-    earliest_at: string | null;
-    latest_at: string | null;
-    created_at: string;
-  }> {
+  ): LeafSummaryForDayRow[] {
     return this.db
       .prepare(
         `SELECT
@@ -469,7 +467,17 @@ export class RollupStore {
           latest_at,
           created_at,
           created_at AS updated_at,
-          source_message_token_count AS source_message_count
+          COALESCE(
+            NULLIF(
+              (
+                SELECT COUNT(*)
+                FROM summary_messages sm
+                WHERE sm.summary_id = summaries.summary_id
+              ),
+              0
+            ),
+            1
+          ) AS source_message_count
          FROM summaries
          WHERE conversation_id = ?
            AND kind = 'leaf'

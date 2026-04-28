@@ -1,8 +1,7 @@
 import { Type } from "@sinclair/typebox";
-import type { DatabaseSync } from "node:sqlite";
 import { formatTimestamp } from "../compaction.js";
 import type { LcmContextEngine } from "../engine.js";
-import { RollupStore } from "../store/rollup-store.js";
+import type { RollupStore } from "../store/rollup-store.js";
 import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
@@ -30,16 +29,12 @@ const LcmRollupDebugSchema = Type.Object({
   ),
 });
 
-function getLcmDatabase(lcm: LcmContextEngine): DatabaseSync {
+function getLcmRollupStore(lcm: LcmContextEngine): RollupStore {
   const store = lcm.getRollupStore?.();
   if (store?.db) {
-    return store.db;
+    return store;
   }
-  const candidate = lcm as unknown as { db?: DatabaseSync };
-  if (!candidate.db) {
-    throw new Error("LCM rollup database is unavailable.");
-  }
-  return candidate.db;
+  throw new Error("LCM rollup database is unavailable.");
 }
 
 function formatValue(value: string | null, timezone: string): string {
@@ -81,17 +76,25 @@ export function createLcmRollupDebugTool(input: {
         });
       }
 
-      const db = getLcmDatabase(lcm);
-      const store = new RollupStore(db);
+      const store = getLcmRollupStore(lcm);
       const conversationId = conversationScope.conversationId;
       const limit =
         typeof p.limit === "number" && Number.isFinite(p.limit) && p.limit > 0
           ? Math.floor(p.limit)
           : 20;
-      const periodKind =
-        p.periodKind === "day" || p.periodKind === "week" || p.periodKind === "month"
-          ? p.periodKind
-          : undefined;
+      let periodKind: "day" | "week" | "month" | undefined;
+      if (p.periodKind != null) {
+        if (
+          p.periodKind !== "day" &&
+          p.periodKind !== "week" &&
+          p.periodKind !== "month"
+        ) {
+          return jsonResult({
+            error: 'periodKind must be one of "day", "week", or "month".',
+          });
+        }
+        periodKind = p.periodKind;
+      }
       const includeSources = p.includeSources === true;
       const state = store.getState(conversationId);
       const rollups = store.listRollups(conversationId, periodKind, limit);
@@ -136,8 +139,6 @@ export function createLcmRollupDebugTool(input: {
         );
         if (includeSources) {
           lines.push(`  - source summaries: ${rollup.source_summary_ids || "[]"}`);
-        }
-        if (includeSources) {
           const sources = store.getRollupSources(rollup.rollup_id);
           lines.push(
             `  - provenance: ${
@@ -151,7 +152,16 @@ export function createLcmRollupDebugTool(input: {
 
       return {
         content: [{ type: "text", text: lines.join("\n") }],
-        details: { conversationId, state, rollups },
+        details: {
+          conversationId,
+          state,
+          rollups: includeSources
+            ? rollups
+            : rollups.map(({ source_summary_ids, ...rollup }) => ({
+                ...rollup,
+                source_summary_ids: "omitted",
+              })),
+        },
       };
     },
   };

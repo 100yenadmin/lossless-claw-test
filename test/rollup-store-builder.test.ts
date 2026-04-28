@@ -52,6 +52,20 @@ describe("LCM temporal rollup MVP", () => {
         )
         .get()
     ).toBeTruthy();
+    expect(
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'view' AND name = 'weekly_rollups'"
+        )
+        .get()
+    ).toBeTruthy();
+    expect(
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'view' AND name = 'monthly_rollups'"
+        )
+        .get()
+    ).toBeTruthy();
   });
 
   it("builds a stable daily rollup and preserves rollup_id across rebuilds", async () => {
@@ -110,7 +124,7 @@ describe("LCM temporal rollup MVP", () => {
       "2026-04-27"
     );
     expect(second?.rollup_id).toBe(first?.rollup_id);
-    expect(second?.source_message_count).toBe(22);
+    expect(second?.source_message_count).toBe(2);
     expect(
       rollupStore
         .getRollupSources(second!.rollup_id)
@@ -123,6 +137,7 @@ import {
   createLcmRecentTool,
   __lcmRecentTestInternals,
 } from "../src/tools/lcm-recent-tool.js";
+import { createLcmRollupDebugTool } from "../src/tools/lcm-rollup-debug-tool.js";
 import type { LcmDependencies } from "../src/types.js";
 
 function makeRecentDeps(): LcmDependencies {
@@ -203,6 +218,20 @@ describe("LCM sub-day window retrieval", () => {
     );
     expect(meridiemWindow.window?.startMinutes).toBe(16 * 60);
     expect(meridiemWindow.window?.endMinutes).toBe(20 * 60);
+
+    expect(() =>
+      __lcmRecentTestInternals.resolvePeriod(
+        "date:2026-03-08 2:30-3:30",
+        "America/New_York"
+      )
+    ).toThrow(/Nonexistent local time/);
+
+    const nightWindow = __lcmRecentTestInternals.resolvePeriod(
+      "date:2026-04-27 night",
+      "Pacific/Auckland"
+    );
+    expect(nightWindow.start.toISOString()).toBe("2026-04-27T10:00:00.000Z");
+    expect(nightWindow.end.toISOString()).toBe("2026-04-27T12:00:00.000Z");
   });
 
   it("falls back to leaf summaries inside the requested sub-day window", async () => {
@@ -254,12 +283,7 @@ describe("LCM sub-day window retrieval", () => {
 
     const lcm = {
       timezone: "Asia/Bangkok",
-      db,
-      getRetrieval: () => ({
-        grep: async () => ({}),
-        expand: async () => ({}),
-        describe: async () => ({}),
-      }),
+      getRollupStore: () => new RollupStore(db),
       getConversationStore: () => ({
         getConversationBySessionId: async () => ({
           conversationId: conversation.conversationId,
@@ -410,6 +434,7 @@ describe("LCM weekly and monthly rollups", () => {
     );
     expect(week?.status).toBe("ready");
     expect(week?.content).toContain("Weekly Summary: 2026-04-27");
+    expect(week?.source_message_count).toBe(3);
     expect(
       rollupStore
         .getRollupSources(week!.rollup_id)
@@ -423,6 +448,7 @@ describe("LCM weekly and monthly rollups", () => {
     );
     expect(month?.status).toBe("ready");
     expect(month?.content).toContain("Monthly Summary: 2026-04");
+    expect(month?.source_message_count).toBe(2);
     expect(rollupStore.getRollupSources(month!.rollup_id)).toHaveLength(2);
 
     const firstMonthId = month?.rollup_id;
@@ -433,5 +459,109 @@ describe("LCM weekly and monthly rollups", () => {
       rollupStore.getRollup(conversation.conversationId, "month", "2026-04")
         ?.rollup_id
     ).toBe(firstMonthId);
+  });
+
+  it("uses local UTC+13 day keys for week and month aggregation", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "aggregate-utc-plus",
+      sessionKey: "agent:main:aggregate-utc-plus",
+      title: "Aggregate UTC+13",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_auckland",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Completed the Pacific/Auckland aggregate key fix.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      earliestAt: new Date("2026-04-26T12:30:00.000Z"),
+      latestAt: new Date("2026-04-26T13:00:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, {
+      timezone: "Pacific/Auckland",
+    });
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    await expect(
+      builder.buildWeeklyRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    await expect(
+      builder.buildMonthlyRollup(conversation.conversationId, "2026-04")
+    ).resolves.toBe(true);
+
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "week", "2026-04-27")
+        ?.content
+    ).toContain("2026-04-27");
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "month", "2026-04")
+        ?.source_message_count
+    ).toBe(1);
+  });
+
+  it("hides debug source IDs unless includeSources is true", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "debug-source-hiding",
+      sessionKey: "agent:main:debug-source-hiding",
+      title: "Debug source hiding",
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_debug_hidden",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Debug provenance should stay hidden by default.",
+      tokenCount: 10,
+      earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+      latestAt: new Date("2026-04-27T10:00:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await builder.buildDayRollup(conversation.conversationId, "2026-04-27");
+    const lcm = {
+      timezone: "UTC",
+      getRollupStore: () => rollupStore,
+      getConversationStore: () => ({
+        getConversationBySessionId: async () => ({
+          conversationId: conversation.conversationId,
+          sessionId: "debug-source-hiding",
+          title: null,
+          bootstrappedAt: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }),
+        getConversationBySessionKey: async () => null,
+      }),
+    };
+    const tool = createLcmRollupDebugTool({
+      deps: makeRecentDeps(),
+      lcm: lcm as never,
+      sessionId: "debug-source-hiding",
+    });
+
+    const hidden = await tool.execute("debug-hidden", { periodKind: "day" });
+    const hiddenText = (hidden.content[0] as { text: string }).text;
+    expect(hiddenText).not.toContain("sum_debug_hidden");
+    expect(JSON.stringify(hidden.details)).not.toContain("sum_debug_hidden");
+
+    const shown = await tool.execute("debug-shown", {
+      periodKind: "day",
+      includeSources: true,
+    });
+    const shownText = (shown.content[0] as { text: string }).text;
+    expect(shownText).toContain("sum_debug_hidden");
+
+    const invalid = await tool.execute("debug-invalid", {
+      periodKind: "year",
+    });
+    expect((invalid.content[0] as { text: string }).text).toContain(
+      "periodKind must be one of"
+    );
   });
 });

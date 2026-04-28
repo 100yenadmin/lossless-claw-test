@@ -2,7 +2,7 @@ import { Type } from "@sinclair/typebox";
 import type { DatabaseSync } from "node:sqlite";
 import { formatTimestamp } from "../compaction.js";
 import type { LcmContextEngine } from "../engine.js";
-import { RollupStore } from "../store/rollup-store.js";
+import type { RollupStore } from "../store/rollup-store.js";
 import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
@@ -105,16 +105,15 @@ function formatDisplayTime(
   return formatTimestamp(date, timezone);
 }
 
-function getLcmDatabase(lcm: LcmContextEngine): DatabaseSync {
-  const store = lcm.getRollupStore?.();
+function getLcmRollupStore(
+  lcm: LcmContextEngine,
+  inputStore?: RollupStore
+): RollupStore {
+  const store = inputStore ?? lcm.getRollupStore?.();
   if (store?.db) {
-    return store.db;
+    return store;
   }
-  const candidate = lcm as unknown as { db?: DatabaseSync };
-  if (!candidate.db) {
-    throw new Error("LCM rollup database is unavailable.");
-  }
-  return candidate.db;
+  throw new Error("LCM rollup database is unavailable.");
 }
 
 function getPartsInTimezone(
@@ -142,6 +141,7 @@ function getZonedDayString(date: Date, timezone: string): string {
 }
 
 function getUtcDateForZonedMidnight(dayString: string, timezone: string): Date {
+  assertValidPlainDate(dayString);
   const [year, month, day] = dayString.split("-").map((part) => Number(part));
   const approxUtc = new Date(Date.UTC(year, month - 1, day, 0, 0, 0, 0));
   const dtf = new Intl.DateTimeFormat("en-US", {
@@ -178,6 +178,7 @@ function getUtcDateForZonedMidnight(dayString: string, timezone: string): Date {
 }
 
 function addDays(dayString: string, delta: number): string {
+  assertValidPlainDate(dayString);
   const [year, month, day] = dayString.split("-").map((part) => Number(part));
   const date = new Date(Date.UTC(year, month - 1, day + delta, 0, 0, 0, 0));
   return `${date.getUTCFullYear().toString().padStart(4, "0")}-${String(
@@ -203,6 +204,16 @@ function getUtcDateForZonedLocalTime(
   timezone: string,
   minutesAfterMidnight: number
 ): Date {
+  if (
+    !Number.isInteger(minutesAfterMidnight) ||
+    minutesAfterMidnight < 0 ||
+    minutesAfterMidnight > 24 * 60
+  ) {
+    throw new Error("Window bounds must be within the local day.");
+  }
+  if (minutesAfterMidnight === 24 * 60) {
+    return getUtcDateForZonedLocalTime(addDays(dayString, 1), timezone, 0);
+  }
   const hour = Math.floor(minutesAfterMidnight / 60);
   const minute = minutesAfterMidnight % 60;
   return localDateTimeToUtc(
@@ -217,12 +228,11 @@ function localDateTimeToUtc(
   time: string,
   timezone: string
 ): Date {
+  assertValidPlainDate(dateKey);
   const [year, month, day] = dateKey
     .split("-")
     .map((part) => Number.parseInt(part, 10));
-  const [hour, minute, second] = time
-    .split(":")
-    .map((part) => Number.parseInt(part, 10));
+  const { hour, minute, second } = parseTimeParts(time);
   let candidate = new Date(
     Date.UTC(year, month - 1, day, hour, minute, second, 0)
   );
@@ -246,7 +256,34 @@ function localDateTimeToUtc(
     candidate = new Date(candidate.getTime() + deltaMs);
   }
 
-  return candidate;
+  throw new Error(
+    `Nonexistent local time ${dateKey} ${time} in timezone ${timezone}`
+  );
+}
+
+function parseTimeParts(time: string): {
+  hour: number;
+  minute: number;
+  second: number;
+} {
+  const match = /^(\d{2}):(\d{2}):(\d{2})$/.exec(time);
+  if (!match) {
+    throw new Error(`Invalid time: ${time}`);
+  }
+  const hour = Number.parseInt(match[1]!, 10);
+  const minute = Number.parseInt(match[2]!, 10);
+  const second = Number.parseInt(match[3]!, 10);
+  if (
+    hour < 0 ||
+    hour > 23 ||
+    minute < 0 ||
+    minute > 59 ||
+    second < 0 ||
+    second > 59
+  ) {
+    throw new Error(`Invalid time: ${time}`);
+  }
+  return { hour, minute, second };
 }
 
 function getZonedDateTimeParts(
@@ -272,14 +309,45 @@ function getZonedDateTimeParts(
   });
   const parts = formatter.formatToParts(date);
   const lookup = new Map(parts.map((part) => [part.type, part.value]));
-  const rawHour = Number.parseInt(lookup.get("hour") ?? "0", 10);
-  return {
+  return normalizeZonedParts({
     year: Number.parseInt(lookup.get("year") ?? "0", 10),
     month: Number.parseInt(lookup.get("month") ?? "1", 10),
     day: Number.parseInt(lookup.get("day") ?? "1", 10),
-    hour: rawHour === 24 ? 0 : rawHour,
+    hour: Number.parseInt(lookup.get("hour") ?? "0", 10),
     minute: Number.parseInt(lookup.get("minute") ?? "0", 10),
     second: Number.parseInt(lookup.get("second") ?? "0", 10),
+  });
+}
+
+function normalizeZonedParts(parts: {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+}): {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+} {
+  if (parts.hour !== 24) {
+    return parts;
+  }
+  const rolled = new Date(
+    Date.UTC(parts.year, parts.month - 1, parts.day, 0, parts.minute, parts.second)
+  );
+  rolled.setUTCDate(rolled.getUTCDate() + 1);
+  return {
+    year: rolled.getUTCFullYear(),
+    month: rolled.getUTCMonth() + 1,
+    day: rolled.getUTCDate(),
+    hour: 0,
+    minute: rolled.getUTCMinutes(),
+    second: rolled.getUTCSeconds(),
   };
 }
 
@@ -607,6 +675,27 @@ function combineRollups(rollups: RollupRecord[]): {
   return { content, tokenCount, status, sourceSummaryIds };
 }
 
+function getExpectedDayKeys(
+  start: Date,
+  end: Date,
+  timezone: string
+): string[] {
+  if (end <= start) {
+    return [];
+  }
+  const keys: string[] = [];
+  let cursor = getZonedDayString(start, timezone);
+  const lastKey = getZonedDayString(new Date(end.getTime() - 1), timezone);
+  for (let guard = 0; guard < 370; guard += 1) {
+    keys.push(cursor);
+    if (cursor === lastKey) {
+      return keys;
+    }
+    cursor = addDays(cursor, 1);
+  }
+  return keys;
+}
+
 function getRecentSummaryFallback(
   db: DatabaseSync,
   conversationId: number | undefined,
@@ -668,7 +757,6 @@ export function createLcmRecentTool(input: {
       const p = params as Record<string, unknown>;
       const includeSources = p.includeSources === true;
       const timezone = lcm.timezone;
-      const retrieval = lcm.getRetrieval();
       const conversationScope = await resolveLcmConversationScope({
         lcm,
         deps: input.deps,
@@ -696,7 +784,8 @@ export function createLcmRecentTool(input: {
         });
       }
 
-      const db = getLcmDatabase(lcm);
+      const rollupStore = getLcmRollupStore(lcm, input.rollupStore);
+      const db = rollupStore.db;
 
       if (conversationScope.allConversations) {
         const recentSummaries = getRecentSummaryFallback(
@@ -754,7 +843,6 @@ export function createLcmRecentTool(input: {
         };
       }
 
-      const rollupStore = input.rollupStore ?? new RollupStore(db);
       const conversationId = conversationScope.conversationId as number;
 
       let rollupContent: string | null = null;
@@ -762,7 +850,16 @@ export function createLcmRecentTool(input: {
       let status: "ready" | "stale" | "fallback" = "fallback";
       let sourceSummaryIds: string[] = [];
 
-      if (resolution.kind && resolution.periodKey && !resolution.window) {
+      const currentDayKey = getZonedDayString(new Date(), timezone);
+      const canUseStoredCurrentDay =
+        resolution.periodKey == null || resolution.periodKey !== currentDayKey;
+
+      if (
+        resolution.kind &&
+        resolution.periodKey &&
+        !resolution.window &&
+        canUseStoredCurrentDay
+      ) {
         const rollup = rollupStore.getRollup(
           conversationId,
           resolution.kind,
@@ -777,7 +874,7 @@ export function createLcmRecentTool(input: {
           status = rollup.status === "ready" ? "ready" : "stale";
           sourceSummaryIds = parseJsonStringArray(rollup.source_summary_ids);
         }
-      } else if (resolution.kind) {
+      } else if (resolution.kind && !resolution.window) {
         const rollups = rollupStore
           .listRollups(conversationId, resolution.kind, 200)
           .filter(
@@ -817,7 +914,19 @@ export function createLcmRecentTool(input: {
               : null,
             errorText: rollup.error_text,
           }));
-        if (usableRollups.length > 0) {
+        const expectedKeys =
+          resolution.kind === "day"
+            ? getExpectedDayKeys(resolution.start, resolution.end, timezone)
+            : [];
+        const usableKeys = new Set(
+          usableRollups.map((rollup) => rollup.periodKey)
+        );
+        const hasCompleteCoverage =
+          resolution.kind !== "day" ||
+          (expectedKeys.length > 0 &&
+            !expectedKeys.includes(currentDayKey) &&
+            expectedKeys.every((key) => usableKeys.has(key)));
+        if (usableRollups.length > 0 && hasCompleteCoverage) {
           const combined = combineRollups(usableRollups);
           rollupContent = combined.content;
           tokenCount = combined.tokenCount;
