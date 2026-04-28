@@ -144,40 +144,7 @@ function getZonedDayString(date: Date, timezone: string): string {
 }
 
 function getUtcDateForZonedMidnight(dayString: string, timezone: string): Date {
-  assertValidDateKey(dayString, 'period date');
-  const [year, month, day] = dayString.split("-").map((part) => Number(part));
-  const approxUtc = new Date(Date.UTC(year, month - 1, day, 0, 0, 0, 0));
-  const dtf = new Intl.DateTimeFormat("en-US", {
-    timeZone: timezone,
-    hour12: false,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-  const parts = dtf.formatToParts(approxUtc);
-  const zonedYear = Number(parts.find((part) => part.type === "year")?.value);
-  const zonedMonth = Number(parts.find((part) => part.type === "month")?.value);
-  const zonedDay = Number(parts.find((part) => part.type === "day")?.value);
-  const zonedHour = Number(parts.find((part) => part.type === "hour")?.value);
-  const zonedMinute = Number(
-    parts.find((part) => part.type === "minute")?.value
-  );
-  const zonedSecond = Number(
-    parts.find((part) => part.type === "second")?.value
-  );
-  const asUtc = Date.UTC(
-    zonedYear,
-    zonedMonth - 1,
-    zonedDay,
-    zonedHour,
-    zonedMinute,
-    zonedSecond
-  );
-  const desiredUtc = Date.UTC(year, month - 1, day, 0, 0, 0, 0);
-  return new Date(approxUtc.getTime() - (asUtc - desiredUtc));
+  return localDateTimeToUtc(dayString, "00:00:00", timezone);
 }
 
 function addDays(dayString: string, delta: number): string {

@@ -332,6 +332,14 @@ describe("LCM sub-day window retrieval", () => {
     expect(nightWindow.label).toBe("2026-04-27 night");
     expect(nightWindow.start.toISOString()).toBe("2026-04-27T10:00:00.000Z");
     expect(nightWindow.end.toISOString()).toBe("2026-04-27T12:00:00.000Z");
+
+    const midnightTransition = __lcmRecentTestInternals.resolvePeriod(
+      "date:2026-03-28",
+      "Asia/Gaza"
+    );
+    expect(midnightTransition.start.toISOString()).toBe(
+      "2026-03-27T22:00:00.000Z"
+    );
   });
 
   it("falls back to leaf summaries inside the requested sub-day window", async () => {

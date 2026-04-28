@@ -165,10 +165,14 @@ export class RollupBuilder {
       }
     }
 
+    const latestState = this.store.getState(conversationId);
+    const shouldClearPending =
+      result.errors.length === 0 &&
+      isTimestampAtOrBefore(latestState?.last_message_at, scannedAt);
     this.store.upsertState(conversationId, {
       timezone: this.config.timezone,
       last_rollup_check_at: scannedAt.toISOString(),
-      pending_rebuild: result.errors.length === 0 ? 0 : 1,
+      pending_rebuild: result.errors.length === 0 && shouldClearPending ? 0 : 1,
     });
 
     return result;
@@ -347,6 +351,17 @@ function getLocalDayBoundsForDateKey(
     timezone,
   );
   return { start, end };
+}
+
+function isTimestampAtOrBefore(
+  value: string | null | undefined,
+  boundary: Date
+): boolean {
+  if (!value) {
+    return true;
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) || parsed <= boundary;
 }
 
 function buildRollupId(periodKind: string, periodKey: string): string {

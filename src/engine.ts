@@ -4510,6 +4510,7 @@ export class LcmContextEngine implements ContextEngine {
             if (
               !rollupState ||
               rollupState.pending_rebuild === 1 ||
+              rollupState.timezone !== this.timezone ||
               result.changed
             ) {
               const rollupResult = await this.rollupBuilder.buildDailyRollups(
