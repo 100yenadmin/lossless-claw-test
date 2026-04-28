@@ -27,30 +27,30 @@ describe("LCM temporal rollup MVP", () => {
     expect(
       db
         .prepare(
-          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'lcm_rollups'",
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'lcm_rollups'"
         )
-        .get(),
+        .get()
     ).toBeTruthy();
     expect(
       db
         .prepare(
-          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'lcm_rollup_sources'",
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'lcm_rollup_sources'"
         )
-        .get(),
+        .get()
     ).toBeTruthy();
     expect(
       db
         .prepare(
-          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'lcm_rollup_state'",
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'lcm_rollup_state'"
         )
-        .get(),
+        .get()
     ).toBeTruthy();
     expect(
       db
         .prepare(
-          "SELECT name FROM sqlite_master WHERE type = 'view' AND name = 'daily_rollups'",
+          "SELECT name FROM sqlite_master WHERE type = 'view' AND name = 'daily_rollups'"
         )
-        .get(),
+        .get()
     ).toBeTruthy();
   });
 
@@ -86,32 +86,32 @@ describe("LCM temporal rollup MVP", () => {
 
     const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
     await expect(
-      builder.buildDayRollup(conversation.conversationId, "2026-04-27"),
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
     ).resolves.toBe(true);
     const first = rollupStore.getRollup(
       conversation.conversationId,
       "day",
-      "2026-04-27",
+      "2026-04-27"
     );
     expect(first?.status).toBe("ready");
     expect(first?.content).toContain("Daily Summary: 2026-04-27");
     expect(first?.source_summary_ids).toBe(
-      JSON.stringify(["sum_rollup_a", "sum_rollup_b"]),
+      JSON.stringify(["sum_rollup_a", "sum_rollup_b"])
     );
 
     await expect(
-      builder.buildDayRollup(conversation.conversationId, "2026-04-27"),
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
     ).resolves.toBe(true);
     const second = rollupStore.getRollup(
       conversation.conversationId,
       "day",
-      "2026-04-27",
+      "2026-04-27"
     );
     expect(second?.rollup_id).toBe(first?.rollup_id);
     expect(
       rollupStore
         .getRollupSources(second!.rollup_id)
-        .map((source) => source.source_id),
+        .map((source) => source.source_id)
     ).toEqual(["sum_rollup_a", "sum_rollup_b"]);
   });
 });
@@ -178,21 +178,28 @@ describe("LCM sub-day window retrieval", () => {
   it("parses deterministic local-time windows with DST-safe UTC bounds", () => {
     const dateWindow = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-03-08 1:30-3:30",
-      "America/New_York",
+      "America/New_York"
     );
     expect(dateWindow.label).toBe("2026-03-08 1:30-3:30");
     expect(dateWindow.window?.startMinutes).toBe(90);
     expect(dateWindow.window?.endMinutes).toBe(210);
     expect(dateWindow.start.toISOString()).toBe("2026-03-08T06:30:00.000Z");
-    expect(dateWindow.end.toISOString()).toBe("2026-03-08T08:30:00.000Z");
+    expect(dateWindow.end.toISOString()).toBe("2026-03-08T07:30:00.000Z");
 
     const namedWindow = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-04-27 morning",
-      "Asia/Bangkok",
+      "Asia/Bangkok"
     );
     expect(namedWindow.label).toBe("2026-04-27 morning");
     expect(namedWindow.start.toISOString()).toBe("2026-04-26T23:00:00.000Z");
     expect(namedWindow.end.toISOString()).toBe("2026-04-27T05:00:00.000Z");
+
+    const meridiemWindow = __lcmRecentTestInternals.resolvePeriod(
+      "date:2026-04-27 4-8pm",
+      "Asia/Bangkok"
+    );
+    expect(meridiemWindow.window?.startMinutes).toBe(16 * 60);
+    expect(meridiemWindow.window?.endMinutes).toBe(20 * 60);
   });
 
   it("falls back to leaf summaries inside the requested sub-day window", async () => {
@@ -221,6 +228,16 @@ describe("LCM sub-day window retrieval", () => {
         "Eric Wilder npm ENOTEMPTY repair happened in the afternoon window.",
       tokenCount: 12,
       latestAt: new Date("2026-04-27T10:30:00.000Z"),
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_spanning_window",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Spanning summary began before the window but overlaps it.",
+      tokenCount: 11,
+      earliestAt: new Date("2026-04-27T09:50:00.000Z"),
+      latestAt: new Date("2026-04-27T11:10:00.000Z"),
     });
     await summaryStore.insertSummary({
       summaryId: "sum_after_window",
@@ -264,11 +281,13 @@ describe("LCM sub-day window retrieval", () => {
     });
     const text = (result.content[0] as { text: string }).text;
     expect(text).toContain("sum_inside_window");
+    expect(text).toContain("sum_spanning_window");
     expect(text).toContain("ENOTEMPTY repair");
     expect(text).not.toContain("sum_before_window");
     expect(text).not.toContain("sum_after_window");
     expect((result.details as { summaryIds?: string[] }).summaryIds).toEqual([
       "sum_inside_window",
+      "sum_spanning_window",
     ]);
   });
 });

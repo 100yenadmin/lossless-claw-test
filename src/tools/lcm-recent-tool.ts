@@ -19,17 +19,17 @@ const LcmRecentSchema = Type.Object({
   conversationId: Type.Optional(
     Type.Number({
       description: "Conversation ID. Defaults to current session.",
-    }),
+    })
   ),
   allConversations: Type.Optional(
     Type.Boolean({
       description: "Search all conversations.",
-    }),
+    })
   ),
   includeSources: Type.Optional(
     Type.Boolean({
       description: "Include source summary IDs.",
-    }),
+    })
   ),
 });
 
@@ -96,7 +96,7 @@ function parseJsonStringArray(value: string): string[] {
 
 function formatDisplayTime(
   value: Date | string | number | null | undefined,
-  timezone: string,
+  timezone: string
 ): string {
   if (value == null) {
     return "-";
@@ -109,6 +109,10 @@ function formatDisplayTime(
 }
 
 function getLcmDatabase(lcm: LcmContextEngine): DatabaseSync {
+  const store = lcm.getRollupStore?.();
+  if (store?.db) {
+    return store.db;
+  }
   const candidate = lcm as unknown as { db?: DatabaseSync };
   if (!candidate.db) {
     throw new Error("LCM rollup database is unavailable.");
@@ -118,7 +122,7 @@ function getLcmDatabase(lcm: LcmContextEngine): DatabaseSync {
 
 function getPartsInTimezone(
   date: Date,
-  timezone: string,
+  timezone: string
 ): { year: number; month: number; day: number } {
   const formatter = new Intl.DateTimeFormat("en-CA", {
     timeZone: timezone,
@@ -135,9 +139,9 @@ function getPartsInTimezone(
 
 function getZonedDayString(date: Date, timezone: string): string {
   const { year, month, day } = getPartsInTimezone(date, timezone);
-  return `${year.toString().padStart(4, "0")}-${month.toString().padStart(2, "0")}-${day
+  return `${year.toString().padStart(4, "0")}-${month
     .toString()
-    .padStart(2, "0")}`;
+    .padStart(2, "0")}-${day.toString().padStart(2, "0")}`;
 }
 
 function getUtcDateForZonedMidnight(dayString: string, timezone: string): Date {
@@ -159,10 +163,10 @@ function getUtcDateForZonedMidnight(dayString: string, timezone: string): Date {
   const zonedDay = Number(parts.find((part) => part.type === "day")?.value);
   const zonedHour = Number(parts.find((part) => part.type === "hour")?.value);
   const zonedMinute = Number(
-    parts.find((part) => part.type === "minute")?.value,
+    parts.find((part) => part.type === "minute")?.value
   );
   const zonedSecond = Number(
-    parts.find((part) => part.type === "second")?.value,
+    parts.find((part) => part.type === "second")?.value
   );
   const asUtc = Date.UTC(
     zonedYear,
@@ -170,7 +174,7 @@ function getUtcDateForZonedMidnight(dayString: string, timezone: string): Date {
     zonedDay,
     zonedHour,
     zonedMinute,
-    zonedSecond,
+    zonedSecond
   );
   const desiredUtc = Date.UTC(year, month - 1, day, 0, 0, 0, 0);
   return new Date(approxUtc.getTime() - (asUtc - desiredUtc));
@@ -179,7 +183,9 @@ function getUtcDateForZonedMidnight(dayString: string, timezone: string): Date {
 function addDays(dayString: string, delta: number): string {
   const [year, month, day] = dayString.split("-").map((part) => Number(part));
   const date = new Date(Date.UTC(year, month - 1, day + delta, 0, 0, 0, 0));
-  return `${date.getUTCFullYear().toString().padStart(4, "0")}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`;
+  return `${date.getUTCFullYear().toString().padStart(4, "0")}-${String(
+    date.getUTCMonth() + 1
+  ).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`;
 }
 
 function startOfWeekDayString(dayString: string): string {
@@ -198,12 +204,86 @@ function startOfMonthDayString(dayString: string): string {
 function getUtcDateForZonedLocalTime(
   dayString: string,
   timezone: string,
-  minutesAfterMidnight: number,
+  minutesAfterMidnight: number
 ): Date {
-  return new Date(
-    getUtcDateForZonedMidnight(dayString, timezone).getTime() +
-      minutesAfterMidnight * 60_000,
+  const hour = Math.floor(minutesAfterMidnight / 60);
+  const minute = minutesAfterMidnight % 60;
+  return localDateTimeToUtc(
+    dayString,
+    `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00`,
+    timezone
   );
+}
+
+function localDateTimeToUtc(
+  dateKey: string,
+  time: string,
+  timezone: string
+): Date {
+  const [year, month, day] = dateKey
+    .split("-")
+    .map((part) => Number.parseInt(part, 10));
+  const [hour, minute, second] = time
+    .split(":")
+    .map((part) => Number.parseInt(part, 10));
+  let candidate = new Date(
+    Date.UTC(year, month - 1, day, hour, minute, second, 0)
+  );
+
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const parts = getZonedDateTimeParts(candidate, timezone);
+    const deltaMs =
+      Date.UTC(year, month - 1, day, hour, minute, second, 0) -
+      Date.UTC(
+        parts.year,
+        parts.month - 1,
+        parts.day,
+        parts.hour,
+        parts.minute,
+        parts.second,
+        0
+      );
+    if (deltaMs === 0) {
+      return candidate;
+    }
+    candidate = new Date(candidate.getTime() + deltaMs);
+  }
+
+  return candidate;
+}
+
+function getZonedDateTimeParts(
+  date: Date,
+  timezone: string
+): {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+} {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+  const parts = formatter.formatToParts(date);
+  const lookup = new Map(parts.map((part) => [part.type, part.value]));
+  const rawHour = Number.parseInt(lookup.get("hour") ?? "0", 10);
+  return {
+    year: Number.parseInt(lookup.get("year") ?? "0", 10),
+    month: Number.parseInt(lookup.get("month") ?? "1", 10),
+    day: Number.parseInt(lookup.get("day") ?? "1", 10),
+    hour: rawHour === 24 ? 0 : rawHour,
+    minute: Number.parseInt(lookup.get("minute") ?? "0", 10),
+    second: Number.parseInt(lookup.get("second") ?? "0", 10),
+  };
 }
 
 function parseClockToken(raw: string): number | null {
@@ -235,17 +315,25 @@ function parseClockToken(raw: string): number | null {
   return hour * 60 + minute;
 }
 
-function inferWindowEndMeridiem(startRaw: string, endRaw: string): string {
+function inferWindowMeridiems(
+  startRaw: string,
+  endRaw: string
+): { start: string; end: string } {
   const start = startRaw.trim().toLowerCase();
   const end = endRaw.trim().toLowerCase();
-  if (/(am|pm)\b/.test(end) || !/(am|pm)\b/.test(start)) {
-    return end;
+  const startMeridiem = /(am|pm)\b/.exec(start)?.[1];
+  const endMeridiem = /(am|pm)\b/.exec(end)?.[1];
+  if (startMeridiem && !endMeridiem) {
+    return { start, end: `${end}${startMeridiem}` };
   }
-  return `${end}${start.endsWith("pm") ? "pm" : "am"}`;
+  if (!startMeridiem && endMeridiem) {
+    return { start: `${start}${endMeridiem}`, end };
+  }
+  return { start, end };
 }
 
 function parseNamedWindow(
-  name: string,
+  name: string
 ): { startMinutes: number; endMinutes: number; name: string } | null {
   switch (name.trim().toLowerCase()) {
     case "morning":
@@ -262,17 +350,21 @@ function parseNamedWindow(
 }
 
 function parseExplicitWindow(
-  windowText: string,
+  windowText: string
 ): { startMinutes: number; endMinutes: number; label: string } | null {
   const match = /^(.+?)\s*(?:-|–|—|to)\s*(.+)$/.exec(
-    windowText.trim().toLowerCase(),
+    windowText.trim().toLowerCase()
   );
   if (!match) {
     return null;
   }
 
-  const startRaw = match[1].trim();
-  const endRaw = inferWindowEndMeridiem(startRaw, match[2].trim());
+  const displayStartRaw = match[1].trim();
+  const displayEndRaw = match[2].trim();
+  const { start: startRaw, end: endRaw } = inferWindowMeridiems(
+    displayStartRaw,
+    displayEndRaw
+  );
   const startMinutes = parseClockToken(startRaw);
   const endMinutes = parseClockToken(endRaw);
   if (
@@ -283,12 +375,16 @@ function parseExplicitWindow(
     return null;
   }
 
-  return { startMinutes, endMinutes, label: `${startRaw}-${match[2].trim()}` };
+  return {
+    startMinutes,
+    endMinutes,
+    label: `${displayStartRaw}-${displayEndRaw}`,
+  };
 }
 
 function parseBaseDay(
   baseText: string,
-  today: string,
+  today: string
 ): { day: string; label: string } | null {
   const base = baseText.trim().toLowerCase();
   if (base === "today") {
@@ -302,6 +398,12 @@ function parseBaseDay(
     if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
       return null;
     }
+    if (
+      Number.isNaN(new Date(`${day}T12:00:00.000Z`).getTime()) ||
+      new Date(`${day}T12:00:00.000Z`).toISOString().slice(0, 10) !== day
+    ) {
+      return null;
+    }
     return { day, label: day };
   }
   if (/^\d{4}-\d{2}-\d{2}$/.test(base)) {
@@ -313,11 +415,11 @@ function parseBaseDay(
 function resolveWindowPeriod(
   normalized: string,
   timezone: string,
-  today: string,
+  today: string
 ): PeriodResolution | null {
   const relative =
     /^last\s+(\d+)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes)$/.exec(
-      normalized,
+      normalized
     );
   if (relative) {
     const amount = Number(relative[1]);
@@ -338,7 +440,7 @@ function resolveWindowPeriod(
 
   const windowMatch =
     /^(today|yesterday|date:\d{4}-\d{2}-\d{2}|\d{4}-\d{2}-\d{2})\s+(.+)$/.exec(
-      normalized,
+      normalized
     );
   if (!windowMatch) {
     return null;
@@ -359,12 +461,12 @@ function resolveWindowPeriod(
   const start = getUtcDateForZonedLocalTime(
     base.day,
     timezone,
-    explicit.startMinutes,
+    explicit.startMinutes
   );
   const end = getUtcDateForZonedLocalTime(
     base.day,
     timezone,
-    explicit.endMinutes,
+    explicit.endMinutes
   );
   return {
     label: `${base.label} ${explicit.name ?? explicit.label}`,
@@ -449,7 +551,9 @@ function resolvePeriod(period: string, timezone: string): PeriodResolution {
   if (normalized === "month") {
     const monthStartDay = startOfMonthDayString(today);
     const [year, month] = monthStartDay.split("-").map((part) => Number(part));
-    const nextMonthStartDay = `${month === 12 ? year + 1 : year}-${String(month === 12 ? 1 : month + 1).padStart(2, "0")}-01`;
+    const nextMonthStartDay = `${month === 12 ? year + 1 : year}-${String(
+      month === 12 ? 1 : month + 1
+    ).padStart(2, "0")}-01`;
     return {
       label: `${monthStartDay.slice(0, 7)}`,
       kind: "month",
@@ -460,13 +564,13 @@ function resolvePeriod(period: string, timezone: string): PeriodResolution {
   }
 
   throw new Error(
-    'period must be one of "today", "yesterday", "7d", "week", "month", "30d", "date:YYYY-MM-DD", "today morning", "yesterday 4-8pm", "date:YYYY-MM-DD 14:00-16:30", "last Nh", or "last Nm".',
+    'period must be one of "today", "yesterday", "7d", "week", "month", "30d", "date:YYYY-MM-DD", "today morning", "yesterday 4-8pm", "date:YYYY-MM-DD 14:00-16:30", "last Nh", or "last Nm".'
   );
 }
 
 function formatSourcesLine(
   summaryIds: string[],
-  includeSources: boolean,
+  includeSources: boolean
 ): string {
   if (!includeSources || summaryIds.length === 0) {
     return "*Sources: omitted*";
@@ -485,7 +589,7 @@ function combineRollups(rollups: RollupRecord[]): {
     .join("\n\n");
   const tokenCount = rollups.reduce(
     (sum, rollup) => sum + rollup.tokenCount,
-    0,
+    0
   );
   const sourceSummaryIds = [
     ...new Set(rollups.flatMap((rollup) => rollup.sourceSummaryIds)),
@@ -500,13 +604,13 @@ function getRecentSummaryFallback(
   db: DatabaseSync,
   conversationId: number | undefined,
   start: Date,
-  end: Date,
+  end: Date
 ): RecentSummaryFallbackRow[] {
   const scopeClause = conversationId == null ? "" : "conversation_id = ? AND";
   const args: Array<string | number> =
     conversationId == null
-      ? [start.toISOString(), end.toISOString()]
-      : [conversationId, start.toISOString(), end.toISOString()];
+      ? [end.toISOString(), start.toISOString()]
+      : [conversationId, end.toISOString(), start.toISOString()];
 
   return db
     .prepare(
@@ -520,10 +624,10 @@ function getRecentSummaryFallback(
        FROM summaries
        WHERE ${scopeClause}
          kind = 'leaf'
-         AND coalesce(latest_at, earliest_at, created_at) >= ?
-         AND coalesce(latest_at, earliest_at, created_at) < ?
-       ORDER BY coalesce(latest_at, earliest_at, created_at) DESC
-       LIMIT 20`,
+         AND julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)
+         AND julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)
+       ORDER BY julianday(coalesce(earliest_at, latest_at, created_at)) DESC
+       LIMIT 20`
     )
     .all(...args) as unknown as RecentSummaryFallbackRow[];
 }
@@ -546,7 +650,7 @@ export function createLcmRecentTool(input: {
     name: "lcm_recent",
     label: "LCM Recent",
     description:
-      "Retrieve recent activity summaries from pre-built temporal rollups. Returns daily, weekly, or monthly summaries without LLM calls. Use for questions like 'what happened today?', 'what did we do yesterday?', or recap requests. Falls back to time-bounded lcm_grep when no rollup exists.",
+      "Retrieve recent activity from pre-built temporal rollups or a bounded leaf-summary SQL fallback. Supports daily/exact-date summaries plus sub-day local windows and relative windows without LLM calls. Use for questions like 'what happened today?' or 'what did we do yesterday 4-8pm?'.",
     parameters: LcmRecentSchema,
     async execute(_toolCallId, params) {
       const lcm = input.lcm ?? (await input.getLcm?.());
@@ -557,7 +661,6 @@ export function createLcmRecentTool(input: {
       const p = params as Record<string, unknown>;
       const includeSources = p.includeSources === true;
       const timezone = lcm.timezone;
-      const retrieval = lcm.getRetrieval();
       const conversationScope = await resolveLcmConversationScope({
         lcm,
         deps: input.deps,
@@ -585,13 +688,6 @@ export function createLcmRecentTool(input: {
         });
       }
 
-      try {
-        parseIsoTimestampParam(p, "since");
-        parseIsoTimestampParam(p, "before");
-      } catch {
-        // Intentional no-op, imported helper kept aligned with surrounding tool conventions.
-      }
-
       const db = getLcmDatabase(lcm);
 
       if (conversationScope.allConversations) {
@@ -599,30 +695,36 @@ export function createLcmRecentTool(input: {
           db,
           undefined,
           resolution.start,
-          resolution.end,
+          resolution.end
         );
         const summaryIds = recentSummaries.map((summary) => summary.summary_id);
 
         const lines: string[] = [];
         lines.push(`## Recent Activity: ${resolution.label}`);
         lines.push(
-          `**Period:** ${formatDisplayTime(resolution.start, timezone)} — ${formatDisplayTime(resolution.end, timezone)}`,
+          `**Period:** ${formatDisplayTime(
+            resolution.start,
+            timezone
+          )} — ${formatDisplayTime(resolution.end, timezone)}`
         );
         lines.push("**Status:** fallback");
         lines.push(`**Token count:** 0`);
         lines.push("");
         if (recentSummaries.length === 0) {
           lines.push(
-            "No pre-built rollup found, and no leaf summaries were captured in this period.",
+            "No pre-built rollup found, and no leaf summaries were captured in this period."
           );
         } else {
           lines.push(
-            "No pre-built rollup available. Here's what LCM captured for this period:",
+            "No pre-built rollup available. Here's what LCM captured for this period:"
           );
           lines.push("");
           for (const summary of recentSummaries) {
             lines.push(
-              `- [${summary.summary_id}] (${summary.kind}, ${formatDisplayTime(summary.effective_time, timezone)}): ${summary.content.replace(/\n/g, " ").trim()}`,
+              `- [${summary.summary_id}] (${summary.kind}, ${formatDisplayTime(
+                summary.effective_time,
+                timezone
+              )}): ${summary.content.replace(/\n/g, " ").trim()}`
             );
           }
           lines.push("");
@@ -630,7 +732,7 @@ export function createLcmRecentTool(input: {
         lines.push("---");
         lines.push(formatSourcesLine(summaryIds, includeSources));
         lines.push(
-          "*Drill down: Use lcm_expand_query with matching summaryIds for deeper recall*",
+          "*Drill down: Use lcm_expand_query with matching summaryIds for deeper recall*"
         );
 
         return {
@@ -652,11 +754,11 @@ export function createLcmRecentTool(input: {
       let status: "ready" | "stale" | "fallback" = "fallback";
       let sourceSummaryIds: string[] = [];
 
-      if (resolution.kind && resolution.periodKey) {
+      if (resolution.kind && resolution.periodKey && !resolution.window) {
         const rollup = rollupStore.getRollup(
           conversationId,
           resolution.kind,
-          resolution.periodKey,
+          resolution.periodKey
         );
         if (
           rollup &&
@@ -673,11 +775,11 @@ export function createLcmRecentTool(input: {
           .filter(
             (rollup) =>
               new Date(rollup.period_start) >= resolution.start &&
-              new Date(rollup.period_start) < resolution.end,
+              new Date(rollup.period_start) < resolution.end
           );
         const usableRollups = rollups
           .filter(
-            (rollup) => rollup.status === "ready" || rollup.status === "stale",
+            (rollup) => rollup.status === "ready" || rollup.status === "stale"
           )
           .map((rollup) => ({
             rollupId: rollup.rollup_id,
@@ -721,40 +823,46 @@ export function createLcmRecentTool(input: {
           db,
           conversationId,
           resolution.start,
-          resolution.end,
+          resolution.end
         );
 
         const lines: string[] = [];
         lines.push(`## Recent Activity: ${resolution.label}`);
         lines.push(
-          `**Period:** ${formatDisplayTime(resolution.start, timezone)} — ${formatDisplayTime(resolution.end, timezone)}`,
+          `**Period:** ${formatDisplayTime(
+            resolution.start,
+            timezone
+          )} — ${formatDisplayTime(resolution.end, timezone)}`
         );
         lines.push("**Status:** fallback");
         lines.push("**Token count:** 0");
         lines.push("");
         if (recentSummaries.length === 0) {
           lines.push(
-            "No pre-built rollup available, and LCM captured no leaf summaries for this period.",
+            "No pre-built rollup available, and LCM captured no leaf summaries for this period."
           );
         } else {
           lines.push(
-            "No pre-built rollup available. Here's what LCM captured for this period:",
+            "No pre-built rollup available. Here's what LCM captured for this period:"
           );
           lines.push("");
           for (const summary of recentSummaries) {
             lines.push(
-              `- [${summary.summary_id}] (${summary.kind}, ${formatDisplayTime(summary.effective_time, timezone)}): ${summary.content.replace(/\n/g, " ").trim()}`,
+              `- [${summary.summary_id}] (${summary.kind}, ${formatDisplayTime(
+                summary.effective_time,
+                timezone
+              )}): ${summary.content.replace(/\n/g, " ").trim()}`
             );
           }
           lines.push("");
           sourceSummaryIds = recentSummaries.map(
-            (summary) => summary.summary_id,
+            (summary) => summary.summary_id
           );
         }
         lines.push("---");
         lines.push(formatSourcesLine(sourceSummaryIds, includeSources));
         lines.push(
-          "*Drill down: Use lcm_expand_query with these summaryIds for deeper recall*",
+          "*Drill down: Use lcm_expand_query with these summaryIds for deeper recall*"
         );
 
         return {
@@ -771,7 +879,10 @@ export function createLcmRecentTool(input: {
       const lines: string[] = [];
       lines.push(`## Recent Activity: ${resolution.label}`);
       lines.push(
-        `**Period:** ${formatDisplayTime(resolution.start, timezone)} — ${formatDisplayTime(resolution.end, timezone)}`,
+        `**Period:** ${formatDisplayTime(
+          resolution.start,
+          timezone
+        )} — ${formatDisplayTime(resolution.end, timezone)}`
       );
       lines.push(`**Status:** ${status}`);
       lines.push(`**Token count:** ${tokenCount}`);
@@ -781,7 +892,7 @@ export function createLcmRecentTool(input: {
       lines.push("---");
       lines.push(formatSourcesLine(sourceSummaryIds, includeSources));
       lines.push(
-        "*Drill down: Use lcm_expand_query with these summaryIds for deeper recall*",
+        "*Drill down: Use lcm_expand_query with these summaryIds for deeper recall*"
       );
 
       return {
