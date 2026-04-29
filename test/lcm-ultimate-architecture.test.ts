@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { ObservedWorkExtractor } from "../src/observed-work-extractor.js";
@@ -365,11 +365,17 @@ describe("LCM ultimate architecture implementation", () => {
     expect(pr528.topUnfinished[0]?.lastSeenAt).toBe("2026-04-22T00:00:00.000Z");
     expect(pr528.transitions?.some((transition) => transition.transitionType === "possibly_resolved")).toBe(true);
 
-    const stale = observedWork.getDensity({
-      conversationId: 4,
-      statuses: ["observed_unfinished", "observed_ambiguous"],
-      staleAfterDays: 3,
-    });
-    expect(stale.staleItems?.map((item) => item.topicKey)).toContain("pr-528");
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-29T00:00:00.000Z"));
+    try {
+      const stale = observedWork.getDensity({
+        conversationId: 4,
+        statuses: ["observed_unfinished", "observed_ambiguous"],
+        staleAfterDays: 3,
+      });
+      expect(stale.staleItems?.map((item) => item.topicKey)).toContain("pr-528");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
