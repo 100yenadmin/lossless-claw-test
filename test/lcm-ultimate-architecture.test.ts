@@ -280,6 +280,54 @@ describe("LCM ultimate architecture implementation", () => {
     ]);
   });
 
+  it("keeps event episode source types and default query keys deterministic", () => {
+    const db = makeDb();
+    createConversation(db, 8);
+    const events = new EventObservationStore(db);
+
+    events.upsertObservation({
+      eventId: "ev_message_source",
+      conversationId: 8,
+      eventKind: "primary",
+      title: "Opened local incident window",
+      ingestTime: "2026-04-25T00:00:00.000Z",
+      confidence: 0.7,
+      rationale: "Direct message evidence.",
+      sourceType: "message",
+      sourceId: "msg_1",
+    });
+    events.upsertObservation({
+      eventId: "ev_rollup_source",
+      conversationId: 8,
+      eventKind: "primary",
+      title: "Opened local incident follow-up",
+      ingestTime: "2026-04-25T01:00:00.000Z",
+      confidence: 0.8,
+      rationale: "Rollup evidence.",
+      sourceType: "rollup",
+      sourceId: "rollup_1",
+    });
+
+    const observations = events.listObservations({
+      conversationId: 8,
+      query: "uncategorized",
+      includeSources: true,
+    });
+    expect(observations).toHaveLength(2);
+    expect(observations.every((event) => event.queryKey === "uncategorized")).toBe(true);
+
+    const episodes = events.listEpisodes({
+      conversationId: 8,
+      query: "uncategorized",
+      includeSources: true,
+    });
+    expect(episodes).toHaveLength(1);
+    expect(episodes[0]?.sources).toEqual([
+      { sourceType: "message", sourceId: "msg_1" },
+      { sourceType: "rollup", sourceId: "rollup_1" },
+    ]);
+  });
+
   it("previews, records, and reviews inert task suggestions without external task writes", async () => {
     const db = makeDb();
     createConversation(db, 3);
