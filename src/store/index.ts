@@ -60,6 +60,7 @@ export type {
 export { EventObservationStore } from "./event-observation-store.js";
 export type {
   EventObservation,
+  EventEpisode,
   EventObservationInput,
   EventObservationKind,
 } from "./event-observation-store.js";

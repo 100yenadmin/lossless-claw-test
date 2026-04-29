@@ -104,6 +104,18 @@ function topicKeyFor(line: string, kind: ObservedWorkKind): string {
   return fallback || kind;
 }
 
+function eventQueryKeyFor(line: string): string {
+  const pr = /\b(?:pr|pull request)\s*#?(\d{1,6})\b/i.exec(line) ?? /\/pull\/(\d{1,6})\b/i.exec(line);
+  if (pr?.[1]) {
+    return `pr-${pr[1]}`;
+  }
+  const errorToken = /\b([A-Z][A-Z0-9_]{3,})\b/.exec(line);
+  if (errorToken?.[1]) {
+    return errorToken[1].toLowerCase();
+  }
+  return topicKeyFor(line, "other");
+}
+
 function confidenceBand(confidence: number): "low" | "medium" | "medium-high" | "high" {
   if (confidence >= 0.85) return "high";
   if (confidence >= 0.72) return "medium-high";
@@ -191,6 +203,7 @@ function classifyEvent(line: string): EventCandidate | null {
   else if (/\b(cortex|memory injection|injected memory)\b/i.test(line)) eventKind = "memory_injection";
   else if (/\b(imported|backfill|historical)\b/i.test(line)) eventKind = "imported";
   else if (/\b(echo|dream|reference)\b/i.test(line)) eventKind = "echo";
+  else if (/\b(first occurrence|original event|started|created|opened|reported)\b/i.test(line)) eventKind = "primary";
   else if (/\b(incident|root cause|restart|error|failed|failing|outage|blocked)\b/i.test(line)) eventKind = "operational_incident";
   else if (DECISION_RE.test(line)) eventKind = "decision";
   const confidence =
@@ -202,7 +215,7 @@ function classifyEvent(line: string): EventCandidate | null {
   return {
     eventKind,
     title: truncate(line, 140),
-    queryKey: topicKeyFor(line, eventKind === "decision" ? "decision" : "other"),
+    queryKey: eventQueryKeyFor(line),
     confidence,
     rationale: `Observed event cue from a leaf summary; event time is evidence time, not necessarily original occurrence time.`,
   };

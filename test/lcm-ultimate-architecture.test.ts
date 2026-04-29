@@ -200,6 +200,86 @@ describe("LCM ultimate architecture implementation", () => {
     expect(JSON.stringify(shown.details)).toContain("sum_event");
   });
 
+  it("groups event observations into cross-day episodes and separates primary evidence from retellings/imports", async () => {
+    const db = makeDb();
+    createConversation(db, 5);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const events = new EventObservationStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork, events);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 5,
+      summaryId: "sum_primary_first",
+      createdAt: "2026-04-20T03:00:00.000Z",
+      content: "- First occurrence: Eric ENOTEMPTY incident was reported after restart",
+    });
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 5,
+      summaryId: "sum_primary_second",
+      createdAt: "2026-04-21T03:00:00.000Z",
+      content: "- Reported ENOTEMPTY verification details after the incident",
+    });
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 5,
+      summaryId: "sum_retelling",
+      createdAt: "2026-04-22T03:00:00.000Z",
+      content: "- Retold Eric ENOTEMPTY incident while discussing later context",
+    });
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 5,
+      summaryId: "sum_imported",
+      createdAt: "2026-04-23T03:00:00.000Z",
+      content: "- Imported historical ENOTEMPTY incident notes from archive",
+    });
+    extractor.processConversation(5);
+
+    const primary = events.listObservations({
+      conversationId: 5,
+      query: "ENOTEMPTY",
+      eventKinds: ["primary"],
+      first: true,
+      includeSources: true,
+    });
+    expect(primary[0]?.eventKind).toBe("primary");
+    expect(primary[0]?.sources?.[0]?.sourceId).toBe("sum_primary_first");
+
+    const retellings = events.listObservations({
+      conversationId: 5,
+      query: "ENOTEMPTY",
+      eventKinds: ["retelling", "imported"],
+      first: true,
+    });
+    expect(retellings.map((event) => event.eventKind)).toEqual(["retelling", "imported"]);
+
+    const episodes = events.listEpisodes({
+      conversationId: 5,
+      query: "ENOTEMPTY",
+      eventKinds: ["primary"],
+      includeSources: true,
+    });
+    expect(episodes).toHaveLength(1);
+    expect(episodes[0]).toMatchObject({
+      episodeKind: "primary",
+      topicKey: "enotempty",
+      observationCount: 2,
+      firstEventTime: "2026-04-20T03:00:00.000Z",
+      lastEventTime: "2026-04-21T03:00:00.000Z",
+    });
+    expect(episodes[0]?.sources?.map((source) => source.sourceId).sort()).toEqual([
+      "sum_primary_first",
+      "sum_primary_second",
+    ]);
+  });
+
   it("previews, records, and reviews inert task suggestions without external task writes", async () => {
     const db = makeDb();
     createConversation(db, 3);

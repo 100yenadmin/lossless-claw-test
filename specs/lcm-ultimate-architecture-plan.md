@@ -45,6 +45,7 @@ This follow-up implements the pieces that were previously only planned:
 - stale open-item reporting for "what's still blocked?" style queries,
 - topic/title/rationale filtering for `lcm_work_density`,
 - deterministic event observations for primary events, retellings, imports, memory injections, decisions, and operational incidents,
+- cross-summary event episodes grouped by deterministic topic key and event kind,
 - read-only `lcm_event_search`,
 - opt-in inert `lcm_task_suggestions` and `lcm_task_suggestion_review` tools,
 - task-bridge source requirements and source redaction by default,
@@ -74,7 +75,7 @@ Open-state tracking is still observed, not authoritative. High-confidence later 
 
 Event observations are cues, not final truth. They separate evidence time from ingest time and label whether a line looks like a primary event, retelling, memory injection, imported history, echo/reference, decision, or operational incident.
 
-`lcm_event_search` is read-only and hides source IDs unless `includeSources=true`. First-occurrence and incident reconstruction claims still require source expansion.
+`lcm_event_search` is read-only and hides source IDs unless `includeSources=true`. It can return raw event observations and deterministic episodes grouped across summaries. First-occurrence and incident reconstruction claims still require source expansion.
 
 ## Task Bridge Contract
 
