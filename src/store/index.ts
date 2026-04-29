@@ -53,6 +53,8 @@ export type {
   ObservedWorkProcessingState,
   ObservedWorkSource,
   ObservedWorkStatus,
+  ObservedWorkTransition,
+  ObservedWorkTransitionType,
 } from "./observed-work-store.js";
 
 export { EventObservationStore } from "./event-observation-store.js";

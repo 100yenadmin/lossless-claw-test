@@ -45,6 +45,8 @@ const LcmWorkDensitySchema = Type.Object({
   statuses: Type.Optional(Type.Array(Type.String({ enum: [...STATUS_VALUES] }), { description: "Observed statuses to include." })),
   kinds: Type.Optional(Type.Array(Type.String({ enum: [...KIND_VALUES] }), { description: "Observed work kinds to include." })),
   includeSources: Type.Optional(Type.Boolean({ description: "Include observed-work source IDs. Defaults to false." })),
+  includeTransitions: Type.Optional(Type.Boolean({ description: "Include observed open/reinforced/resolved transition records for returned items. Defaults to false." })),
+  staleAfterDays: Type.Optional(Type.Number({ description: "Also report unfinished/ambiguous items not reinforced for this many days.", minimum: 1, maximum: 365 })),
   detailLevel: Type.Optional(Type.Number({ description: "0 = compact counts, 1 = include top items, 2 = include more detail. Default 1.", minimum: 0, maximum: 2 })),
   maxOutputTokens: Type.Optional(Type.Number({ description: "Soft output budget hint for future truncation/accounting.", minimum: 256 })),
   minConfidence: Type.Optional(Type.Number({ description: "Minimum observed confidence to include.", minimum: 0, maximum: 1 })),
@@ -217,6 +219,10 @@ export function createLcmWorkDensityTool(input: {
       const minConfidence = typeof p.minConfidence === "number" ? p.minConfidence : undefined;
       const store = lcm.getObservedWorkStore();
       const includeSources = p.includeSources === true;
+      const includeTransitions = p.includeTransitions === true;
+      const staleAfterDays = typeof p.staleAfterDays === "number"
+        ? Math.trunc(p.staleAfterDays)
+        : undefined;
       const result = store.getDensity({
         conversationId: scope.conversationId,
         since,
@@ -226,6 +232,8 @@ export function createLcmWorkDensityTool(input: {
         topic,
         minConfidence,
         includeSources,
+        includeTransitions,
+        staleAfterDays,
         limit,
       });
       const compact = detailLevel <= 0;
@@ -234,12 +242,19 @@ export function createLcmWorkDensityTool(input: {
         window: since || before ? { since, before, timezone: lcm.timezone } : undefined,
         conversationScope: scope.allConversations ? "all" : scope.conversationId,
         density: result.density,
-        ...(compact ? {} : { topUnfinished: result.topUnfinished, completedHighlights: result.completedHighlights, ambiguous: result.ambiguous }),
+        ...(compact ? {} : {
+          topUnfinished: result.topUnfinished,
+          completedHighlights: result.completedHighlights,
+          ambiguous: result.ambiguous,
+          ...(result.staleItems ? { staleItems: result.staleItems } : {}),
+          ...(result.transitions ? { transitions: result.transitions } : {}),
+        }),
         accounting: {
           itemsIncluded: result.itemsIncluded,
           itemsOmitted: result.itemsOmitted,
           truncated: result.itemsOmitted > 0,
           maxOutputTokens: typeof p.maxOutputTokens === "number" ? p.maxOutputTokens : undefined,
+          staleAfterDays,
         },
         confidence: "observed-unrefined",
         disclaimer: "Observed from LCM evidence; not authoritative task state.",

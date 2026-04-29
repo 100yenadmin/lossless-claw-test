@@ -291,4 +291,74 @@ describe("LCM ultimate architecture implementation", () => {
     expect(stillDismissed[0]?.reviewedBy).toBe("unit-test");
     expect(taskBridge.listSuggestions({ status: "pending" })).toHaveLength(0);
   });
+
+  it("tracks open-state resolution, ambiguous possible resolution, and stale items", async () => {
+    const db = makeDb();
+    createConversation(db, 4);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const events = new EventObservationStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork, events);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 4,
+      summaryId: "sum_open",
+      createdAt: "2026-04-20T00:00:00.000Z",
+      content: [
+        "- Blocker: PR #527 still has unresolved review comments",
+        "- Blocker: PR #528 still has failing CI",
+      ].join("\n"),
+    });
+    extractor.processConversation(4);
+    expect(observedWork.getDensity({
+      conversationId: 4,
+      statuses: ["observed_unfinished"],
+    }).density.unfinished).toBe(2);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 4,
+      summaryId: "sum_resolved",
+      createdAt: "2026-04-21T00:00:00.000Z",
+      content: "- Completed: PR #527 review fix landed",
+    });
+    extractor.processConversation(4);
+
+    const pr527 = observedWork.getDensity({
+      conversationId: 4,
+      topic: "pr-527",
+      includeTransitions: true,
+    });
+    expect(pr527.density.unfinished).toBe(0);
+    expect(pr527.density.completed).toBe(1);
+    expect(pr527.transitions?.some((transition) => transition.transitionType === "resolved")).toBe(true);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 4,
+      summaryId: "sum_maybe",
+      createdAt: "2026-04-22T00:00:00.000Z",
+      content: "- Maybe fixed PR #528 but needs verification",
+    });
+    extractor.processConversation(4);
+
+    const pr528 = observedWork.getDensity({
+      conversationId: 4,
+      topic: "pr-528",
+      includeTransitions: true,
+    });
+    expect(pr528.density.unfinished).toBe(1);
+    expect(pr528.transitions?.some((transition) => transition.transitionType === "possibly_resolved")).toBe(true);
+
+    const stale = observedWork.getDensity({
+      conversationId: 4,
+      statuses: ["observed_unfinished", "observed_ambiguous"],
+      staleAfterDays: 3,
+    });
+    expect(stale.staleItems?.map((item) => item.topicKey)).toContain("pr-528");
+  });
 });

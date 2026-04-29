@@ -41,6 +41,8 @@ This follow-up implements the pieces that were previously only planned:
 - deterministic observed-work extraction from new leaf summaries during maintenance,
 - retry-preserving observed-work processing state,
 - source-backed observed work rows with conservative observed vocabulary,
+- observed-work transition records for opened/reinforced/resolved/possible-resolution state,
+- stale open-item reporting for "what's still blocked?" style queries,
 - topic/title/rationale filtering for `lcm_work_density`,
 - deterministic event observations for primary events, retellings, imports, memory injections, decisions, and operational incidents,
 - read-only `lcm_event_search`,
@@ -65,6 +67,8 @@ Observed work uses only non-authoritative labels:
 - `dismissed`
 
 `lcm_work_density` is read-only. Extraction is deterministic and conservative: it processes new leaf summaries incrementally, requires source evidence, raises confidence only with repeated evidence, and never writes to OpenClaw tasks or Cortex.
+
+Open-state tracking is still observed, not authoritative. High-confidence later evidence can move an observed blocker/open item to `observed_completed`; ambiguous "maybe fixed" evidence records a `possibly_resolved` transition without closing the item. Stale reporting is computed at read time and does not mutate task state.
 
 ## Event Observation Contract
 
