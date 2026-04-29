@@ -335,6 +335,15 @@ describe("LCM ultimate architecture implementation", () => {
     expect(pr527.density.unfinished).toBe(0);
     expect(pr527.density.completed).toBe(1);
     expect(pr527.transitions?.some((transition) => transition.transitionType === "resolved")).toBe(true);
+    expect(JSON.stringify(pr527.transitions)).not.toContain("sum_resolved");
+
+    const pr527WithSources = observedWork.getDensity({
+      conversationId: 4,
+      topic: "pr-527",
+      includeTransitions: true,
+      includeSources: true,
+    });
+    expect(JSON.stringify(pr527WithSources.transitions)).toContain("sum_resolved");
 
     await insertLeafSummary({
       db,
@@ -352,6 +361,8 @@ describe("LCM ultimate architecture implementation", () => {
       includeTransitions: true,
     });
     expect(pr528.density.unfinished).toBe(1);
+    expect(pr528.topUnfinished[0]?.evidenceCount).toBe(2);
+    expect(pr528.topUnfinished[0]?.lastSeenAt).toBe("2026-04-22T00:00:00.000Z");
     expect(pr528.transitions?.some((transition) => transition.transitionType === "possibly_resolved")).toBe(true);
 
     const stale = observedWork.getDensity({
