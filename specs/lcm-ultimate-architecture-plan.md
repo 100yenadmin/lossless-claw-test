@@ -44,6 +44,8 @@ This follow-up implements the pieces that were previously only planned:
 - observed-work transition records for opened/reinforced/resolved/possible-resolution state,
 - stale open-item reporting for "what's still blocked?" style queries,
 - topic/title/rationale filtering for `lcm_work_density`,
+- bounded `lcm_recent` topic filtering through source-summary fallback rather than whole-rollup filtering,
+- tighter extraction vocabulary that treats negated completion and soft-resolution language as unfinished or ambiguous,
 - deterministic event observations for primary events, retellings, imports, memory injections, decisions, and operational incidents,
 - cross-summary event episodes grouped by deterministic topic key and event kind,
 - read-only `lcm_event_search`,
@@ -57,6 +59,8 @@ This follow-up implements the pieces that were previously only planned:
 
 Rollup writes belong to explicit/admin/maintenance paths. Build outputs must preserve period kind/key, timezone, source coverage, stale status, provenance, and accounting.
 
+`lcm_recent({ topic })` is deterministic and bounded. Topic filters operate on leaf summary content inside the requested period and intentionally use fallback instead of whole-day/week/month rollups, so the tool does not fake topic-level precision from aggregate prose.
+
 ## Observed Work Contract
 
 Observed work uses only non-authoritative labels:
@@ -67,7 +71,7 @@ Observed work uses only non-authoritative labels:
 - `decision_recorded`
 - `dismissed`
 
-`lcm_work_density` is read-only. Extraction is deterministic and conservative: it processes new leaf summaries incrementally, requires source evidence, raises confidence only with repeated evidence, and never writes to OpenClaw tasks or Cortex.
+`lcm_work_density` is read-only. Extraction is deterministic and conservative: it processes new leaf summaries incrementally, requires source evidence, raises confidence only with repeated evidence, treats negated completion as unfinished, leaves "maybe fixed" style language ambiguous, and never writes to OpenClaw tasks or Cortex.
 
 Open-state tracking is still observed, not authoritative. High-confidence later evidence can move an observed blocker/open item to `observed_completed`; ambiguous "maybe fixed" evidence records a `possibly_resolved` transition without closing the item. Stale reporting is computed at read time and does not mutate task state.
 

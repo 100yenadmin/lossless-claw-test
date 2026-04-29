@@ -420,6 +420,51 @@ describe("LCM ultimate architecture implementation", () => {
     expect(taskBridge.listSuggestions({ status: "pending" })).toHaveLength(0);
   });
 
+  it("keeps negated completion and soft-resolution vocabulary non-authoritative", async () => {
+    const db = makeDb();
+    createConversation(db, 6);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const events = new EventObservationStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork, events);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 6,
+      summaryId: "sum_vocab",
+      createdAt: "2026-04-24T00:00:00.000Z",
+      content: [
+        "- Not completed PR #531 despite green local notes",
+        "- Maybe fixed PR #532 after retry, needs verification",
+        "- Decision recorded: keep topic filters deterministic and bounded",
+      ].join("\n"),
+    });
+    extractor.processConversation(6);
+
+    const notCompleted = observedWork.getDensity({
+      conversationId: 6,
+      topic: "pr-531",
+    });
+    expect(notCompleted.density.completed).toBe(0);
+    expect(notCompleted.density.unfinished).toBe(1);
+    expect(notCompleted.topUnfinished[0]?.title).toContain("Not completed");
+
+    const softResolution = observedWork.getDensity({
+      conversationId: 6,
+      topic: "pr-532",
+    });
+    expect(softResolution.density.completed).toBe(0);
+    expect(softResolution.density.ambiguous).toBe(1);
+    expect(softResolution.ambiguous[0]?.title).toContain("Maybe fixed");
+
+    const decision = observedWork.getDensity({
+      conversationId: 6,
+      topic: "topic filters",
+    });
+    expect(decision.density.decisionRecorded).toBe(1);
+  });
+
   it("tracks open-state resolution, ambiguous possible resolution, and stale items", async () => {
     const db = makeDb();
     createConversation(db, 4);
