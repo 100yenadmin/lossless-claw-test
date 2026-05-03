@@ -472,6 +472,17 @@ describe("ObservedWorkStore", () => {
       expect((global.details as { error?: string }).error).toMatch(
         /does not support allConversations/,
       );
+
+      const filtered = await tool.execute("density-filtered-statuses", {
+        conversationId: 1,
+        period: "week",
+        statuses: ["observed_unfinished"],
+        detailLevel: 0,
+      });
+      expect((filtered.details as { filterScope?: string }).filterScope).toBeDefined();
+      expect((filtered.details as { filterScope?: string }).filterScope).toContain(
+        "observed_unfinished",
+      );
     } finally {
       vi.useRealTimers();
     }
