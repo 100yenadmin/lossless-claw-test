@@ -259,7 +259,7 @@ export function createLcmWorkDensityTool(input: {
     name: "lcm_work_density",
     label: "LCM Work Density",
     description:
-      "Summarize observed work density from LCM evidence. Returns counts and top observed completed/unfinished/ambiguous work items. This is not an authoritative task system; output is unrefined observed evidence.",
+      "Summarize observed work density from LCM evidence. Returns counts and top observed completed/unfinished/ambiguous work items. This is not an authoritative task system; output is unrefined observed evidence. Note: when `statuses` is set, `density.totalObserved` and the per-status counts reflect rows matching the requested filter, NOT the unfiltered conversation total.",
     parameters: LcmWorkDensitySchema,
     async execute(_toolCallId, params) {
       const lcm = input.lcm ?? (await input.getLcm?.());
@@ -319,11 +319,15 @@ export function createLcmWorkDensityTool(input: {
         limit,
       });
       const compact = detailLevel <= 0;
+      const filterScopeNote = statuses?.length
+        ? `density counts reflect statuses=[${statuses.join(",")}] only, not the unfiltered conversation total`
+        : undefined;
       const details = applyOutputBudget({
         period: periodLabel,
         window: since || before ? { since, before, timezone: lcm.timezone } : undefined,
         conversationScope: scope.allConversations ? "all" : scope.conversationId,
         density: result.density,
+        ...(filterScopeNote ? { filterScope: filterScopeNote } : {}),
         ...(compact
           ? {}
           : {
