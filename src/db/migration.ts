@@ -1281,6 +1281,9 @@ export function runLcmMigrations(
         CREATE INDEX IF NOT EXISTS lcm_observed_work_items_fingerprint_idx
           ON lcm_observed_work_items(fingerprint);
 
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_first_seen_idx
+          ON lcm_observed_work_items(conversation_id, first_seen_at);
+
         CREATE INDEX IF NOT EXISTS lcm_observed_work_sources_source_idx
           ON lcm_observed_work_sources(source_type, source_id);
       `);

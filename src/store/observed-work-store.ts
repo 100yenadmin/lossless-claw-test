@@ -371,19 +371,19 @@ export class ObservedWorkStore {
         rationale = excluded.rationale,
         topic_key = excluded.topic_key,
         first_seen_at = CASE
-          WHEN julianday(excluded.first_seen_at) < julianday(lcm_observed_work_items.first_seen_at)
+          WHEN excluded.first_seen_at < lcm_observed_work_items.first_seen_at
             THEN excluded.first_seen_at
           ELSE lcm_observed_work_items.first_seen_at
         END,
         last_seen_at = CASE
-          WHEN julianday(excluded.last_seen_at) > julianday(lcm_observed_work_items.last_seen_at)
+          WHEN excluded.last_seen_at > lcm_observed_work_items.last_seen_at
             THEN excluded.last_seen_at
           ELSE lcm_observed_work_items.last_seen_at
         END,
         completed_at = CASE
           WHEN lcm_observed_work_items.completed_at IS NULL THEN excluded.completed_at
           WHEN excluded.completed_at IS NULL THEN lcm_observed_work_items.completed_at
-          WHEN julianday(excluded.completed_at) < julianday(lcm_observed_work_items.completed_at)
+          WHEN excluded.completed_at < lcm_observed_work_items.completed_at
             THEN excluded.completed_at
           ELSE lcm_observed_work_items.completed_at
         END,
