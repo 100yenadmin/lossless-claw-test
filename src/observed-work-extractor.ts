@@ -115,6 +115,10 @@ const RESOLUTION_STOPWORDS = new Set([
   "work",
 ]);
 
+// Monotonic counter for SAVEPOINT identifiers. Avoids interpolating row ids
+// (or any external value) into SQL identifiers and isolates nested savepoints.
+let summarySavepointCounter = 0;
+
 function hashId(prefix: string, value: string): string {
   return `${prefix}_${createHash("sha256").update(value).digest("hex").slice(0, 24)}`;
 }
@@ -688,8 +692,11 @@ export class ObservedWorkExtractor {
     return row?.summary_rowid;
   }
 
-  private withSummarySavepoint<T>(summaryRowid: number, fn: () => T): T {
-    const savepoint = `lcm_observed_work_summary_${Math.max(0, Math.trunc(summaryRowid))}`;
+  private withSummarySavepoint<T>(_summaryRowid: number, fn: () => T): T {
+    // Use a monotonic counter rather than interpolating a row id from the DB.
+    // Even though the input is integer-typed, keeping user/row data out of SQL
+    // identifiers is a robustness win against future schema changes.
+    const savepoint = `lcm_observed_work_${++summarySavepointCounter}`;
     this.db.exec(`SAVEPOINT ${savepoint}`);
     try {
       const result = fn();

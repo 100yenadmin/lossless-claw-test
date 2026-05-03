@@ -1523,4 +1523,91 @@ describe("ObservedWorkStore", () => {
     expect(details.accounting.itemsReturned).toBeLessThan(20);
     expect(details.accounting.estimatedOutputTokens).toBeLessThanOrEqual(256);
   });
+
+  it("upserts the same (conversation, kind, queryKey) without ordinal collisions", () => {
+    // Regression for race in upsertEpisodeFromObservation: prior to wrapping
+    // upsertObservation in a transaction, two ingests targeting the same
+    // (conversationId, eventKind, queryKey) computed MAX(ordinal)+1 against an
+    // intermediate state and could collide. The INSERT OR IGNORE meant the loser
+    // silently dropped its link, leaving observation_count out of sync. With the
+    // wrapping transaction, sequential ingests must produce strictly increasing,
+    // unique ordinals and a consistent observation_count.
+    const db = makeDb();
+    createConversation(db, 21);
+    const events = new EventObservationStore(db);
+
+    for (let i = 0; i < 10; i++) {
+      events.upsertObservation({
+        eventId: `evt_race_${i}`,
+        conversationId: 21,
+        eventKind: "primary",
+        title: `Hot episode observation ${i}`,
+        queryKey: "shared-topic",
+        ingestTime: `2026-04-28T07:00:0${i}.000Z`,
+        confidence: 0.5,
+        rationale: "Pumping observations into the same episode bucket.",
+        sourceType: "summary",
+        sourceId: `sum_race_${i}`,
+      });
+    }
+
+    const ordinals = (
+      db.prepare(
+        `SELECT link.ordinal AS ordinal
+         FROM lcm_event_episode_observations link
+         JOIN lcm_event_observations eo ON eo.event_id = link.event_id
+         WHERE eo.conversation_id = ? AND eo.event_kind = 'primary'
+                AND eo.query_key = 'shared-topic'
+         ORDER BY link.ordinal ASC`,
+      ).all(21) as Array<{ ordinal: number }>
+    ).map((row) => row.ordinal);
+    expect(ordinals).toHaveLength(10);
+    expect(new Set(ordinals).size).toBe(10);
+
+    const episode = db.prepare(
+      `SELECT observation_count FROM lcm_event_episodes
+       WHERE conversation_id = ? AND episode_kind = 'primary'
+              AND topic_key = 'shared-topic'`,
+    ).get(21) as { observation_count: number };
+    expect(episode.observation_count).toBe(10);
+  });
+
+  it("caps the persisted source_ids JSON blob on write for hot episodes", () => {
+    // Regression for unbounded source_ids growth: rebuildEpisode must trim the
+    // persisted JSON to MAX_PERSISTED_EPISODE_SOURCES (40) regardless of how
+    // many observations land in the episode, so memory + write amplification
+    // stay O(1) per upsert instead of O(N) over the episode lifetime.
+    const db = makeDb();
+    createConversation(db, 22);
+    const events = new EventObservationStore(db);
+
+    for (let i = 0; i < 100; i++) {
+      events.upsertObservation({
+        eventId: `evt_blob_${i}`,
+        conversationId: 22,
+        eventKind: "primary",
+        title: `Blob cap observation ${i}`,
+        queryKey: "blob-topic",
+        ingestTime: `2026-04-28T07:00:00.${String(i).padStart(3, "0")}Z`,
+        confidence: 0.5,
+        rationale: "Stress the source_ids JSON blob with many sources.",
+        sourceType: "summary",
+        sourceId: `sum_blob_${i}`,
+      });
+    }
+
+    const row = db.prepare(
+      `SELECT source_ids, observation_count FROM lcm_event_episodes
+       WHERE conversation_id = ? AND episode_kind = 'primary'
+              AND topic_key = 'blob-topic'`,
+    ).get(22) as { source_ids: string; observation_count: number };
+    expect(row.observation_count).toBe(100);
+    const parsed = JSON.parse(row.source_ids) as unknown[];
+    expect(parsed.length).toBeLessThanOrEqual(40);
+    // The cap should still hold the most recent sources (we walk newest-first).
+    const ids = parsed
+      .map((s) => (typeof s === "object" && s != null && "sourceId" in s ? (s as { sourceId: string }).sourceId : null))
+      .filter((id): id is string => id != null);
+    expect(ids).toContain("sum_blob_99");
+  });
 });
