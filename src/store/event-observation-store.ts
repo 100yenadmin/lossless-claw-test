@@ -184,6 +184,13 @@ export class EventObservationStore {
     // link rows with stale observation_count. Use BEGIN IMMEDIATE when not
     // already in a transaction (e.g. direct store callers); use a SAVEPOINT
     // when nested inside withSummarySavepoint (extractor path).
+    //
+    // Load-bearing: db.isTransaction is the node:sqlite (Node 22.10+) flag that
+    // flips true after BEGIN/SAVEPOINT and false after COMMIT/ROLLBACK. Verified
+    // present on this runtime; if it ever returns undefined here, the nested
+    // detection silently breaks and BEGIN IMMEDIATE will throw "cannot start a
+    // transaction within a transaction" under withSummarySavepoint. Do not
+    // remove or rename without an equivalent guard.
     const nested = this.db.isTransaction;
     const savepoint = nested ? `lcm_upsert_obs_${++upsertObservationCounter}` : null;
     if (nested) {
@@ -381,54 +388,92 @@ export class EventObservationStore {
   }
 
   private rebuildEpisode(episodeId: string): void {
-    const rows = this.db.prepare(
+    // O(1) aggregate: COUNT, MIN/MAX time, MAX confidence — no row scan into JS.
+    const aggregate = this.db.prepare(
       `SELECT
-         eo.event_id,
-         eo.conversation_id,
-         eo.event_kind,
-         eo.title,
-         eo.query_key,
-         eo.event_time,
-         eo.ingest_time,
-         eo.confidence,
-         eo.source_type,
-         eo.source_ids
+         COUNT(*) AS count,
+         MAX(eo.confidence) AS max_confidence
        FROM lcm_event_episode_observations link
        JOIN lcm_event_observations eo ON eo.event_id = link.event_id
-       WHERE link.episode_id = ?
-       ORDER BY
-         julianday(coalesce(eo.event_time, eo.ingest_time)) ASC,
-         link.ordinal ASC,
-         eo.event_id ASC`,
-    ).all(episodeId) as Array<{
-      event_id: string;
-      conversation_id: number;
-      event_kind: EventObservationKind;
-      title: string;
-      query_key: string | null;
-      event_time: string | null;
-      ingest_time: string;
-      confidence: number;
-      source_type: "summary" | "rollup" | "message";
-      source_ids: string;
-    }>;
-    if (rows.length === 0) {
+       WHERE link.episode_id = ?`,
+    ).get(episodeId) as { count: number; max_confidence: number | null };
+    if (aggregate.count === 0) {
       this.db.prepare(
         `DELETE FROM lcm_event_episodes
          WHERE episode_id = ?`,
       ).run(episodeId);
       return;
     }
-    const first = rows[0]!;
-    const last = rows[rows.length - 1]!;
-    // Walk rows newest-first and stop once we have enough unique sources, then
-    // reverse to restore chronological order. This bounds the JSON blob written
-    // to source_ids regardless of how many observations the episode accumulates,
+    // Chronologically first row: drives episode-level metadata (conversation,
+    // kind, query_key, title) and first_event_time. Single LIMIT 1, not O(N).
+    const first = this.db.prepare(
+      `SELECT
+         eo.conversation_id,
+         eo.event_kind,
+         eo.title,
+         eo.query_key,
+         eo.event_time,
+         eo.ingest_time
+       FROM lcm_event_episode_observations link
+       JOIN lcm_event_observations eo ON eo.event_id = link.event_id
+       WHERE link.episode_id = ?
+       ORDER BY
+         julianday(coalesce(eo.event_time, eo.ingest_time)) ASC,
+         link.ordinal ASC,
+         eo.event_id ASC
+       LIMIT 1`,
+    ).get(episodeId) as {
+      conversation_id: number;
+      event_kind: EventObservationKind;
+      title: string;
+      query_key: string | null;
+      event_time: string | null;
+      ingest_time: string;
+    };
+    // Chronologically last row: only needs the time pair for last_event_time.
+    const last = this.db.prepare(
+      `SELECT
+         eo.event_time,
+         eo.ingest_time
+       FROM lcm_event_episode_observations link
+       JOIN lcm_event_observations eo ON eo.event_id = link.event_id
+       WHERE link.episode_id = ?
+       ORDER BY
+         julianday(coalesce(eo.event_time, eo.ingest_time)) DESC,
+         link.ordinal DESC,
+         eo.event_id DESC
+       LIMIT 1`,
+    ).get(episodeId) as {
+      event_time: string | null;
+      ingest_time: string;
+    };
+    // Newest-first slice for source_ids JSON. Each observation's source_ids
+    // blob is itself capped (cap on write at upsertEpisodeFromObservation), so
+    // pulling MAX_PERSISTED_EPISODE_SOURCES rows is enough to fill the dedup'd
+    // output cap. Keeps rebuild cost O(MAX_PERSISTED_EPISODE_SOURCES), not O(N).
+    const sourceRows = this.db.prepare(
+      `SELECT
+         eo.source_type,
+         eo.source_ids
+       FROM lcm_event_episode_observations link
+       JOIN lcm_event_observations eo ON eo.event_id = link.event_id
+       WHERE link.episode_id = ?
+       ORDER BY
+         julianday(coalesce(eo.event_time, eo.ingest_time)) DESC,
+         link.ordinal DESC,
+         eo.event_id DESC
+       LIMIT ?`,
+    ).all(episodeId, MAX_PERSISTED_EPISODE_SOURCES) as Array<{
+      source_type: "summary" | "rollup" | "message";
+      source_ids: string;
+    }>;
+    // Walk newest-first and stop once we have enough unique sources, then
+    // reverse to restore chronological order. Bounds the JSON blob written to
+    // source_ids regardless of how many observations the episode accumulates,
     // avoiding O(N) memory + write amplification on hot episodes.
     const sourcesNewestFirst: EventSource[] = [];
     const sourceSeen = new Set<string>();
-    for (let i = rows.length - 1; i >= 0; i--) {
-      const row = rows[i]!;
+    for (const row of sourceRows) {
       for (const source of parseSources(row.source_ids, row.source_type)) {
         const key = `${source.sourceType ?? ""}:${source.sourceId}`;
         if (sourceSeen.has(key)) {
@@ -445,7 +490,7 @@ export class EventObservationStore {
       }
     }
     const sources = sourcesNewestFirst.reverse();
-    const confidence = Math.max(...rows.map((row) => row.confidence));
+    const confidence = aggregate.max_confidence ?? 0;
     this.db.prepare(
       `UPDATE lcm_event_episodes
        SET conversation_id = ?,
@@ -466,7 +511,7 @@ export class EventObservationStore {
       first.title,
       first.event_time ?? first.ingest_time,
       last.event_time ?? last.ingest_time,
-      rows.length,
+      aggregate.count,
       confidence,
       JSON.stringify(sources),
       episodeId,
