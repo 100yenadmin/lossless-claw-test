@@ -70,11 +70,11 @@ describe("TaskBridgeSuggestionStore", () => {
     expect(row?.name).toBe("lcm_task_bridge_suggestions");
   });
 
-  it("stores suggestions as pending records without applying task writes", () => {
+  it("stores suggestions as pending records without applying task writes", async () => {
     const db = makeDb();
     createObservedWorkItem(db, "work_1", ["sum_a", "sum_b"]);
     const store = new TaskBridgeSuggestionStore(db);
-    expect(store.upsertSuggestion({
+    expect(await store.upsertSuggestion({
       suggestionId: "sug_1",
       workItemId: "work_1",
       suggestionKind: "create_task",
@@ -82,7 +82,7 @@ describe("TaskBridgeSuggestionStore", () => {
       rationale: "Observed repeated unfinished blocker evidence.",
       sourceIds: ["sum_a", "sum_b", "sum_a", ""],
     })).toBe("inserted");
-    expect(store.upsertSuggestion({
+    expect(await store.upsertSuggestion({
       suggestionId: "sug_1",
       workItemId: "work_1",
       suggestionKind: "create_task",
@@ -107,11 +107,11 @@ describe("TaskBridgeSuggestionStore", () => {
     ).toBeUndefined();
   });
 
-  it("records review status without modifying external task state", () => {
+  it("records review status without modifying external task state", async () => {
     const db = makeDb();
     createObservedWorkItem(db, "work_2", ["sum_done", "sum_done_later"]);
     const store = new TaskBridgeSuggestionStore(db);
-    expect(store.upsertSuggestion({
+    expect(await store.upsertSuggestion({
       suggestionId: "sug_2",
       workItemId: "work_2",
       taskId: "task_123",
@@ -156,7 +156,7 @@ describe("TaskBridgeSuggestionStore", () => {
       evidenceKind: "created",
     });
 
-    expect(store.upsertSuggestion({
+    expect(await store.upsertSuggestion({
       suggestionId: "sug_2",
       workItemId: "work_2b",
       suggestionKind: "create_task",
@@ -197,12 +197,12 @@ describe("TaskBridgeSuggestionStore", () => {
     });
   });
 
-  it("orders refreshed pending suggestions by updated time", () => {
+  it("orders refreshed pending suggestions by updated time", async () => {
     const db = makeDb();
     createObservedWorkItem(db, "work_order", ["sum_order"]);
     const store = new TaskBridgeSuggestionStore(db);
 
-    expect(store.upsertSuggestion({
+    expect(await store.upsertSuggestion({
       suggestionId: "sug_old",
       workItemId: "work_order",
       suggestionKind: "create_task",
@@ -210,7 +210,7 @@ describe("TaskBridgeSuggestionStore", () => {
       rationale: "Older suggestion.",
       sourceIds: ["sum_order"],
     })).toBe("inserted");
-    expect(store.upsertSuggestion({
+    expect(await store.upsertSuggestion({
       suggestionId: "sug_refreshed",
       workItemId: "work_order",
       suggestionKind: "create_task",
@@ -233,12 +233,12 @@ describe("TaskBridgeSuggestionStore", () => {
       .toEqual(["sug_refreshed", "sug_old"]);
   });
 
-  it("rejects invalid suggestion records and reports missing review targets", () => {
+  it("rejects invalid suggestion records and reports missing review targets", async () => {
     const db = makeDb();
     createObservedWorkItem(db, "work_3", ["sum_bad"]);
     const store = new TaskBridgeSuggestionStore(db);
 
-    expect(() =>
+    await expect(
       store.upsertSuggestion({
         suggestionId: "bad_confidence",
         workItemId: "work_3",
@@ -247,8 +247,8 @@ describe("TaskBridgeSuggestionStore", () => {
         rationale: "too confident",
         sourceIds: ["sum_bad"],
       })
-    ).toThrow(/confidence/);
-    expect(() =>
+    ).rejects.toThrow(/confidence/);
+    await expect(
       store.upsertSuggestion({
         suggestionId: "bad_sources",
         workItemId: "work_3",
@@ -257,8 +257,8 @@ describe("TaskBridgeSuggestionStore", () => {
         rationale: "missing sources",
         sourceIds: [],
       })
-    ).toThrow(/source ID/);
-    expect(() =>
+    ).rejects.toThrow(/source ID/);
+    await expect(
       store.upsertSuggestion({
         suggestionId: " ",
         workItemId: "work_3",
@@ -267,8 +267,8 @@ describe("TaskBridgeSuggestionStore", () => {
         rationale: "blank suggestion ID",
         sourceIds: ["sum_bad"],
       })
-    ).toThrow(/suggestionId/);
-    expect(() =>
+    ).rejects.toThrow(/suggestionId/);
+    await expect(
       store.upsertSuggestion({
         suggestionId: "bad_work_item",
         workItemId: " ",
@@ -277,8 +277,8 @@ describe("TaskBridgeSuggestionStore", () => {
         rationale: "blank work item ID",
         sourceIds: ["sum_bad"],
       })
-    ).toThrow(/workItemId/);
-    expect(() =>
+    ).rejects.toThrow(/workItemId/);
+    await expect(
       store.upsertSuggestion({
         suggestionId: "missing_work",
         workItemId: "missing_work_item",
@@ -287,8 +287,8 @@ describe("TaskBridgeSuggestionStore", () => {
         rationale: "missing FK target",
         sourceIds: ["sum_bad"],
       })
-    ).toThrow();
-    expect(() =>
+    ).rejects.toThrow();
+    await expect(
       store.upsertSuggestion({
         suggestionId: "missing_source",
         workItemId: "work_3",
@@ -297,8 +297,8 @@ describe("TaskBridgeSuggestionStore", () => {
         rationale: "missing observed source",
         sourceIds: ["missing_source"],
       })
-    ).toThrow(/source IDs/);
-    expect(() =>
+    ).rejects.toThrow(/source IDs/);
+    await expect(
       store.upsertSuggestion({
         suggestionId: "reviewed_on_upsert",
         workItemId: "work_3",
@@ -308,8 +308,8 @@ describe("TaskBridgeSuggestionStore", () => {
         rationale: "review state attempted on upsert",
         sourceIds: ["sum_bad"],
       })
-    ).toThrow(/reviewSuggestion/);
-    expect(() =>
+    ).rejects.toThrow(/reviewSuggestion/);
+    await expect(
       store.upsertSuggestion({
         suggestionId: "missing_task_id",
         workItemId: "work_3",
@@ -318,7 +318,7 @@ describe("TaskBridgeSuggestionStore", () => {
         rationale: "targeted task action without task target",
         sourceIds: ["sum_bad"],
       })
-    ).toThrow(/taskId/);
+    ).rejects.toThrow(/taskId/);
     expect(
       store.reviewSuggestion({
         suggestionId: "missing",

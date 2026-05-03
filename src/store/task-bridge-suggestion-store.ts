@@ -1,4 +1,5 @@
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
+import { withDatabaseTransaction } from "../transaction-mutex.js";
 
 export type TaskBridgeSuggestionKind =
   | "create_task"
@@ -150,7 +151,9 @@ export class TaskBridgeSuggestionStore {
     }
   }
 
-  upsertSuggestion(input: TaskBridgeSuggestionInput): TaskBridgeSuggestionUpsertResult {
+  async upsertSuggestion(
+    input: TaskBridgeSuggestionInput,
+  ): Promise<TaskBridgeSuggestionUpsertResult> {
     const suggestionId = input.suggestionId.trim();
     if (suggestionId.length === 0) {
       throw new Error("suggestionId is required.");
@@ -182,13 +185,14 @@ export class TaskBridgeSuggestionStore {
     // Wrap the read-then-write (status check + INSERT … ON CONFLICT DO UPDATE)
     // in a single transaction. Without it, two concurrent upserts can both
     // observe `existingStatus === undefined`, both report "inserted", and
-    // race on the conflict resolution. BEGIN IMMEDIATE serializes writers.
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
+    // race on the conflict resolution. Route through `withDatabaseTransaction`
+    // so we participate in the per-DB async mutex (issue #260) — a raw
+    // BEGIN IMMEDIATE here would throw if a future caller invoked us from
+    // inside an enclosing transaction on the same shared DatabaseSync handle.
+    return withDatabaseTransaction(this.db, "BEGIN IMMEDIATE", () => {
       const existingStatus = this.getSuggestionStatus(suggestionId);
       if (existingStatus && existingStatus !== "pending") {
-        this.db.exec("COMMIT");
-        return "preserved_reviewed";
+        return "preserved_reviewed" as TaskBridgeSuggestionUpsertResult;
       }
       this.assertSourceIdsBelongToWorkItem(workItemId, sourceIds);
       this.db.prepare(
@@ -237,12 +241,8 @@ export class TaskBridgeSuggestionStore {
         JSON.stringify(sourceIds),
         input.createdBy?.trim() || "lcm_observed",
       );
-      this.db.exec("COMMIT");
       return existingStatus === "pending" ? "refreshed" : "inserted";
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   listSuggestions(input?: {
