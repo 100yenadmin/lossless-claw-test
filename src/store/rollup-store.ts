@@ -353,7 +353,7 @@ export class RollupStore {
     rollupId: string,
     sources: RollupSourceInput[]
   ): Promise<void> {
-    await withDatabaseTransaction(this.db, "BEGIN IMMEDIATE", () => {
+    await withDatabaseTransaction(this.db, "BEGIN", () => {
       this.db
         .prepare(`DELETE FROM lcm_rollup_sources WHERE rollup_id = ?`)
         .run(rollupId);
@@ -384,25 +384,6 @@ export class RollupStore {
          ORDER BY ordinal ASC`
       )
       .all(rollupId) as unknown as RollupSourceRow[];
-  }
-
-  /**
-   * Read just the timezone column from lcm_rollup_state for the given
-   * conversation. Returns null if no state row exists yet (brand-new
-   * conversation that has not recorded any state). Read paths should prefer
-   * this over the engine-wide config, so per-conversation timezone is
-   * preserved even if the engine default later changes.
-   */
-  getTimezone(conversationId: number): string | null {
-    const row = this.db
-      .prepare(
-        `SELECT timezone FROM lcm_rollup_state WHERE conversation_id = ?`
-      )
-      .get(conversationId) as { timezone: string } | undefined;
-    if (!row || typeof row.timezone !== "string" || row.timezone.length === 0) {
-      return null;
-    }
-    return row.timezone;
   }
 
   getState(conversationId: number): RollupStateRow | null {

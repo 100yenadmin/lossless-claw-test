@@ -10,6 +10,7 @@ import {
   getUtcDateForZonedLocalTime,
   getUtcDateForZonedMidnight,
   getZonedDayString,
+  startOfWeekDayString,
 } from "../timezone-windows.js";
 import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
@@ -51,16 +52,6 @@ const AUTO_DETAIL_LEVEL_SAFETY_RATIO = 0.2;
  * Compute an auto-picked `detailLevel` for the calling agent based on its
  * remaining context room. Returns null if no usable data is available; the
  * caller then falls back to the static default.
- *
- * Resolution: synchronous registry lookup (`getModelContextWindow`) for the
- * model's contextWindow + LCM telemetry (`last_observed_prompt_token_count`)
- * for last-observed usage. No live RPC paths — Tier 2 (`status`) and Tier 3
- * (`models.list`) were removed because (i) plugin-sdk doesn't expose gateway
- * RPC invocation for them and (ii) the response-shape navigation never
- * matched openclaw's actual StatusSummary, so they never returned non-null.
- * See audit/pr516/INVESTIGATION-design-calls.md Question 1 for the full
- * write-up. Output is a pure function of (telemetry-row, registry-snapshot)
- * — replay-clean by construction.
  */
 function computeAutoDetailLevel(
   db: DatabaseSync,
@@ -109,19 +100,16 @@ const LcmRecentSchema = Type.Object({
       description: "Search all conversations.",
     })
   ),
+  topic: Type.Optional(
+    Type.String({
+      description:
+        "Deterministic case-insensitive content filter applied inside the requested time window. Uses bounded leaf-summary fallback rather than whole-period rollups.",
+    })
+  ),
   includeSources: Type.Optional(
     Type.Boolean({
       description: "Include source summary IDs.",
     })
-  ),
-  mode: Type.Optional(
-    Type.Union(
-      [Type.Literal("summary"), Type.Literal("index")],
-      {
-        description:
-          "Response mode. \"summary\" (default) returns the full rollup content per detailLevel. \"index\" returns a navigation digest — one short bullet per rollup in the window, with builtAt/source IDs — for cheap exploration before drilling in with detailLevel:3 or lcm_expand_query.",
-      },
-    ),
   ),
   maxOutputTokens: Type.Optional(
     Type.Number({
@@ -170,7 +158,7 @@ type RollupRecord = {
   coverageEnd: Date | null;
   summarizerModel: string | null;
   sourceFingerprint: string | null;
-  builtAt: Date | null;
+  builtAt: Date;
   invalidatedAt: Date | null;
   errorText: string | null;
 };
@@ -196,10 +184,6 @@ type RecallBudget = {
   globalMaxOutputTokens: number;
   effectiveOutputTokens: number;
   detailLevel: number;
-  /** The detailLevel value the caller actually passed (pre-clamp). null if omitted. */
-  requestedDetailLevel: number | null;
-  /** Reason `detailLevel` differs from `requestedDetailLevel`, if any. */
-  clampReason: "above-max" | "below-min" | null;
   maxSourceSummaries: number;
 };
 
@@ -262,14 +246,6 @@ function getLcmRollupStore(
     return store;
   }
   throw new Error("LCM rollup database is unavailable.");
-}
-
-function startOfWeekDayString(dayString: string): string {
-  const [year, month, day] = dayString.split("-").map((part) => Number(part));
-  const date = new Date(Date.UTC(year, month - 1, day, 0, 0, 0, 0));
-  const weekday = date.getUTCDay();
-  const mondayOffset = weekday === 0 ? -6 : 1 - weekday;
-  return addDays(dayString, mondayOffset);
 }
 
 function startOfMonthDayString(dayString: string): string {
@@ -408,8 +384,7 @@ function parseBaseDay(
 function resolveWindowPeriod(
   normalized: string,
   timezone: string,
-  today: string,
-  now: Date
+  today: string
 ): PeriodResolution | null {
   const relative =
     /^last\s+(\d+)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes)$/.exec(
@@ -422,7 +397,7 @@ function resolveWindowPeriod(
     if (!Number.isFinite(minutes) || minutes <= 0) {
       return null;
     }
-    const end = now;
+    const end = new Date();
     const start = new Date(end.getTime() - minutes * 60_000);
     return {
       label: `last ${amount}${unit.startsWith("h") ? "h" : "m"}`,
@@ -478,10 +453,11 @@ function resolveWindowPeriod(
   };
 }
 
-function resolvePeriod(period: string, timezone: string, now: Date): PeriodResolution {
+function resolvePeriod(period: string, timezone: string): PeriodResolution {
   const normalized = period.trim().toLowerCase().replace(/\s+/g, " ");
+  const now = new Date();
   const today = getZonedDayString(now, timezone);
-  const windowPeriod = resolveWindowPeriod(normalized, timezone, today, now);
+  const windowPeriod = resolveWindowPeriod(normalized, timezone, today);
   if (windowPeriod) {
     return windowPeriod;
   }
@@ -568,15 +544,25 @@ function formatSourcesLine(
   sourceIds: string[],
   includeSources: boolean
 ): string {
-  // When there's actually nothing to show, "none" is the truth regardless of
-  // includeSources — saying "omitted" would imply hidden source ids exist.
-  if (sourceIds.length === 0) {
-    return "*Sources: none*";
-  }
   if (!includeSources) {
     return "*Sources: omitted*";
   }
+  if (sourceIds.length === 0) {
+    return "*Sources: none*";
+  }
   return `*Sources: ${sourceIds.join(", ")}*`;
+}
+
+function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, (part) => `\\${part}`);
+}
+
+function normalizeTopicFilter(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const normalized = value.trim().replace(/\s+/g, " ");
+  return normalized.length > 0 ? normalized : undefined;
 }
 
 function formatDrilldownHint(
@@ -594,16 +580,7 @@ function formatDrilldownHint(
 }
 
 function resolveRecallBudget(params: Record<string, unknown>): RecallBudget {
-  const requestedDetailLevelRaw =
-    typeof params.detailLevel === "number" && Number.isFinite(params.detailLevel)
-      ? Math.floor(params.detailLevel)
-      : null;
   const detailLevel = clampInt(params.detailLevel, 1, 0, 3);
-  let clampReason: "above-max" | "below-min" | null = null;
-  if (requestedDetailLevelRaw != null) {
-    if (requestedDetailLevelRaw > 3) clampReason = "above-max";
-    else if (requestedDetailLevelRaw < 0) clampReason = "below-min";
-  }
   const requestedFromDetail =
     DETAIL_LEVEL_TOKEN_HINTS.get(detailLevel) ?? DEFAULT_RECENT_OUTPUT_TOKENS;
   const requestedOutputTokens = clampInt(
@@ -624,8 +601,6 @@ function resolveRecallBudget(params: Record<string, unknown>): RecallBudget {
     globalMaxOutputTokens,
     effectiveOutputTokens: Math.min(requestedOutputTokens, globalMaxOutputTokens),
     detailLevel,
-    requestedDetailLevel: requestedDetailLevelRaw,
-    clampReason,
     maxSourceSummaries: clampInt(
       params.maxSourceSummaries,
       maxSourceSummariesDefault,
@@ -707,181 +682,6 @@ function buildAccounting(
   };
 }
 
-/**
- * Find the newest rollup for a given (periodKind, periodKey) across multiple
- * conversation IDs. Used when a session_key spans multiple conversations
- * (eg. after `/new` or `/reset`) — we want lossless coverage by reading the
- * freshest rollup any of those conversations produced for the period.
- *
- * Single-conversation case: pass a one-element array.
- */
-function getRollupAcrossConversations(
-  rollupStore: RollupStore,
-  conversationIds: number[],
-  periodKind: "day" | "week" | "month",
-  periodKey: string,
-  timezone: string,
-): import("../store/rollup-store.js").RollupRow | null {
-  let best: import("../store/rollup-store.js").RollupRow | null = null;
-  for (const cid of conversationIds) {
-    const row = rollupStore.getRollup(cid, periodKind, periodKey, timezone);
-    if (!row) continue;
-    if (
-      !best ||
-      new Date(row.built_at).getTime() > new Date(best.built_at).getTime()
-    ) {
-      best = row;
-    }
-  }
-  return best;
-}
-
-/**
- * List all rollups of a given periodKind across multiple conversations,
- * deduplicating by (periodKind, period_key, timezone) and keeping the row
- * with the newest `built_at`. Used by lcm_recent when crossing /new and
- * /reset boundaries.
- */
-function listRollupsAcrossConversations(
-  rollupStore: RollupStore,
-  conversationIds: number[],
-  periodKind: "day" | "week" | "month",
-  perConvLimit: number,
-): import("../store/rollup-store.js").RollupRow[] {
-  const dedup = new Map<string, import("../store/rollup-store.js").RollupRow>();
-  for (const cid of conversationIds) {
-    const rows = rollupStore.listRollups(cid, periodKind, perConvLimit);
-    for (const row of rows) {
-      const key = `${row.period_kind}|${row.timezone}|${row.period_key}`;
-      const existing = dedup.get(key);
-      if (
-        !existing ||
-        new Date(row.built_at).getTime() >
-          new Date(existing.built_at).getTime()
-      ) {
-        dedup.set(key, row);
-      }
-    }
-  }
-  return Array.from(dedup.values());
-}
-
-/**
- * Render an index/digest view of the rollups in the window. Each rollup gets
- * a header (period_kind/period_key, status, builtAt, source counts) followed
- * by a short digest extracted from its content. Used when caller passes
- * `mode: "index"` — cheaper than full content, useful for navigation before
- * drilling in with `mode: "summary"` and `detailLevel: 3`.
- */
-function extractRollupDigest(
-  content: string,
-  maxChars: number,
-  periodKind?: string,
-): string {
-  // Aggregate (weekly/monthly) rollups embed each daily verbatim, including
-  // each daily's own "## Key Items" section. Matching the first one would
-  // surface the FIRST nested day's bullets and pretend they're the whole
-  // week/month digest — actively misleading. Skip the regex for aggregates
-  // and emit a generic content prefix instead. Also fall back to a generic
-  // prefix when periodKind is unknown but the content includes embedded
-  // "## YYYY-MM-DD" day headers (sibling defensive check).
-  const isAggregate =
-    periodKind === "week" ||
-    periodKind === "month" ||
-    /(?:^|\n)##\s+\d{4}-\d{2}-\d{2}\b/.test(content);
-  if (!isAggregate) {
-    // Prefer the "## Key Items" section if the rollup uses that structure
-    // (current daily rollup format does).
-    const keyItemsMatch = content.match(/##\s+Key Items[\s\S]*?(?=\n##\s|$)/);
-    if (keyItemsMatch) {
-      const section = keyItemsMatch[0].trim();
-      return section.length > maxChars
-        ? section.slice(0, maxChars).trimEnd() + "…"
-        : section;
-    }
-  }
-  const trimmed = content.trim();
-  return trimmed.length > maxChars
-    ? trimmed.slice(0, maxChars).trimEnd() + "…"
-    : trimmed;
-}
-
-function renderRollupsIndex(
-  rollups: RollupRecord[],
-  budget: RecallBudget,
-): {
-  content: string;
-  tokenCount: number;
-  status: "ready" | "stale";
-  sourceSummaryIds: string[];
-  truncated: boolean;
-  lastBuiltAt: Date | null;
-} {
-  if (rollups.length === 0) {
-    return {
-      content: "(no rollups in window)",
-      tokenCount: 0,
-      status: "ready",
-      sourceSummaryIds: [],
-      truncated: false,
-      lastBuiltAt: null,
-    };
-  }
-  const sortedRollups = [...rollups].sort(
-    (a, b) => a.periodStart.getTime() - b.periodStart.getTime(),
-  );
-  // Index entries get a per-rollup digest cap of ~600 chars (~150 tokens),
-  // so for a week's worth of dailies we stay well under typical detailLevel 0/1
-  // budgets (~12-24K tokens).
-  const perRollupDigestMax = 600;
-  const lines: string[] = [];
-  lines.push(
-    `### Rollup index (${sortedRollups.length} period${sortedRollups.length === 1 ? "" : "s"})`,
-  );
-  lines.push("");
-  for (const rollup of sortedRollups) {
-    lines.push(`#### ${rollup.periodKind}/${rollup.periodKey}`);
-    lines.push(
-      `- Status: ${rollup.status} | Built: ${rollup.builtAt ? rollup.builtAt.toISOString() : "(unknown)"}`,
-    );
-    lines.push(
-      `- Sources: ${rollup.sourceMessageCount} msgs, ${rollup.sourceTokenCount} src tokens, ${rollup.sourceSummaryIds.length} summaries`,
-    );
-    lines.push("");
-    lines.push(
-      extractRollupDigest(rollup.content, perRollupDigestMax, rollup.periodKind),
-    );
-    lines.push("");
-  }
-  let content = lines.join("\n");
-  let truncated = false;
-  if (estimateTokens(content) > budget.effectiveOutputTokens) {
-    content = truncateToEstimatedTokens(content, budget.effectiveOutputTokens);
-    truncated = true;
-  }
-  const sourceSummaryIds = [
-    ...new Set(sortedRollups.flatMap((r) => r.sourceSummaryIds)),
-  ];
-  const status: "ready" | "stale" = sortedRollups.every(
-    (r) => r.status === "ready",
-  )
-    ? "ready"
-    : "stale";
-  const builtTimes = sortedRollups
-    .map((r) => r.builtAt?.getTime())
-    .filter((t): t is number => typeof t === "number");
-  const lastBuiltAt =
-    builtTimes.length > 0 ? new Date(Math.max(...builtTimes)) : null;
-  return {
-    content,
-    tokenCount: estimateTokens(content),
-    status,
-    sourceSummaryIds,
-    truncated,
-    lastBuiltAt,
-  };
-}
-
 function combineRollups(rollups: RollupRecord[], budget: RecallBudget): {
   content: string;
   tokenCount: number;
@@ -892,8 +692,6 @@ function combineRollups(rollups: RollupRecord[], budget: RecallBudget): {
   sourceCount: number;
   omittedRollups: number;
   truncated: boolean;
-  /** Latest build timestamp across the retained rollups. null if none retained. */
-  lastBuiltAt: Date | null;
 } {
   let retained = [...rollups];
   let omittedRollups = 0;
@@ -921,13 +719,6 @@ function combineRollups(rollups: RollupRecord[], budget: RecallBudget): {
   const status = retained.every((rollup) => rollup.status === "ready")
     ? "ready"
     : "stale";
-  const retainedBuiltTimes = retained
-    .map((rollup) => rollup.builtAt?.getTime())
-    .filter((t): t is number => typeof t === "number");
-  const lastBuiltAt =
-    retainedBuiltTimes.length > 0
-      ? new Date(Math.max(...retainedBuiltTimes))
-      : null;
   return {
     content,
     tokenCount,
@@ -938,7 +729,6 @@ function combineRollups(rollups: RollupRecord[], budget: RecallBudget): {
     sourceCount: retained.reduce((sum, rollup) => sum + rollup.sourceSummaryIds.length, 0),
     omittedRollups,
     truncated: omittedRollups > 0 || exceededBudget,
-    lastBuiltAt,
   };
 }
 
@@ -1106,18 +896,46 @@ function getRecentSummaryFallback(
   conversationId: number | undefined,
   start: Date,
   end: Date,
-  relatedConversationIds?: ReadonlyArray<number>
+  topic?: string
 ): RecentSummaryFallbackResult {
-  const scope = normalizeConversationScope(conversationId, relatedConversationIds);
-  const placeholders = scope ? scope.map(() => "?").join(", ") : "";
-  const scopeClause =
-    scope == null ? "" : `conversation_id IN (${placeholders}) AND`;
-  const messageScopeClause =
-    scope == null ? "" : `m.conversation_id IN (${placeholders}) AND`;
-  const args: Array<string | number> =
-    scope == null
-      ? [end.toISOString(), start.toISOString()]
-      : [...scope, end.toISOString(), start.toISOString()];
+  const summaryWhere = [
+    "kind = 'leaf'",
+    "julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)",
+    "julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)",
+  ];
+  const summaryArgs: Array<string | number> = [];
+  if (conversationId != null) {
+    summaryWhere.unshift("conversation_id = ?");
+    summaryArgs.push(conversationId);
+  }
+  summaryArgs.push(end.toISOString(), start.toISOString());
+
+  const messageWhere = [
+    "julianday(m.created_at) < julianday(?)",
+    "julianday(m.created_at) >= julianday(?)",
+    `NOT EXISTS (
+      SELECT 1
+      FROM summary_messages sm
+      WHERE sm.message_id = m.message_id
+    )`,
+  ];
+  const messageArgs: Array<string | number> = [];
+  if (conversationId != null) {
+    messageWhere.unshift("m.conversation_id = ?");
+    messageArgs.push(conversationId);
+  }
+  messageArgs.push(end.toISOString(), start.toISOString());
+
+  const normalizedTopic = topic?.trim().toLowerCase();
+  if (normalizedTopic) {
+    const topicPattern = `%${escapeLikePattern(normalizedTopic)}%`;
+    summaryWhere.push("lower(content) LIKE ? ESCAPE '\\'");
+    summaryArgs.push(topicPattern);
+    messageWhere.push("lower(m.content) LIKE ? ESCAPE '\\'");
+    messageArgs.push(topicPattern);
+  }
+  const summaryWhereSql = summaryWhere.join(" AND ");
+  const messageWhereSql = messageWhere.join(" AND ");
 
   const summaryRows = db
     .prepare(
@@ -1130,14 +948,11 @@ function getRecentSummaryFallback(
         strftime('%Y-%m-%dT%H:%M:%fZ', created_at) AS created_at,
         strftime('%Y-%m-%dT%H:%M:%fZ', coalesce(latest_at, earliest_at, created_at)) AS effective_time
        FROM summaries
-       WHERE ${scopeClause}
-         kind = 'leaf'
-         AND julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)
-         AND julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)
-       ORDER BY julianday(coalesce(latest_at, earliest_at, created_at)) DESC, summary_id ASC
+       WHERE ${summaryWhereSql}
+       ORDER BY julianday(coalesce(latest_at, earliest_at, created_at)) DESC
        LIMIT ${FALLBACK_SQL_LIMIT + 1}`
     )
-    .all(...args) as unknown as RecentSummaryFallbackRow[];
+    .all(...summaryArgs) as unknown as RecentSummaryFallbackRow[];
   const messageRows = db
     .prepare(
       `SELECT
@@ -1149,18 +964,11 @@ function getRecentSummaryFallback(
         strftime('%Y-%m-%dT%H:%M:%fZ', m.created_at) AS created_at,
         strftime('%Y-%m-%dT%H:%M:%fZ', m.created_at) AS effective_time
        FROM messages m
-       WHERE ${messageScopeClause}
-         julianday(m.created_at) < julianday(?)
-         AND julianday(m.created_at) >= julianday(?)
-         AND NOT EXISTS (
-           SELECT 1
-           FROM summary_messages sm
-           WHERE sm.message_id = m.message_id
-         )
-       ORDER BY julianday(m.created_at) DESC, m.message_id ASC
+       WHERE ${messageWhereSql}
+       ORDER BY julianday(m.created_at) DESC
        LIMIT ${FALLBACK_SQL_LIMIT + 1}`
     )
-    .all(...args) as unknown as RecentSummaryFallbackRow[];
+    .all(...messageArgs) as unknown as RecentSummaryFallbackRow[];
   const combinedRows = [...summaryRows, ...messageRows].sort(
     (left, right) =>
       new Date(right.effective_time).getTime() -
@@ -1178,25 +986,15 @@ function getRecentSummaryFallback(
                (
                  SELECT COUNT(*)
                  FROM summaries
-                 WHERE ${scopeClause}
-                   kind = 'leaf'
-                   AND julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)
-                   AND julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)
+                 WHERE ${summaryWhereSql}
                ) +
                (
                  SELECT COUNT(*)
                  FROM messages m
-                 WHERE ${messageScopeClause}
-                   julianday(m.created_at) < julianday(?)
-                   AND julianday(m.created_at) >= julianday(?)
-                   AND NOT EXISTS (
-                     SELECT 1
-                     FROM summary_messages sm
-                     WHERE sm.message_id = m.message_id
-                   )
+                 WHERE ${messageWhereSql}
                ) AS count`
           )
-          .get(...args, ...args) as { count: number } | undefined
+          .get(...summaryArgs, ...messageArgs) as { count: number } | undefined
       )?.count ?? combinedRows.length
     : combinedRows.length;
   return {
@@ -1208,48 +1006,17 @@ function getRecentSummaryFallback(
   };
 }
 
-/**
- * Resolve a "scope" of conversation IDs into a normalized list. Callers pass
- * either a single id, undefined (= unscoped, all conversations), or an
- * explicit list (for cross-conversation reads under the same session_key).
- *
- * Returns null when the caller is unscoped, or a non-empty list otherwise.
- * The returned list is deduped to avoid SQL placeholder waste.
- */
-function normalizeConversationScope(
-  conversationId: number | undefined,
-  relatedConversationIds?: ReadonlyArray<number>,
-): number[] | null {
-  if (relatedConversationIds && relatedConversationIds.length > 0) {
-    return [...new Set(relatedConversationIds)];
-  }
-  if (conversationId == null) {
-    return null;
-  }
-  return [conversationId];
-}
-
 function hasFallbackSourceItemsInRange(
   db: DatabaseSync,
   conversationId: number | undefined,
   start: Date,
-  end: Date,
-  relatedConversationIds?: ReadonlyArray<number>
+  end: Date
 ): boolean {
-  const scope = normalizeConversationScope(conversationId, relatedConversationIds);
-  const placeholders = scope ? scope.map(() => "?").join(", ") : "";
-  const summaryScopeClause =
-    scope == null ? "" : `conversation_id IN (${placeholders}) AND`;
-  const messageScopeClause =
-    scope == null ? "" : `m.conversation_id IN (${placeholders}) AND`;
-  const summaryArgs: Array<string | number> =
-    scope == null
+  const scopeClause = conversationId == null ? "" : "conversation_id = ? AND";
+  const args: Array<string | number> =
+    conversationId == null
       ? [end.toISOString(), start.toISOString()]
-      : [...scope, end.toISOString(), start.toISOString()];
-  const messageArgs: Array<string | number> =
-    scope == null
-      ? [end.toISOString(), start.toISOString()]
-      : [...scope, end.toISOString(), start.toISOString()];
+      : [conversationId, end.toISOString(), start.toISOString()];
 
   const row = db
     .prepare(
@@ -1257,7 +1024,7 @@ function hasFallbackSourceItemsInRange(
          EXISTS (
            SELECT 1
            FROM summaries
-           WHERE ${summaryScopeClause}
+           WHERE ${scopeClause}
              kind = 'leaf'
              AND julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)
              AND julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)
@@ -1265,7 +1032,7 @@ function hasFallbackSourceItemsInRange(
          OR EXISTS (
            SELECT 1
            FROM messages m
-           WHERE ${messageScopeClause}
+           WHERE ${conversationId == null ? "" : "m.conversation_id = ? AND"}
              julianday(m.created_at) < julianday(?)
              AND julianday(m.created_at) >= julianday(?)
              AND NOT EXISTS (
@@ -1276,7 +1043,7 @@ function hasFallbackSourceItemsInRange(
          ) AS present
        LIMIT 1`
     )
-    .get(...summaryArgs, ...messageArgs) as { present: 0 | 1 } | undefined;
+    .get(...args, ...args) as { present: 0 | 1 } | undefined;
   return row?.present === 1;
 }
 
@@ -1284,15 +1051,13 @@ function dayHasFallbackSourceItems(
   db: DatabaseSync,
   conversationId: number | undefined,
   dayKey: string,
-  timezone: string,
-  relatedConversationIds?: ReadonlyArray<number>
+  timezone: string
 ): boolean {
   return hasFallbackSourceItemsInRange(
     db,
     conversationId,
     getUtcDateForZonedMidnight(dayKey, timezone),
-    getUtcDateForZonedMidnight(addDays(dayKey, 1), timezone),
-    relatedConversationIds
+    getUtcDateForZonedMidnight(addDays(dayKey, 1), timezone)
   );
 }
 
@@ -1300,9 +1065,6 @@ export const __lcmRecentTestInternals = {
   resolvePeriod,
   getUtcDateForZonedMidnight,
   getUtcDateForZonedLocalTime,
-  extractRollupDigest,
-  formatSourcesLine,
-  getRecentSummaryFallback,
   computeAutoDetailLevel,
 };
 
@@ -1326,17 +1088,11 @@ export function createLcmRecentTool(input: {
         throw new Error("LCM engine is unavailable.");
       }
 
-      // Capture wall-clock once at entry: every "now" observation in this
-      // call uses the same Date instance. Otherwise resolvePeriod and the
-      // currentDayKey check below would each call deps.clock.now() separately
-      // and a request straddling local midnight could see two different days
-      // (RD-FIX-4).
-      const callTime = input.deps.clock.now();
-
       const p = params as Record<string, unknown>;
       const includeSources = p.includeSources === true;
-      const mode: "summary" | "index" = p.mode === "index" ? "index" : "summary";
-      let budget = resolveRecallBudget(p);
+      const topic = normalizeTopicFilter(p.topic);
+      const budget = resolveRecallBudget(p);
+      const timezone = lcm.timezone;
       const conversationScope = await resolveLcmConversationScope({
         lcm,
         deps: input.deps,
@@ -1344,40 +1100,6 @@ export function createLcmRecentTool(input: {
         sessionKey: input.sessionKey,
         params: p,
       });
-      // Read timezone from per-conversation rollup state first, falling back
-      // to the engine-wide default. Persisted state wins so a conversation
-      // recorded in America/Los_Angeles keeps its day-keys even if the
-      // engine default later changes (e.g. operator updates plugin config).
-      const rollupStoreForTz = getLcmRollupStore(lcm, input.rollupStore);
-      const timezone =
-        (conversationScope.conversationId != null
-          ? rollupStoreForTz.getTimezone(conversationScope.conversationId)
-          : null) ?? lcm.timezone;
-
-      // Smart detailLevel auto-pick: when caller didn't specify and we know the
-      // agent's last observed prompt size + model, pick a detailLevel that
-      // fits the agent's remaining context room. Pulls runtime data via the
-      // gateway's `status` RPC (same data /status returns), with `models.list`
-      // and LCM telemetry as graceful fallbacks. Falls through to the static
-      // default (1) if all tiers fail.
-      if (
-        p.detailLevel == null &&
-        conversationScope.conversationId != null
-      ) {
-        const rollupStoreForAuto = getLcmRollupStore(lcm, input.rollupStore);
-        const dbForAuto = rollupStoreForAuto.db;
-        const autoLevel = computeAutoDetailLevel(
-          dbForAuto,
-          conversationScope.conversationId,
-          input.deps.getModelContextWindow,
-        );
-        if (autoLevel != null && autoLevel !== budget.detailLevel) {
-          budget = resolveRecallBudget({ ...p, detailLevel: autoLevel });
-          // Reset requestedDetailLevel + clampReason: caller didn't explicitly
-          // request this level — it was auto-picked.
-          budget = { ...budget, requestedDetailLevel: null, clampReason: null };
-        }
-      }
 
       if (
         !conversationScope.allConversations &&
@@ -1391,7 +1113,7 @@ export function createLcmRecentTool(input: {
 
       let resolution: PeriodResolution;
       try {
-        resolution = resolvePeriod(String(p.period ?? ""), timezone, callTime);
+        resolution = resolvePeriod(String(p.period ?? ""), timezone);
       } catch (error) {
         return jsonResult({
           error: error instanceof Error ? error.message : "Invalid period.",
@@ -1406,7 +1128,8 @@ export function createLcmRecentTool(input: {
           db,
           undefined,
           resolution.start,
-          resolution.end
+          resolution.end,
+          topic
         );
         const rendered = renderFallbackRollupSection(
           resolution.label,
@@ -1426,6 +1149,11 @@ export function createLcmRecentTool(input: {
           )} — ${formatDisplayTime(resolution.end, timezone)}`
         );
         lines.push("**Status:** fallback");
+        if (topic) {
+          lines.push(
+            `**Topic:** deterministic source-summary filter "${topic}"`
+          );
+        }
         lines.push(`**Confidence:** ${confidence}`);
         lines.push(...formatBudgetLines(budget, rendered.accounting));
         lines.push("");
@@ -1435,7 +1163,9 @@ export function createLcmRecentTool(input: {
           );
         } else {
           lines.push(
-            "No pre-built rollup available. Here's what LCM captured for this period:"
+            topic
+              ? "Topic filters use bounded leaf-summary fallback. Here's what matched in this period:"
+              : "No pre-built rollup available. Here's what LCM captured for this period:"
           );
           lines.push("");
           lines.push(rendered.content);
@@ -1454,6 +1184,7 @@ export function createLcmRecentTool(input: {
             confidence,
             budget,
             accounting: rendered.accounting,
+            topic,
             totalMatches: fallback.availableCount,
             tokenCount: response.tokenCount,
             truncated:
@@ -1462,7 +1193,6 @@ export function createLcmRecentTool(input: {
               fallback.sqlTruncated,
             summaryIds: includeSources ? rendered.summaryIds : [],
             sourceIds: includeSources ? rendered.sourceIds : [],
-            lastBuiltAt: null,
           },
         };
       }
@@ -1477,9 +1207,8 @@ export function createLcmRecentTool(input: {
       let usedFallback = false;
       let truncated = false;
       let degradedReason: string | undefined;
-      let lastBuiltAt: Date | null = null;
 
-      const currentDayKey = getZonedDayString(callTime, timezone);
+      const currentDayKey = getZonedDayString(new Date(), timezone);
       const rollupState = rollupStore.getState(conversationId);
       const lastPendingMessageAt =
         rollupState?.pending_rebuild === 1 && rollupState.last_message_at
@@ -1516,89 +1245,40 @@ export function createLcmRecentTool(input: {
       }
 
       if (
+        !topic &&
         resolution.kind &&
         resolution.periodKey &&
         !resolution.window &&
         canUseStoredResolvedRollup
       ) {
-        // Cross-conversation: prefer the freshest rollup across all
-        // conversations under the same session_key (boundary crossing).
-        const conversationIdsForLookup =
-          conversationScope.relatedConversationIds.length > 0
-            ? conversationScope.relatedConversationIds
-            : [conversationId];
-        const rollup = getRollupAcrossConversations(
-          rollupStore,
-          conversationIdsForLookup,
+        const rollup = rollupStore.getRollup(
+          conversationId,
           resolution.kind,
           resolution.periodKey,
-          timezone,
+          timezone
         );
         if (
           rollup &&
           (rollup.status === "ready" || rollup.status === "stale")
         ) {
-          if (mode === "index") {
-            const record: RollupRecord = {
-              rollupId: rollup.rollup_id,
-              conversationId: rollup.conversation_id,
-              periodKind: rollup.period_kind,
-              periodKey: rollup.period_key,
-              periodStart: new Date(rollup.period_start),
-              periodEnd: new Date(rollup.period_end),
-              timezone: rollup.timezone,
-              content: rollup.content,
-              tokenCount: rollup.token_count,
-              sourceSummaryIds: parseJsonStringArray(rollup.source_summary_ids),
-              sourceMessageCount: rollup.source_message_count,
-              sourceTokenCount: rollup.source_token_count,
-              status: rollup.status,
-              coverageStart: rollup.coverage_start ? new Date(rollup.coverage_start) : null,
-              coverageEnd: rollup.coverage_end ? new Date(rollup.coverage_end) : null,
-              summarizerModel: rollup.summarizer_model,
-              sourceFingerprint: rollup.source_fingerprint,
-              builtAt: rollup.built_at ? new Date(rollup.built_at) : null,
-              invalidatedAt: rollup.invalidated_at ? new Date(rollup.invalidated_at) : null,
-              errorText: rollup.error_text,
-            };
-            const indexed = renderRollupsIndex([record], budget);
-            rollupContent = indexed.content;
-            tokenCount = indexed.tokenCount;
-            status = indexed.status;
-            sourceSummaryIds = indexed.sourceSummaryIds;
-            sourceIds = sourceSummaryIds;
-            truncated = truncated || indexed.truncated;
-            lastBuiltAt = indexed.lastBuiltAt;
-          } else {
-            rollupContent = rollup.content;
-            tokenCount = rollup.token_count;
-            status = rollup.status === "ready" ? "ready" : "stale";
-            sourceSummaryIds = parseJsonStringArray(rollup.source_summary_ids);
-            sourceIds = sourceSummaryIds;
-            lastBuiltAt = rollup.built_at ? new Date(rollup.built_at) : null;
-          }
+          rollupContent = rollup.content;
+          tokenCount = rollup.token_count;
+          status = rollup.status === "ready" ? "ready" : "stale";
+          sourceSummaryIds = parseJsonStringArray(rollup.source_summary_ids);
+          sourceIds = sourceSummaryIds;
         } else if (rollup) {
           degradedReason = `Stored ${resolution.kind} rollup is ${rollup.status}${
             rollup.error_text ? `: ${rollup.error_text}` : ""
           }.`;
         }
       } else if (
+        !topic &&
         resolution.kind &&
         !resolution.window &&
         (resolution.kind === "day" || !hasPendingRebuild)
       ) {
-        // Cross-conversation: gather rollups across all conversations under
-        // the same session_key, dedupe by period_key keeping the freshest.
-        const conversationIdsForListing =
-          conversationScope.relatedConversationIds.length > 0
-            ? conversationScope.relatedConversationIds
-            : [conversationId];
-        const rollups = listRollupsAcrossConversations(
-          rollupStore,
-          conversationIdsForListing,
-          resolution.kind,
-          200,
-        )
+        const rollups = rollupStore
+          .listRollups(conversationId, resolution.kind, 200)
           .filter((rollup) => rollup.timezone === timezone)
           .filter(
             (rollup) =>
@@ -1631,7 +1311,7 @@ export function createLcmRecentTool(input: {
               : null,
             summarizerModel: rollup.summarizer_model,
             sourceFingerprint: rollup.source_fingerprint,
-            builtAt: rollup.built_at ? new Date(rollup.built_at) : null,
+            builtAt: new Date(rollup.built_at),
             invalidatedAt: rollup.invalidated_at
               ? new Date(rollup.invalidated_at)
               : null,
@@ -1669,13 +1349,7 @@ export function createLcmRecentTool(input: {
             requiredKeys.every(
               (key) =>
                 usableKeys.has(key) ||
-                !dayHasFallbackSourceItems(
-                  db,
-                  conversationId,
-                  key,
-                  timezone,
-                  conversationScope.relatedConversationIds
-                )
+                !dayHasFallbackSourceItems(db, conversationId, key, timezone)
             ));
         const hasStoredCoverage =
           resolution.kind === "day"
@@ -1692,147 +1366,48 @@ export function createLcmRecentTool(input: {
                   (left, right) =>
                     left.periodStart.getTime() - right.periodStart.getTime()
                 );
-          if (mode === "index") {
-            const indexed = renderRollupsIndex(orderedRollups, budget);
-            const liveDigestSections: string[] = [];
-            const liveSummaryIds: string[] = [];
-            const liveSourceIds: string[] = [];
-            for (const liveDayKey of liveFallbackKeys) {
-              const currentStart = getUtcDateForZonedMidnight(
-                liveDayKey,
-                timezone
-              );
-              const currentEnd = new Date(
-                Math.min(
-                  resolution.end.getTime(),
-                  getUtcDateForZonedMidnight(
-                    addDays(liveDayKey, 1),
-                    timezone
-                  ).getTime()
-                )
-              );
-              const live = renderFallbackRollupSection(
-                liveDayKey,
-                getRecentSummaryFallback(
-                  db,
-                  conversationId,
-                  currentStart,
-                  currentEnd,
-                  conversationScope.relatedConversationIds
-                ),
-                timezone,
-                budget,
-                includeSources
-              );
-              const digest = extractRollupDigest(live.content, 600);
-              const digestSection = [
-                `#### day/${liveDayKey} (live fallback)`,
-                `- Status: fallback | Built: (live)`,
-                `- Sources: ${live.retainedSummaries.length} summaries`,
-                "",
-                digest,
-                "",
-              ].join("\n");
-              liveDigestSections.push(digestSection);
-              liveSummaryIds.push(...live.summaryIds);
-              liveSourceIds.push(...live.sourceIds);
-              usedFallback = true;
-              truncated = truncated || live.accounting.truncated;
-            }
-            // Recompute the index header to reflect the TOTAL number of
-            // emitted entries (stored + live). Pre-fix the header used
-            // `sortedRollups.length` from `renderRollupsIndex` even when N
-            // live entries were appended — operators saw "(3 periods)" but
-            // 5 `####` entries below it.
-            const totalEntries = orderedRollups.length + liveDigestSections.length;
-            const indexHeader = `### Rollup index (${totalEntries} period${totalEntries === 1 ? "" : "s"})`;
-            const baseContent =
-              orderedRollups.length === 0 && liveDigestSections.length > 0
-                ? indexHeader
-                : indexed.content.replace(
-                    /^### Rollup index \([^)]*\)/,
-                    indexHeader,
-                  );
-            let combinedContent = [
-              baseContent,
-              ...liveDigestSections,
-            ]
+          const combined = combineRollups(orderedRollups, budget);
+          truncated = truncated || combined.truncated;
+          const liveSections: string[] = [];
+          const liveSummaryIds: string[] = [];
+          const liveSourceIds: string[] = [];
+          for (const liveDayKey of liveFallbackKeys) {
+            const currentStart = getUtcDateForZonedMidnight(
+              liveDayKey,
+              timezone
+            );
+            const currentEnd = new Date(
+              Math.min(
+                resolution.end.getTime(),
+                getUtcDateForZonedMidnight(
+                  addDays(liveDayKey, 1),
+                  timezone
+                ).getTime()
+              )
+            );
+            const live = renderFallbackRollupSection(
+              liveDayKey,
+              getRecentSummaryFallback(db, conversationId, currentStart, currentEnd),
+              timezone,
+              budget,
+              includeSources
+            );
+            liveSections.push(live.content);
+            liveSummaryIds.push(...live.summaryIds);
+            liveSourceIds.push(...live.sourceIds);
+            usedFallback = true;
+            truncated = truncated || live.accounting.truncated;
+          }
+          rollupContent = combined.content;
+          if (liveSections.length > 0) {
+            rollupContent = [rollupContent, ...liveSections]
               .filter((section) => section.trim().length > 0)
               .join("\n\n");
-            // `indexed.content` was already truncated to effectiveOutputTokens,
-            // but appending live-fallback digest sections AFTER that truncation
-            // can overflow the caller-declared budget. Re-truncate the
-            // combined output as a unit before publishing.
-            if (
-              estimateTokens(combinedContent) > budget.effectiveOutputTokens
-            ) {
-              combinedContent = truncateToEstimatedTokens(
-                combinedContent,
-                budget.effectiveOutputTokens,
-              );
-              truncated = true;
-            }
-            rollupContent = combinedContent;
-            tokenCount = estimateTokens(combinedContent);
-            status =
-              orderedRollups.length === 0 && liveDigestSections.length > 0
-                ? "fallback"
-                : indexed.status;
-            sourceSummaryIds = [...indexed.sourceSummaryIds, ...liveSummaryIds];
-            sourceIds = [...indexed.sourceSummaryIds, ...liveSourceIds];
-            truncated = truncated || indexed.truncated;
-            lastBuiltAt = indexed.lastBuiltAt;
-          } else {
-            const combined = combineRollups(orderedRollups, budget);
-            truncated = truncated || combined.truncated;
-            const liveSections: string[] = [];
-            const liveSummaryIds: string[] = [];
-            const liveSourceIds: string[] = [];
-            for (const liveDayKey of liveFallbackKeys) {
-              const currentStart = getUtcDateForZonedMidnight(
-                liveDayKey,
-                timezone
-              );
-              const currentEnd = new Date(
-                Math.min(
-                  resolution.end.getTime(),
-                  getUtcDateForZonedMidnight(
-                    addDays(liveDayKey, 1),
-                    timezone
-                  ).getTime()
-                )
-              );
-              const live = renderFallbackRollupSection(
-                liveDayKey,
-                getRecentSummaryFallback(
-                  db,
-                  conversationId,
-                  currentStart,
-                  currentEnd,
-                  conversationScope.relatedConversationIds
-                ),
-                timezone,
-                budget,
-                includeSources
-              );
-              liveSections.push(live.content);
-              liveSummaryIds.push(...live.summaryIds);
-              liveSourceIds.push(...live.sourceIds);
-              usedFallback = true;
-              truncated = truncated || live.accounting.truncated;
-            }
-            rollupContent = combined.content;
-            if (liveSections.length > 0) {
-              rollupContent = [rollupContent, ...liveSections]
-                .filter((section) => section.trim().length > 0)
-                .join("\n\n");
-            }
-            tokenCount = estimateTokens(rollupContent);
-            status = orderedRollups.length > 0 ? combined.status : "fallback";
-            sourceSummaryIds = [...combined.sourceSummaryIds, ...liveSummaryIds];
-            sourceIds = [...combined.sourceSummaryIds, ...liveSourceIds];
-            lastBuiltAt = combined.lastBuiltAt;
           }
+          tokenCount = estimateTokens(rollupContent);
+          status = orderedRollups.length > 0 ? combined.status : "fallback";
+          sourceSummaryIds = [...combined.sourceSummaryIds, ...liveSummaryIds];
+          sourceIds = [...combined.sourceSummaryIds, ...liveSourceIds];
         }
       }
 
@@ -1842,7 +1417,7 @@ export function createLcmRecentTool(input: {
           conversationId,
           resolution.start,
           resolution.end,
-          conversationScope.relatedConversationIds
+          topic
         );
         const rendered = renderFallbackRollupSection(
           resolution.label,
@@ -1862,6 +1437,11 @@ export function createLcmRecentTool(input: {
           )} — ${formatDisplayTime(resolution.end, timezone)}`
         );
         lines.push("**Status:** fallback");
+        if (topic) {
+          lines.push(
+            `**Topic:** deterministic source-summary filter "${topic}"`
+          );
+        }
         lines.push(`**Confidence:** ${confidence}`);
         if (degradedReason) {
           lines.push(`**Degraded:** ${degradedReason}`);
@@ -1870,29 +1450,15 @@ export function createLcmRecentTool(input: {
         lines.push("");
         if (fallback.summaries.length === 0) {
           lines.push(
-            "No pre-built rollup available, and LCM captured no leaf summaries or unsummarized raw messages for this period."
+            topic
+              ? "No leaf summaries or unsummarized raw messages matched this topic inside the requested period."
+              : "No pre-built rollup available, and LCM captured no leaf summaries or unsummarized raw messages for this period."
           );
-        } else if (mode === "index") {
-          // mode:"index" must stay digest-style on the global fallback path
-          // too. Mirror the index live-fallback shape: a `### Rollup index`
-          // header plus a single `#### <kind>/<label>` entry whose body is
-          // an extractRollupDigest of the fallback content. Falling through
-          // to the full-content branch would silently violate the caller's
-          // index-mode contract.
-          const digest = extractRollupDigest(rendered.content, 600);
-          lines.push("### Rollup index (1 period)");
-          lines.push("");
-          lines.push(`#### ${resolution.kind ?? "window"}/${resolution.label} (live fallback)`);
-          lines.push(`- Status: fallback | Built: (live)`);
-          lines.push(`- Sources: ${rendered.retainedSummaries.length} summaries`);
-          lines.push("");
-          lines.push(digest);
-          lines.push("");
-          sourceSummaryIds = rendered.summaryIds;
-          sourceIds = rendered.sourceIds;
         } else {
           lines.push(
-            "No pre-built rollup available. Here's what LCM captured for this period:"
+            topic
+              ? "Topic filters use bounded leaf-summary fallback. Here's what matched in this period:"
+              : "No pre-built rollup available. Here's what LCM captured for this period:"
           );
           lines.push("");
           lines.push(rendered.content);
@@ -1914,6 +1480,7 @@ export function createLcmRecentTool(input: {
             confidence,
             budget,
             accounting: rendered.accounting,
+            topic,
             totalMatches: fallback.availableCount,
             tokenCount: response.tokenCount,
             truncated:
@@ -1922,10 +1489,6 @@ export function createLcmRecentTool(input: {
               fallback.sqlTruncated,
             summaryIds: includeSources ? sourceSummaryIds : [],
             sourceIds: includeSources ? sourceIds : [],
-            detailLevel: budget.detailLevel,
-            requestedDetailLevel: budget.requestedDetailLevel,
-            clampReason: budget.clampReason,
-            lastBuiltAt: null,
           },
         };
       }
@@ -1939,6 +1502,9 @@ export function createLcmRecentTool(input: {
         )} — ${formatDisplayTime(resolution.end, timezone)}`
       );
       lines.push(`**Status:** ${status}`);
+      if (topic) {
+        lines.push(`**Topic:** deterministic source-summary filter "${topic}"`);
+      }
       if (degradedReason) {
         lines.push(`**Degraded:** ${degradedReason}`);
       }
@@ -1961,14 +1527,11 @@ export function createLcmRecentTool(input: {
           status,
           usedFallback,
           degradedReason,
+          topic,
           tokenCount: response.tokenCount,
           truncated: response.truncated || truncated,
           summaryIds: includeSources ? sourceSummaryIds : [],
           sourceIds: includeSources ? sourceIds : [],
-          detailLevel: budget.detailLevel,
-          requestedDetailLevel: budget.requestedDetailLevel,
-          clampReason: budget.clampReason,
-          lastBuiltAt: lastBuiltAt ? lastBuiltAt.toISOString() : null,
         },
       };
     },

@@ -7,57 +7,6 @@ type MigrationLogger = {
   info?: (message: string) => void;
 };
 
-type SummaryColumnInfo = {
-  name?: string;
-};
-
-type SummaryDepthRow = {
-  summary_id: string;
-  conversation_id: number;
-  kind: "leaf" | "condensed";
-  depth: number;
-  token_count: number;
-  created_at: string;
-};
-
-type SummaryMessageTimeRangeRow = {
-  summary_id: string;
-  earliest_at: string | null;
-  latest_at: string | null;
-  source_message_token_count: number | null;
-};
-
-type SummaryParentEdgeRow = {
-  summary_id: string;
-  parent_summary_id: string;
-};
-
-type TableNameRow = {
-  name?: string;
-};
-
-type MessageIdentityBackfillRow = {
-  message_id: number;
-  role: string;
-  content: string;
-};
-
-type FtsTableSpec = {
-  tableName: string;
-  createSql: string;
-  seedSql: string;
-  expectedColumns: string[];
-  staleSchemaPatterns?: string[];
-};
-
-const VERSIONED_BACKFILL_STEPS = {
-  backfillSummaryDepths: 1,
-  backfillSummaryMetadata: 1,
-  backfillToolCallColumns: 1,
-} as const;
-
-type VersionedBackfillStepName = keyof typeof VERSIONED_BACKFILL_STEPS;
-
 /**
  * Initial schema statements — exec'd one at a time inside the BEGIN EXCLUSIVE
  * wrapper in `runLcmMigrations` so a SQL error throws instead of silently
@@ -223,15 +172,13 @@ const LCM_INITIAL_SCHEMA_STATEMENTS: readonly string[] = [
     completed_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (step_name, algorithm_version)
   )`,
-  // Indexes — each created individually so a single index failure can't take
-  // out the rest.  Note: messages.UNIQUE(conversation_id, seq) and
-  // context_items.PRIMARY KEY (conversation_id, ordinal) already create
-  // implicit indexes on those columns; we don't add explicit ones for them.
+  `CREATE INDEX IF NOT EXISTS messages_conv_seq_idx ON messages (conversation_id, seq)`,
   `CREATE INDEX IF NOT EXISTS summaries_conv_created_idx ON summaries (conversation_id, created_at)`,
   `CREATE INDEX IF NOT EXISTS summary_messages_message_idx ON summary_messages (message_id)`,
   `CREATE INDEX IF NOT EXISTS summary_parents_parent_summary_idx ON summary_parents (parent_summary_id)`,
   `CREATE INDEX IF NOT EXISTS message_parts_message_idx ON message_parts (message_id)`,
   `CREATE INDEX IF NOT EXISTS message_parts_type_idx ON message_parts (part_type)`,
+  `CREATE INDEX IF NOT EXISTS context_items_conv_idx ON context_items (conversation_id, ordinal)`,
   `CREATE INDEX IF NOT EXISTS large_files_conv_idx ON large_files (conversation_id, created_at)`,
   `CREATE INDEX IF NOT EXISTS bootstrap_state_path_idx
     ON conversation_bootstrap_state (session_file_path, updated_at)`,
@@ -239,8 +186,117 @@ const LCM_INITIAL_SCHEMA_STATEMENTS: readonly string[] = [
     ON conversation_compaction_telemetry (cache_state, updated_at)`,
 ];
 
+type TableColumnInfo = {
+  name?: string;
+};
+
+type SummaryDepthRow = {
+  summary_id: string;
+  conversation_id: number;
+  kind: "leaf" | "condensed";
+  depth: number;
+  token_count: number;
+  created_at: string;
+};
+
+type SummaryMessageTimeRangeRow = {
+  summary_id: string;
+  earliest_at: string | null;
+  latest_at: string | null;
+  source_message_token_count: number | null;
+};
+
+type SummaryParentEdgeRow = {
+  summary_id: string;
+  parent_summary_id: string;
+};
+
+type TableNameRow = {
+  name?: string;
+};
+
+type MessageIdentityBackfillRow = {
+  message_id: number;
+  role: string;
+  content: string;
+};
+
+type FtsTableSpec = {
+  tableName: string;
+  createSql: string;
+  seedSql: string;
+  expectedColumns: string[];
+  staleSchemaPatterns?: string[];
+};
+
+const VERSIONED_BACKFILL_STEPS = {
+  backfillSummaryDepths: 1,
+  backfillSummaryMetadata: 1,
+  backfillToolCallColumns: 1,
+} as const;
+
+type VersionedBackfillStepName = keyof typeof VERSIONED_BACKFILL_STEPS;
+
+/**
+ * Belt-and-suspenders: recreate `message_parts` (and its indexes) when the
+ * initial bulk schema CREATE silently aborted partway through, leaving the
+ * table missing on disk. See PR #482 / issue #569.
+ */
+function ensureMessagePartsTable(db: DatabaseSync): void {
+  const tables = db
+    .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'message_parts'`)
+    .all() as { name: string }[];
+  if (tables.length > 0) return;
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS message_parts (
+      part_id TEXT PRIMARY KEY,
+      message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      part_type TEXT NOT NULL CHECK (part_type IN (
+        'text', 'reasoning', 'tool', 'patch', 'file',
+        'subtask', 'compaction', 'step_start', 'step_finish',
+        'snapshot', 'agent', 'retry'
+      )),
+      ordinal INTEGER NOT NULL,
+      text_content TEXT,
+      is_ignored INTEGER,
+      is_synthetic INTEGER,
+      tool_call_id TEXT,
+      tool_name TEXT,
+      tool_status TEXT,
+      tool_input TEXT,
+      tool_output TEXT,
+      tool_error TEXT,
+      tool_title TEXT,
+      patch_hash TEXT,
+      patch_files TEXT,
+      file_mime TEXT,
+      file_name TEXT,
+      file_url TEXT,
+      subtask_prompt TEXT,
+      subtask_desc TEXT,
+      subtask_agent TEXT,
+      step_reason TEXT,
+      step_cost REAL,
+      step_tokens_in INTEGER,
+      step_tokens_out INTEGER,
+      snapshot_hash TEXT,
+      compaction_auto INTEGER,
+      metadata TEXT,
+      UNIQUE (message_id, ordinal)
+    )
+  `);
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS message_parts_message_idx ON message_parts (message_id)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS message_parts_type_idx ON message_parts (part_type)`,
+  );
+}
+
 function ensureSummaryDepthColumn(db: DatabaseSync): void {
-  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
+  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as TableColumnInfo[];
   const hasDepth = summaryColumns.some((col) => col.name === "depth");
   if (!hasDepth) {
     db.exec(`ALTER TABLE summaries ADD COLUMN depth INTEGER NOT NULL DEFAULT 0`);
@@ -248,7 +304,7 @@ function ensureSummaryDepthColumn(db: DatabaseSync): void {
 }
 
 function ensureSummaryMetadataColumns(db: DatabaseSync): void {
-  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
+  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as TableColumnInfo[];
   const hasEarliestAt = summaryColumns.some((col) => col.name === "earliest_at");
   const hasLatestAt = summaryColumns.some((col) => col.name === "latest_at");
   const hasDescendantCount = summaryColumns.some((col) => col.name === "descendant_count");
@@ -283,7 +339,7 @@ function isoStringOrNull(value: Date | null): string | null {
 }
 
 function ensureSummaryModelColumn(db: DatabaseSync): void {
-  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
+  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as TableColumnInfo[];
   const hasModel = summaryColumns.some((col) => col.name === "model");
   if (!hasModel) {
     db.exec(`ALTER TABLE summaries ADD COLUMN model TEXT NOT NULL DEFAULT 'unknown'`);
@@ -291,7 +347,7 @@ function ensureSummaryModelColumn(db: DatabaseSync): void {
 }
 
 function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
-  const telemetryColumns = db.prepare(`PRAGMA table_info(conversation_compaction_telemetry)`).all() as SummaryColumnInfo[];
+  const telemetryColumns = db.prepare(`PRAGMA table_info(conversation_compaction_telemetry)`).all() as TableColumnInfo[];
   const hasConsecutiveColdObservations = telemetryColumns.some(
     (col) => col.name === "consecutive_cold_observations",
   );
@@ -349,81 +405,8 @@ function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
   }
 }
 
-/**
- * Belt-and-suspenders guard: create `message_parts` if it does not yet exist.
- *
- * Historically, `message_parts` was defined inside a single bulk `db.exec()`
- * block in `runLcmMigrations`.  On some Node.js SQLite builds (particularly
- * `node:sqlite` before v22.12) a syntax error or constraint-check mismatch
- * anywhere in that block could cause the exec to stop early, silently
- * leaving tables that appeared later in the string uncreated.
- *
- * The split-bulk approach (introduced for #569) now exec's each schema
- * statement individually, so a SQL error on any one statement throws
- * directly instead of silently aborting subsequent statements.  This guard
- * is kept as a defense-in-depth against legacy databases that were
- * upgraded across the silent-abort window — `message_parts` is the highest-
- * impact table because every ingested message that has structured parts
- * INSERTs into it.  This function probes `sqlite_master` directly and
- * creates the table + indexes when absent, matching the pattern used for
- * column guards (`ensureSummaryDepthColumn`,
- * `ensureMessageIdentityHashColumn`, …).
- */
-function ensureMessagePartsTable(db: DatabaseSync): void {
-  const tables = db
-    .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'message_parts'`)
-    .all() as { name: string }[];
-  if (tables.length > 0) return;
-
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS message_parts (
-      part_id TEXT PRIMARY KEY,
-      message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
-      session_id TEXT NOT NULL,
-      part_type TEXT NOT NULL CHECK (part_type IN (
-        'text', 'reasoning', 'tool', 'patch', 'file',
-        'subtask', 'compaction', 'step_start', 'step_finish',
-        'snapshot', 'agent', 'retry'
-      )),
-      ordinal INTEGER NOT NULL,
-      text_content TEXT,
-      is_ignored INTEGER,
-      is_synthetic INTEGER,
-      tool_call_id TEXT,
-      tool_name TEXT,
-      tool_status TEXT,
-      tool_input TEXT,
-      tool_output TEXT,
-      tool_error TEXT,
-      tool_title TEXT,
-      patch_hash TEXT,
-      patch_files TEXT,
-      file_mime TEXT,
-      file_name TEXT,
-      file_url TEXT,
-      subtask_prompt TEXT,
-      subtask_desc TEXT,
-      subtask_agent TEXT,
-      step_reason TEXT,
-      step_cost REAL,
-      step_tokens_in INTEGER,
-      step_tokens_out INTEGER,
-      snapshot_hash TEXT,
-      compaction_auto INTEGER,
-      metadata TEXT,
-      UNIQUE (message_id, ordinal)
-    )
-  `);
-  db.exec(
-    `CREATE INDEX IF NOT EXISTS message_parts_message_idx ON message_parts (message_id)`,
-  );
-  db.exec(
-    `CREATE INDEX IF NOT EXISTS message_parts_type_idx ON message_parts (part_type)`,
-  );
-}
-
 function ensureMessageIdentityHashColumn(db: DatabaseSync): void {
-  const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
+  const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as TableColumnInfo[];
   const hasIdentityHash = messageColumns.some((col) => col.name === "identity_hash");
   if (!hasIdentityHash) {
     db.exec(`ALTER TABLE messages ADD COLUMN identity_hash TEXT`);
@@ -949,7 +932,7 @@ function addColumnIfMissing(
   columnName: string,
   columnDefinition: string,
 ): void {
-  const columns = db.prepare(`PRAGMA table_info(${quoteSqlIdentifier(tableName)})`).all() as SummaryColumnInfo[];
+  const columns = db.prepare(`PRAGMA table_info(${quoteSqlIdentifier(tableName)})`).all() as TableColumnInfo[];
   if (!columns.some((col) => col.name === columnName)) {
     db.exec(
       `ALTER TABLE ${quoteSqlIdentifier(tableName)} ADD COLUMN ${quoteSqlIdentifier(columnName)} ${columnDefinition}`,
@@ -978,7 +961,7 @@ function shouldRecreateStandaloneFtsTable(db: DatabaseSync, spec: FtsTableSpec):
 
     const columns = db
       .prepare(`PRAGMA table_info(${quoteSqlIdentifier(spec.tableName)})`)
-      .all() as SummaryColumnInfo[];
+      .all() as TableColumnInfo[];
     const columnNames = new Set(
       columns
         .map((col) => col.name)
@@ -1015,11 +998,7 @@ export function runLcmMigrations(
   try {
     // Each schema statement is exec'd individually so a SQL error throws on
     // its own. Node's db.exec() can silently abort partway through a
-    // multi-statement block when one statement fails, leaving subsequent
-    // tables/indexes unmade — see PR #482 (ensureMessagePartsTable belt-and-
-    // suspenders) and issue #569. Splitting the bulk exec addresses the root
-    // cause for every table and index in the initial schema. Each statement
-    // is still inside the BEGIN EXCLUSIVE wrapper above (cf. PR #455).
+    // multi-statement block when one statement fails — see PR #482 / #569.
     for (const statement of LCM_INITIAL_SCHEMA_STATEMENTS) {
       db.exec(statement);
     }
@@ -1063,13 +1042,7 @@ export function runLcmMigrations(
       ON conversations (session_id, active, created_at)
     `);
     db.exec(`DROP INDEX IF EXISTS conversations_session_key_idx`);
-    // Drop indexes that shadow implicit ones created by UNIQUE/PRIMARY KEY
-    // constraints — `messages.UNIQUE(conversation_id, seq)` and
-    // `context_items.PRIMARY KEY (conversation_id, ordinal)` both already
-    // produce an index on those exact columns, so the explicit indexes added
-    // by older migrations are pure write/maintenance overhead.
-    db.exec(`DROP INDEX IF EXISTS messages_conv_seq_idx`);
-    db.exec(`DROP INDEX IF EXISTS context_items_conv_idx`);
+    runMigrationStep("ensureMessagePartsTable", log, () => ensureMessagePartsTable(db));
     runMigrationStep("ensureSummaryDepthColumn", log, () => ensureSummaryDepthColumn(db));
     runMigrationStep("ensureSummaryMetadataColumns", log, () =>
       ensureSummaryMetadataColumns(db),
@@ -1078,14 +1051,6 @@ export function runLcmMigrations(
     runMigrationStep("ensureMessageIdentityHashColumn", log, () =>
       ensureMessageIdentityHashColumn(db),
     );
-    // Belt-and-suspenders: defense-in-depth against legacy databases that
-    // were upgraded across the pre-#569 silent-abort window.  The
-    // split-bulk schema loop above now exec's each statement individually
-    // so a SQL error on any new install/upgrade throws directly, but any
-    // existing DB that ran the old bulk path before the split could still
-    // have a missing `message_parts`.  This step is cheap and keeps the
-    // critical-path table always present.
-    runMigrationStep("ensureMessagePartsTable", log, () => ensureMessagePartsTable(db));
     runMigrationStep("backfillMessageIdentityHashes", log, () =>
       backfillMessageIdentityHashes(db, { managesOwnTransaction: false }),
     );
@@ -1215,6 +1180,240 @@ export function runLcmMigrations(
 
         CREATE VIEW IF NOT EXISTS monthly_rollups AS
         SELECT * FROM lcm_rollups WHERE period_kind = 'month';
+      `);
+    });
+
+    runMigrationStep("ensureObservedWorkTables", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_observed_work_items (
+          work_item_id TEXT PRIMARY KEY,
+          conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+          owner_id TEXT,
+          title TEXT NOT NULL,
+          description TEXT,
+          observed_status TEXT NOT NULL CHECK (observed_status IN (
+            'observed_completed',
+            'observed_unfinished',
+            'observed_ambiguous',
+            'decision_recorded',
+            'dismissed'
+          )),
+          kind TEXT NOT NULL CHECK (kind IN (
+            'implementation',
+            'review',
+            'blocker',
+            'decision',
+            'question',
+            'follow_up',
+            'test',
+            'deploy',
+            'research',
+            'other'
+          )),
+          confidence REAL NOT NULL DEFAULT 0.5 CHECK (confidence >= 0 AND confidence <= 1),
+          confidence_band TEXT NOT NULL DEFAULT 'medium' CHECK (confidence_band IN ('low', 'medium', 'medium-high', 'high')),
+          rationale TEXT,
+          topic_key TEXT,
+          first_seen_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL,
+          completed_at TEXT,
+          completion_confidence REAL CHECK (completion_confidence IS NULL OR (completion_confidence >= 0 AND completion_confidence <= 1)),
+          evidence_count INTEGER NOT NULL DEFAULT 0,
+          source_message_count INTEGER NOT NULL DEFAULT 0,
+          source_token_count INTEGER NOT NULL DEFAULT 0,
+          authority_source TEXT NOT NULL DEFAULT 'lcm_observed',
+          sensitivity TEXT,
+          visibility TEXT,
+          fingerprint TEXT NOT NULL,
+          fingerprint_version INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS lcm_observed_work_sources (
+          work_item_id TEXT NOT NULL REFERENCES lcm_observed_work_items(work_item_id) ON DELETE CASCADE,
+          source_type TEXT NOT NULL CHECK (source_type IN ('summary', 'rollup', 'message')),
+          source_id TEXT NOT NULL,
+          ordinal INTEGER NOT NULL,
+          evidence_kind TEXT NOT NULL CHECK (evidence_kind IN (
+            'created',
+            'reinforced',
+            'possible_completion',
+            'completed',
+            'contradicted',
+            'dismissed'
+          )),
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (work_item_id, source_type, source_id, evidence_kind)
+        );
+
+        CREATE TABLE IF NOT EXISTS lcm_observed_work_state (
+          conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+          last_processed_summary_created_at TEXT,
+          last_processed_summary_id TEXT,
+          last_processed_summary_rowid INTEGER,
+          pending_rebuild INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+    });
+
+    runMigrationStep("ensureObservedWorkStateCursorColumns", log, () => {
+      addColumnIfMissing(
+        db,
+        "lcm_observed_work_state",
+        "last_processed_summary_rowid",
+        "INTEGER",
+      );
+    });
+
+    runMigrationStep("ensureObservedWorkIndexes", log, () => {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_status_kind_seen_idx
+          ON lcm_observed_work_items(conversation_id, observed_status, kind, last_seen_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_owner_status_kind_seen_idx
+          ON lcm_observed_work_items(owner_id, observed_status, kind, last_seen_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_topic_status_seen_idx
+          ON lcm_observed_work_items(topic_key, observed_status, last_seen_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_fingerprint_idx
+          ON lcm_observed_work_items(fingerprint);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_sources_source_idx
+          ON lcm_observed_work_sources(source_type, source_id);
+      `);
+    });
+
+    runMigrationStep("ensureObservedWorkTransitionTables", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_observed_work_transitions (
+          transition_id TEXT PRIMARY KEY,
+          work_item_id TEXT NOT NULL REFERENCES lcm_observed_work_items(work_item_id) ON DELETE CASCADE,
+          transition_type TEXT NOT NULL CHECK (transition_type IN (
+            'opened',
+            'reinforced',
+            'possibly_resolved',
+            'resolved',
+            'dismissed',
+            'marked_stale'
+          )),
+          from_status TEXT CHECK (from_status IS NULL OR from_status IN (
+            'observed_completed',
+            'observed_unfinished',
+            'observed_ambiguous',
+            'decision_recorded',
+            'dismissed'
+          )),
+          to_status TEXT CHECK (to_status IS NULL OR to_status IN (
+            'observed_completed',
+            'observed_unfinished',
+            'observed_ambiguous',
+            'decision_recorded',
+            'dismissed'
+          )),
+          observed_at TEXT NOT NULL,
+          confidence REAL NOT NULL DEFAULT 0.5 CHECK (confidence >= 0 AND confidence <= 1),
+          rationale TEXT NOT NULL,
+          source_type TEXT NOT NULL CHECK (source_type IN ('summary', 'rollup', 'message')),
+          source_id TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_transitions_item_time_idx
+          ON lcm_observed_work_transitions(work_item_id, observed_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_transitions_type_time_idx
+          ON lcm_observed_work_transitions(transition_type, observed_at DESC);
+      `);
+    });
+
+    runMigrationStep("ensureTaskBridgeSuggestionTables", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_task_bridge_suggestions (
+          suggestion_id TEXT PRIMARY KEY,
+          work_item_id TEXT NOT NULL REFERENCES lcm_observed_work_items(work_item_id) ON DELETE CASCADE,
+          task_id TEXT,
+          suggestion_kind TEXT NOT NULL CHECK (suggestion_kind IN (
+            'create_task',
+            'link_task',
+            'mark_task_done',
+            'mark_task_blocked',
+            'add_task_evidence'
+          )),
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN (
+            'pending',
+            'accepted',
+            'rejected',
+            'dismissed',
+            'expired'
+          )),
+          confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+          rationale TEXT NOT NULL,
+          source_ids TEXT NOT NULL,
+          created_by TEXT NOT NULL DEFAULT 'lcm_observed',
+          reviewed_by TEXT,
+          reviewed_at TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+    });
+
+    runMigrationStep("ensureTaskBridgeSuggestionIndexes", log, () => {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_status_kind_idx
+          ON lcm_task_bridge_suggestions(status, suggestion_kind, created_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_work_item_idx
+          ON lcm_task_bridge_suggestions(work_item_id, status);
+
+        CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_task_idx
+          ON lcm_task_bridge_suggestions(task_id, status);
+      `);
+    });
+
+    runMigrationStep("ensureEventObservationTables", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_event_observations (
+          event_id TEXT PRIMARY KEY,
+          conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+          event_kind TEXT NOT NULL CHECK (event_kind IN (
+            'primary',
+            'retelling',
+            'memory_injection',
+            'echo',
+            'imported',
+            'operational_incident',
+            'decision'
+          )),
+          title TEXT NOT NULL,
+          description TEXT,
+          query_key TEXT,
+          event_time TEXT,
+          ingest_time TEXT NOT NULL,
+          confidence REAL NOT NULL DEFAULT 0.5 CHECK (confidence >= 0 AND confidence <= 1),
+          rationale TEXT NOT NULL,
+          source_type TEXT NOT NULL CHECK (source_type IN ('summary', 'rollup', 'message')),
+          source_id TEXT NOT NULL,
+          source_ids TEXT NOT NULL DEFAULT '[]',
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+    });
+
+    runMigrationStep("ensureEventObservationIndexes", log, () => {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_event_observations_conversation_kind_time_idx
+          ON lcm_event_observations(conversation_id, event_kind, event_time DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_event_observations_query_time_idx
+          ON lcm_event_observations(query_key, event_time DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_event_observations_source_idx
+          ON lcm_event_observations(source_type, source_id);
       `);
     });
 

@@ -18,14 +18,8 @@ import type {
 export { getLocalDateKey, getLocalDayBounds } from "./timezone-windows.js";
 
 const DEFAULT_DAILY_TARGET_TOKENS = 5_000;
-// Default storage caps follow the user's design math: daily 40K → weekly
-// 140K (≈20K avg per day × 7) → monthly 560K (≈4 weeks × 140K). These are
-// STORAGE caps; the per-call response size is bounded separately by
-// lcm_recent's detailLevel + maxOutputTokens so the agent's prompt stays
-// well under the model's context window.
-const DEFAULT_DAILY_MAX_TOKENS = 40_000;
-const DEFAULT_WEEKLY_MAX_TOKENS = 140_000;
-const DEFAULT_MONTHLY_MAX_TOKENS = 560_000;
+const DEFAULT_DAILY_MAX_TOKENS = 15_000;
+const DEFAULT_AGGREGATE_MAX_TOKENS = 20_000;
 const TIMELINE_SENTENCE_LIMIT = 3;
 const TIMELINE_MAX_CHARS = 500;
 const DAY_PERIOD_KIND = "day";
@@ -36,8 +30,6 @@ export interface RollupBuilderConfig {
   timezone: string;
   dailyTargetTokens?: number;
   dailyMaxTokens?: number;
-  weeklyMaxTokens?: number;
-  monthlyMaxTokens?: number;
 }
 
 export interface BuildResult {
@@ -85,8 +77,6 @@ type RollupDraft = {
 
 export class RollupBuilder {
   private readonly dailyMaxTokens: number;
-  private readonly weeklyMaxTokens: number;
-  private readonly monthlyMaxTokens: number;
 
   constructor(private store: RollupStore, private config: RollupBuilderConfig) {
     const dailyTargetTokens = normalizePositiveInt(
@@ -96,18 +86,6 @@ export class RollupBuilder {
     this.dailyMaxTokens = Math.max(
       dailyTargetTokens,
       normalizePositiveInt(config.dailyMaxTokens, DEFAULT_DAILY_MAX_TOKENS)
-    );
-    // Aggregates embed dailies, so the weekly cap MUST be at least as large
-    // as the daily cap or a single oversized day will fail to fit. Same for
-    // monthly vs weekly. Pre-fix the trim path's `length > 1` exit silently
-    // produced a weekly that exceeded its declared cap.
-    this.weeklyMaxTokens = Math.max(
-      this.dailyMaxTokens,
-      normalizePositiveInt(config.weeklyMaxTokens, DEFAULT_WEEKLY_MAX_TOKENS)
-    );
-    this.monthlyMaxTokens = Math.max(
-      this.weeklyMaxTokens,
-      normalizePositiveInt(config.monthlyMaxTokens, DEFAULT_MONTHLY_MAX_TOKENS)
     );
   }
 
@@ -178,7 +156,7 @@ export class RollupBuilder {
     conversationId: number,
     weekKey: string
   ): Promise<boolean> {
-    const canonicalWeekKey = startOfWeekKey(weekKey, this.config.timezone);
+    const canonicalWeekKey = startOfWeekKey(weekKey);
     if (weekKey !== canonicalWeekKey) {
       throw new Error(
         `Week key must be a Monday calendar week start: ${canonicalWeekKey}`
@@ -233,10 +211,7 @@ export class RollupBuilder {
       }
       const key =
         periodKind === WEEK_PERIOD_KIND
-          ? startOfWeekKey(
-              rollup.period_key,
-              rollup.timezone || this.config.timezone
-            )
+          ? startOfWeekKey(rollup.period_key)
           : rollup.period_key.slice(0, 7);
       keys.add(key);
     }
@@ -277,102 +252,83 @@ export class RollupBuilder {
       )
       .sort((left, right) => left.period_key.localeCompare(right.period_key));
 
-    // The existing-row decision and the upsertRollup/replaceRollupSources
-    // writes must happen atomically — otherwise a concurrent
-    // buildAggregateRollup can swap `existing` between the read and the
-    // write, leaving us with an FK reference to a row another writer
-    // already replaced (chunk A, G — race outside transaction).
-    let result = false;
+    const existing = this.store.getRollup(
+      conversationId,
+      periodKind,
+      periodKey,
+      this.config.timezone
+    );
+    if (sourceRollups.length === 0) {
+      if (existing) {
+        this.store.deleteRollup(existing.rollup_id);
+        return true;
+      }
+      return false;
+    }
+    const expectedDayKeys = getAggregateDayKeys(periodKind, periodKey);
+    const sourceDayKeys = new Set(
+      sourceRollups.map((rollup) => rollup.period_key)
+    );
+    const missingActiveDayKeys = expectedDayKeys.filter((key) => {
+      if (sourceDayKeys.has(key)) {
+        return false;
+      }
+      const dayBounds = getLocalDayBoundsForDateKey(key, this.config.timezone);
+      return this.getLeafSummariesForDay(
+        conversationId,
+        dayBounds.start,
+        dayBounds.end
+      ).some((summary) => summary.kind === "leaf");
+    });
+    if (missingActiveDayKeys.length > 0) {
+      if (existing) {
+        this.store.deleteRollup(existing.rollup_id);
+      }
+      return false;
+    }
+
+    const sourceTokens = sourceRollups.reduce(
+      (sum, rollup) => sum + safeTokenCount(rollup.source_token_count),
+      0
+    );
+    const fingerprint = computeFingerprint(
+      sourceRollups.map((rollup) => ({
+        id: rollup.rollup_id,
+        tokenCount: rollup.source_token_count,
+        content: rollup.content,
+        earliestAt: rollup.coverage_start,
+        latestAt: rollup.coverage_end,
+        sourceCount: rollup.source_message_count,
+        sourceTokenCount: rollup.source_token_count,
+        sourceFingerprint: rollup.source_fingerprint,
+      }))
+    );
+    if (existing?.source_fingerprint === fingerprint && existing.status === "ready") {
+      return false;
+    }
+
+    const draft = buildAggregateRollupContent({
+      periodKind,
+      periodKey,
+      sourceRollups,
+      maxTokens: DEFAULT_AGGREGATE_MAX_TOKENS,
+    });
+    const rollupId =
+      existing?.rollup_id ?? buildRollupId(periodKind, periodKey);
+    const sourceSummaryIds = uniqueStrings(
+      sourceRollups.flatMap((rollup) =>
+        parseJsonStringArray(rollup.source_summary_ids)
+      )
+    );
+    const sourceMessageCount = sourceRollups.reduce(
+      (sum, rollup) => sum + safeTokenCount(rollup.source_message_count),
+      0
+    );
+
     await withDatabaseTransaction(
       this.store.db,
       "BEGIN IMMEDIATE",
       async () => {
-        const existing = this.store.getRollup(
-          conversationId,
-          periodKind,
-          periodKey,
-          this.config.timezone
-        );
-        if (sourceRollups.length === 0) {
-          if (existing) {
-            this.store.deleteRollup(existing.rollup_id);
-            result = true;
-            return;
-          }
-          result = false;
-          return;
-        }
-        const expectedDayKeys = getAggregateDayKeys(periodKind, periodKey);
-        const sourceDayKeys = new Set(
-          sourceRollups.map((rollup) => rollup.period_key)
-        );
-        const missingActiveDayKeys = expectedDayKeys.filter((key) => {
-          if (sourceDayKeys.has(key)) {
-            return false;
-          }
-          const dayBounds = getLocalDayBoundsForDateKey(
-            key,
-            this.config.timezone
-          );
-          return this.getLeafSummariesForDay(
-            conversationId,
-            dayBounds.start,
-            dayBounds.end
-          ).some((summary) => summary.kind === "leaf");
-        });
-        if (missingActiveDayKeys.length > 0) {
-          if (existing) {
-            this.store.deleteRollup(existing.rollup_id);
-          }
-          result = false;
-          return;
-        }
-
-        const sourceTokens = sourceRollups.reduce(
-          (sum, rollup) => sum + safeTokenCount(rollup.source_token_count),
-          0
-        );
-        const fingerprint = computeFingerprint(
-          sourceRollups.map((rollup) => ({
-            id: rollup.rollup_id,
-            tokenCount: rollup.source_token_count,
-            content: rollup.content,
-            earliestAt: rollup.coverage_start,
-            latestAt: rollup.coverage_end,
-            sourceCount: rollup.source_message_count,
-            sourceTokenCount: rollup.source_token_count,
-            sourceFingerprint: rollup.source_fingerprint,
-          }))
-        );
-        if (
-          existing?.source_fingerprint === fingerprint &&
-          existing.status === "ready"
-        ) {
-          result = false;
-          return;
-        }
-
-        const draft = buildAggregateRollupContent({
-          periodKind,
-          periodKey,
-          sourceRollups,
-          maxTokens:
-            periodKind === WEEK_PERIOD_KIND
-              ? this.weeklyMaxTokens
-              : this.monthlyMaxTokens,
-        });
-        const rollupId =
-          existing?.rollup_id ?? buildRollupId(periodKind, periodKey);
-        const sourceSummaryIds = uniqueStrings(
-          sourceRollups.flatMap((rollup) =>
-            parseJsonStringArray(rollup.source_summary_ids)
-          )
-        );
-        const sourceMessageCount = sourceRollups.reduce(
-          (sum, rollup) => sum + safeTokenCount(rollup.source_message_count),
-          0
-        );
-
         this.store.upsertRollup({
           rollup_id: rollupId,
           conversation_id: conversationId,
@@ -407,12 +363,10 @@ export class RollupBuilder {
             ordinal: index,
           }))
         );
-
-        result = true;
       }
     );
 
-    return result;
+    return true;
   }
 
   async buildDailyRollups(
@@ -473,33 +427,18 @@ export class RollupBuilder {
         .sort(compareSummariesChronologically);
       if (leafSummaries.length === 0) {
         try {
-          // R3-FIX-2: read getRollup INSIDE the transaction so a concurrent
-          // rebuild that upserts a fresh rollup at the same slot cannot have
-          // its work destroyed by a stale-empty-snapshot delete from this
-          // racing caller. Mirrors P1-8's pattern in the non-empty branch
-          // (buildAggregateRollup + buildDayRollup).
-          let cleaned = false;
-          await withDatabaseTransaction(
-            this.store.db,
-            "BEGIN IMMEDIATE",
-            async () => {
-              const existing = this.store.getRollup(
-                conversationId,
-                DAY_PERIOD_KIND,
-                dateKey,
-                this.config.timezone
-              );
-              if (existing) {
-                this.store.deleteRollup(existing.rollup_id);
-                cleaned = true;
-              }
-            }
+          const existing = this.store.getRollup(
+            conversationId,
+            DAY_PERIOD_KIND,
+            dateKey,
+            this.config.timezone
           );
-          if (cleaned) {
+          if (existing) {
+            this.store.deleteRollup(existing.rollup_id);
             result.built += 1;
-          } else {
-            result.skipped += 1;
+            continue;
           }
+          result.skipped += 1;
         } catch (error) {
           result.errors.push(
             `${dateKey}: empty-day cleanup failed: ${formatError(error)}`
@@ -556,38 +495,25 @@ export class RollupBuilder {
 
     try {
       const finishedAt = new Date();
-      // P1-3 race fix: re-read latestState / latestSummaryCreatedAt /
-      // latestSummaryFingerprint INSIDE a BEGIN IMMEDIATE transaction so a
-      // concurrent ingest writer that flips pending_rebuild=1 between the
-      // builder's outer read and the post-build write cannot be silently
-      // clobbered. The CAS-style read inside the txn observes the freshest
-      // value the writer committed; if the ingest moved last_message_at
-      // past scannedAt, we re-arm pending_rebuild instead of clearing.
-      await withDatabaseTransaction(
-        this.store.db,
-        "BEGIN IMMEDIATE",
-        async () => {
-          const latestState = this.store.getState(conversationId);
-          const latestSummaryCreatedAt =
-            this.store.getLatestLeafSummaryCreatedAt(conversationId);
-          const latestSummaryFingerprint =
-            this.store.getLeafSummarySweepFingerprint(conversationId);
-          const shouldClearPending =
-            result.errors.length === 0 &&
-            isTimestampAtOrBefore(latestState?.last_message_at, scannedAt) &&
-            isTimestampAtOrBefore(latestSummaryCreatedAt, scannedAt) &&
-            latestSummaryFingerprint === scanFingerprint;
-          this.store.upsertState(conversationId, {
-            timezone: this.config.timezone,
-            last_rollup_check_at: laterDate(
-              finishedAt,
-              latestState?.last_rollup_check_at
-            ).toISOString(),
-            pending_rebuild:
-              result.errors.length === 0 && shouldClearPending ? 0 : 1,
-          });
-        }
-      );
+      const latestState = this.store.getState(conversationId);
+      const latestSummaryCreatedAt =
+        this.store.getLatestLeafSummaryCreatedAt(conversationId);
+      const latestSummaryFingerprint =
+        this.store.getLeafSummarySweepFingerprint(conversationId);
+      const shouldClearPending =
+        result.errors.length === 0 &&
+        isTimestampAtOrBefore(latestState?.last_message_at, scannedAt) &&
+        isTimestampAtOrBefore(latestSummaryCreatedAt, scannedAt) &&
+        latestSummaryFingerprint === scanFingerprint;
+      this.store.upsertState(conversationId, {
+        timezone: this.config.timezone,
+        last_rollup_check_at: laterDate(
+          finishedAt,
+          latestState?.last_rollup_check_at
+        ).toISOString(),
+        pending_rebuild:
+          result.errors.length === 0 && shouldClearPending ? 0 : 1,
+      });
     } catch (error) {
       result.errors.push(`final sweep state update failed: ${formatError(error)}`);
     }
@@ -608,28 +534,17 @@ export class RollupBuilder {
       .sort(compareSummariesChronologically);
 
     if (summaries.length === 0) {
-      // R3-FIX-2: read getRollup INSIDE the transaction so a concurrent
-      // builder that upserts a fresh rollup at the same slot cannot have
-      // its work destroyed by a stale-empty-snapshot delete from this
-      // racing caller. Mirrors P1-8's pattern in the non-empty branch.
-      let cleaned = false;
-      await withDatabaseTransaction(
-        this.store.db,
-        "BEGIN IMMEDIATE",
-        async () => {
-          const existing = this.store.getRollup(
-            conversationId,
-            DAY_PERIOD_KIND,
-            dateKey,
-            this.config.timezone
-          );
-          if (existing) {
-            this.store.deleteRollup(existing.rollup_id);
-            cleaned = true;
-          }
-        }
+      const existing = this.store.getRollup(
+        conversationId,
+        DAY_PERIOD_KIND,
+        dateKey,
+        this.config.timezone
       );
-      return cleaned;
+      if (existing) {
+        this.store.deleteRollup(existing.rollup_id);
+        return true;
+      }
+      return false;
     }
 
     const totalSourceTokens = summaries.reduce(
@@ -855,25 +770,16 @@ function renderAggregateRollup(
 ): string {
   const title =
     periodKind === WEEK_PERIOD_KIND ? "Weekly Summary" : "Monthly Summary";
-  const lines: string[] = [`# ${title}: ${periodKey}`, ""];
+  const lines = [`# ${title}: ${periodKey}`, "", "## Daily Rollups"];
   if (omittedEntries > 0) {
+    lines.push(`- (${omittedEntries} earlier daily rollups omitted)`);
+  }
+  for (const rollup of rollups) {
     lines.push(
-      `(${omittedEntries} earlier daily rollups omitted to fit budget)`,
-      "",
+      `- ${rollup.period_key}: ${summariseTimelineContent(rollup.content)}`
     );
   }
-  // Embed each day's FULL rollup content. Per-day truncation has been
-  // replaced by a total-budget cap in buildAggregateRollupContent's outer
-  // trim loop — when the budget is exceeded it drops oldest days entirely
-  // instead of stripping per-day detail. This produces a real aggregate
-  // (~10-20K per day × N days) rather than a 200-char-per-day TOC.
-  for (const rollup of rollups) {
-    lines.push(`## ${rollup.period_key}`);
-    lines.push("");
-    lines.push(rollup.content.trim());
-    lines.push("");
-  }
-  lines.push("---", "## Statistics");
+  lines.push("", "## Statistics");
   lines.push(`- Source daily rollups: ${rollups.length}`);
   lines.push(
     `- Total source tokens: ${rollups.reduce(
@@ -1202,8 +1108,7 @@ function uniqueStrings(values: string[]): string[] {
   return [...new Set(values)];
 }
 
-function startOfWeekKey(dayKey: string, timezone: string): string {
-  void timezone;
+function startOfWeekKey(dayKey: string): string {
   assertValidDateKey(dayKey);
   const [year, month, day] = dayKey
     .split("-")

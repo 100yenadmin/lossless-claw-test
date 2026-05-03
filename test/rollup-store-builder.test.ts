@@ -335,9 +335,8 @@ import {
 import { createLcmRollupDebugTool } from "../src/tools/lcm-rollup-debug-tool.js";
 import type { LcmDependencies } from "../src/types.js";
 
-function makeRecentDeps(overrides?: { clock?: { now: () => Date } }): LcmDependencies {
+function makeRecentDeps(): LcmDependencies {
   return {
-    clock: overrides?.clock ?? { now: () => new Date() },
     config: {
       enabled: true,
       databasePath: ":memory:",
@@ -419,11 +418,9 @@ function makeLcmForConversation(input: {
 
 describe("LCM sub-day window retrieval", () => {
   it("parses deterministic local-time windows with DST-safe UTC bounds", () => {
-    const liveNow = new Date();
     const dateWindow = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-03-08 1:30-3:30",
-      "America/New_York",
-      liveNow
+      "America/New_York"
     );
     expect(dateWindow.label).toBe("2026-03-08 1:30-3:30");
     expect(dateWindow.window?.startMinutes).toBe(90);
@@ -433,8 +430,7 @@ describe("LCM sub-day window retrieval", () => {
 
     const namedWindow = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-04-27 morning",
-      "Asia/Bangkok",
-      liveNow
+      "Asia/Bangkok"
     );
     expect(namedWindow.label).toBe("2026-04-27 morning");
     expect(namedWindow.start.toISOString()).toBe("2026-04-26T23:00:00.000Z");
@@ -442,8 +438,7 @@ describe("LCM sub-day window retrieval", () => {
 
     const meridiemWindow = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-04-27 4-8pm",
-      "Asia/Bangkok",
-      liveNow
+      "Asia/Bangkok"
     );
     expect(meridiemWindow.window?.startMinutes).toBe(16 * 60);
     expect(meridiemWindow.window?.endMinutes).toBe(20 * 60);
@@ -451,23 +446,20 @@ describe("LCM sub-day window retrieval", () => {
     expect(() =>
       __lcmRecentTestInternals.resolvePeriod(
         "date:2026-03-08 2:30-3:30",
-        "America/New_York",
-        liveNow
+        "America/New_York"
       )
     ).toThrow(/Nonexistent local time/);
 
     const nightWindow = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-04-27 night",
-      "Pacific/Auckland",
-      liveNow
+      "Pacific/Auckland"
     );
     expect(nightWindow.start.toISOString()).toBe("2026-04-27T10:00:00.000Z");
     expect(nightWindow.end.toISOString()).toBe("2026-04-27T12:00:00.000Z");
 
     const midnightTransition = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-03-28",
-      "Asia/Gaza",
-      liveNow
+      "Asia/Gaza"
     );
     expect(midnightTransition.start.toISOString()).toBe(
       "2026-03-27T22:00:00.000Z"
@@ -475,8 +467,7 @@ describe("LCM sub-day window retrieval", () => {
 
     const skippedMidnight = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-04-24",
-      "Africa/Cairo",
-      liveNow
+      "Africa/Cairo"
     );
     expect(skippedMidnight.start.toISOString()).toBe(
       "2026-04-23T22:00:00.000Z"
@@ -484,8 +475,7 @@ describe("LCM sub-day window retrieval", () => {
 
     const skippedMidnightNight = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-04-23 night",
-      "Africa/Cairo",
-      liveNow
+      "Africa/Cairo"
     );
     expect(skippedMidnightNight.start.toISOString()).toBe(
       "2026-04-23T20:00:00.000Z"
@@ -496,8 +486,7 @@ describe("LCM sub-day window retrieval", () => {
 
     const explicitEndOfDay = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-04-23 22:00-24:00",
-      "Africa/Cairo",
-      liveNow
+      "Africa/Cairo"
     );
     expect(explicitEndOfDay.window?.endMinutes).toBe(24 * 60);
     expect(explicitEndOfDay.start.toISOString()).toBe(
@@ -698,10 +687,7 @@ describe("LCM sub-day window retrieval", () => {
     const emptyFallbackText = (emptyFallback.content[0] as { text: string })
       .text;
     expect(emptyFallbackText).toContain("**Confidence:** none");
-    // P3 fix: an empty source list emits "none" regardless of
-    // includeSources — saying "omitted" would falsely imply hidden ids exist.
-    expect(emptyFallbackText).toContain("*Sources: none*");
-    expect(emptyFallbackText).not.toContain("*Sources: omitted*");
+    expect(emptyFallbackText).toContain("*Sources: omitted*");
     expect(
       (emptyFallback.details as { confidence?: string; usedFallback?: boolean })
         .confidence
@@ -729,6 +715,70 @@ describe("LCM sub-day window retrieval", () => {
     expect((invalid.details as { error?: string }).error).toMatch(
       /real calendar date/
     );
+  });
+
+  it("applies lcm_recent topic filters through bounded source-summary fallback", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "recent-topic-filter",
+      sessionKey: "agent:main:recent-topic-filter",
+      title: "Recent topic filter",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_topic_match",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "ENOTEMPTY repair finished during the handoff window.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      latestAt: new Date("2026-04-27T10:00:00.000Z"),
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_topic_other",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "GraphQL review-thread audit continued in the same day.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      latestAt: new Date("2026-04-27T11:00:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+
+    const tool = createLcmRecentTool({
+      deps: makeRecentDeps(),
+      lcm: makeLcmForConversation({
+        conversationId: conversation.conversationId,
+        rollupStore,
+        sessionId: "recent-topic-filter",
+      }) as never,
+      sessionId: "recent-topic-filter",
+    });
+
+    const result = await tool.execute("call-topic-filter", {
+      period: "date:2026-04-27",
+      topic: "ENOTEMPTY",
+      includeSources: true,
+    });
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("Topic filters use bounded leaf-summary fallback");
+    expect(text).toContain("sum_topic_match");
+    expect(text).toContain("ENOTEMPTY repair");
+    expect(text).not.toContain("sum_topic_other");
+    expect(text).not.toContain("GraphQL review-thread");
+    expect(result.details).toMatchObject({
+      status: "fallback",
+      usedFallback: true,
+      topic: "ENOTEMPTY",
+      totalMatches: 1,
+      summaryIds: ["sum_topic_match"],
+    });
   });
 
   it("orders fallback rows by the displayed effective time", async () => {
@@ -1071,863 +1121,6 @@ describe("LCM sub-day window retrieval", () => {
         (result.details as { status?: string; usedFallback?: boolean })
           .usedFallback
       ).toBe(true);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("formatSourcesLine emits 'none' for empty list regardless of includeSources (P3)", () => {
-    const fmt = __lcmRecentTestInternals.formatSourcesLine;
-    // Pre-fix `includeSources=false && empty` returned "omitted" which lied:
-    // there was nothing to omit.
-    expect(fmt([], false)).toBe("*Sources: none*");
-    expect(fmt([], true)).toBe("*Sources: none*");
-    // Hidden ids when caller asked to suppress.
-    expect(fmt(["sum_a", "sum_b"], false)).toBe("*Sources: omitted*");
-    // Visible ids when caller asked to include.
-    expect(fmt(["sum_a", "sum_b"], true)).toBe("*Sources: sum_a, sum_b*");
-  });
-
-  it("returns null lastBuiltAt for index mode when built_at is missing (P2-9)", async () => {
-    const { db, conversationStore, summaryStore, rollupStore } = createStores();
-    const conversation = await conversationStore.createConversation({
-      sessionId: "built-at-missing",
-      sessionKey: "agent:main:built-at-missing",
-      title: "built_at missing",
-    });
-    await summaryStore.insertSummary({
-      summaryId: "sum_built_at_missing",
-      conversationId: conversation.conversationId,
-      kind: "leaf",
-      depth: 0,
-      content: "Source for built_at-missing index test.",
-      tokenCount: 7,
-      latestAt: new Date("2026-04-27T10:00:00.000Z"),
-    });
-    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
-    await builder.buildDayRollup(conversation.conversationId, "2026-04-27");
-    // Force built_at to empty string — pre-fix the index mode would coerce
-    // this to a wall-clock new Date() and taint replay determinism.
-    db.prepare(
-      `UPDATE lcm_rollups
-       SET built_at = ''
-       WHERE conversation_id = ? AND period_kind = 'day' AND period_key = ?`
-    ).run(conversation.conversationId, "2026-04-27");
-
-    const lcm = {
-      timezone: "UTC",
-      getRollupStore: () => rollupStore,
-      getConversationStore: () => ({
-        getConversationBySessionId: async () => ({
-          conversationId: conversation.conversationId,
-          sessionId: "built-at-missing",
-          title: null,
-          bootstrappedAt: null,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        }),
-        getConversationBySessionKey: async () => null,
-      }),
-    };
-    const tool = createLcmRecentTool({
-      deps: makeRecentDeps(),
-      lcm: lcm as never,
-      sessionId: "built-at-missing",
-    });
-
-    const result = await tool.execute("call-built-at-missing", {
-      period: "date:2026-04-27",
-      mode: "index",
-      includeSources: true,
-    });
-    const details = result.details as { lastBuiltAt?: Date | null };
-    expect(details.lastBuiltAt).toBeNull();
-    const text = (result.content[0] as { text: string }).text;
-    // Index entry header should fall back to "(unknown)" rather than a fake
-    // wall-clock timestamp.
-    expect(text).toMatch(/Built:\s*\(unknown\)/);
-  });
-
-  it("uses BEGIN IMMEDIATE in replaceRollupSources to acquire write lock upfront (P2-4)", async () => {
-    // Smoke: with no outer transaction, replaceRollupSources should still
-    // succeed. The fix (BEGIN -> BEGIN IMMEDIATE) only changes lock-acquisition
-    // semantics, not API surface.
-    const { conversationStore, summaryStore, rollupStore } = createStores();
-    const conversation = await conversationStore.createConversation({
-      sessionId: "begin-immediate-smoke",
-      sessionKey: "agent:main:begin-immediate-smoke",
-      title: "BEGIN IMMEDIATE smoke",
-    });
-    await summaryStore.insertSummary({
-      summaryId: "sum_begin_immediate",
-      conversationId: conversation.conversationId,
-      kind: "leaf",
-      depth: 0,
-      content: "Source for replaceRollupSources smoke.",
-      tokenCount: 6,
-      latestAt: new Date("2026-04-27T10:00:00.000Z"),
-    });
-    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
-    await builder.buildDayRollup(conversation.conversationId, "2026-04-27");
-    const rollup = rollupStore.getRollup(
-      conversation.conversationId,
-      "day",
-      "2026-04-27",
-      "UTC"
-    );
-    expect(rollup).toBeTruthy();
-    if (!rollup) return;
-    await expect(
-      rollupStore.replaceRollupSources(rollup.rollup_id, [
-        { type: "summary", id: "sum_begin_immediate", ordinal: 0 },
-      ])
-    ).resolves.toBeUndefined();
-
-    // Source-level structural check: replaceRollupSources must declare
-    // BEGIN IMMEDIATE so concurrent writers serialize on lock acquisition,
-    // not at first write time.
-    const fs = await import("node:fs");
-    const path = await import("node:path");
-    const url = await import("node:url");
-    const here = url.fileURLToPath(import.meta.url);
-    const source = fs.readFileSync(
-      path.join(path.dirname(here), "..", "src", "store", "rollup-store.ts"),
-      "utf8"
-    );
-    const fnStart = source.indexOf("async replaceRollupSources(");
-    expect(fnStart).toBeGreaterThan(-1);
-    const fnBody = source.slice(fnStart, fnStart + 600);
-    expect(fnBody).toContain('"BEGIN IMMEDIATE"');
-    expect(fnBody).not.toMatch(/withDatabaseTransaction\(\s*this\.db\s*,\s*"BEGIN"\s*,/);
-  });
-
-  it("clamps weeklyMaxTokens >= dailyMaxTokens and monthlyMaxTokens >= weeklyMaxTokens (P2-3)", () => {
-    const { rollupStore } = createStores();
-    // Pathological config: dailyMaxTokens > default weekly/monthly. Pre-fix
-    // the constructor accepted this, leaving weeklyMaxTokens < dailyMaxTokens
-    // — the aggregate trim path's `length > 1` exit then silently produced
-    // a weekly that exceeded its declared cap (single oversized day case).
-    const builder = new RollupBuilder(rollupStore, {
-      timezone: "UTC",
-      dailyMaxTokens: 200_000,
-    });
-    type Mut = {
-      dailyMaxTokens: number;
-      weeklyMaxTokens: number;
-      monthlyMaxTokens: number;
-    };
-    const introspect = builder as unknown as Mut;
-    expect(introspect.weeklyMaxTokens).toBeGreaterThanOrEqual(
-      introspect.dailyMaxTokens
-    );
-    expect(introspect.monthlyMaxTokens).toBeGreaterThanOrEqual(
-      introspect.weeklyMaxTokens
-    );
-  });
-
-  it("returns deterministic order from listConversationsBySessionKey when created_at ties (P1-9)", async () => {
-    const { db, conversationStore } = createStores();
-    const sessionKey = "agent:main:tiebreak-stability";
-
-    // Insert two conversations sharing both session_key and created_at,
-    // simulating the low-resolution clock case (e.g. SQLite second-precision
-    // ties under load). The unique active+session_key index forces one to be
-    // archived; both rows still come back from listConversationsBySessionKey.
-    const archived = await conversationStore.createConversation({
-      sessionId: "tiebreak-A",
-      sessionKey,
-    });
-    db.prepare(
-      `UPDATE conversations SET active = 0, archived_at = datetime('now') WHERE conversation_id = ?`,
-    ).run(archived.conversationId);
-    await conversationStore.createConversation({
-      sessionId: "tiebreak-B",
-      sessionKey,
-    });
-    db.prepare(
-      `UPDATE conversations
-       SET created_at = '2026-04-27 12:00:00'
-       WHERE session_key = ?`,
-    ).run(sessionKey);
-
-    const list1 = await conversationStore.listConversationsBySessionKey(sessionKey);
-    const list2 = await conversationStore.listConversationsBySessionKey(sessionKey);
-    const list3 = await conversationStore.listConversationsBySessionKey(sessionKey);
-
-    expect(list1.length).toBe(2);
-    const ids1 = list1.map((c) => c.conversationId);
-    const ids2 = list2.map((c) => c.conversationId);
-    const ids3 = list3.map((c) => c.conversationId);
-    expect(ids2).toEqual(ids1);
-    expect(ids3).toEqual(ids1);
-    // Deterministic tiebreak puts the higher conversation_id first.
-    expect(ids1[0]).toBeGreaterThan(ids1[1]);
-  });
-
-  it("returns deterministic order from getRecentSummaryFallback when timestamps tie (R3-FIX-1)", async () => {
-    // Pre-fix: ORDER BY julianday(...) DESC alone has no PK tiebreaker.
-    // Within one SQLite instance the rowid backstop usually keeps order
-    // stable, but a `.dump | sqlite3 newdb` reimport flips it. We assert
-    // the fix here by inserting two summaries with identical latest_at and
-    // checking that the SQL ordering puts the lexicographically smaller
-    // summary_id first (ASC tiebreak), the same property post-dump-restore
-    // would also satisfy. Mirrors the c192ee8 fix for P1-9.
-    const { db, conversationStore, summaryStore } = createStores();
-    const conversation = await conversationStore.createConversation({
-      sessionId: "fallback-tiebreak",
-      sessionKey: "agent:main:fallback-tiebreak",
-    });
-    const sharedTime = new Date("2026-04-27T10:00:00.000Z");
-    // Insert in "wrong" order so a missing tiebreaker would yield insertion-
-    // order DESC (i.e. zeta first); the ASC tiebreak must put alpha first.
-    await summaryStore.insertSummary({
-      summaryId: "sum_zeta_tiebreak",
-      conversationId: conversation.conversationId,
-      kind: "leaf",
-      depth: 0,
-      content: "Z entry sharing latest_at.",
-      tokenCount: 5,
-      latestAt: sharedTime,
-    });
-    await summaryStore.insertSummary({
-      summaryId: "sum_alpha_tiebreak",
-      conversationId: conversation.conversationId,
-      kind: "leaf",
-      depth: 0,
-      content: "A entry sharing latest_at.",
-      tokenCount: 5,
-      latestAt: sharedTime,
-    });
-    // Force-update both rows to share created_at as well, removing any
-    // chance of the strftime() coalesce sorting on a different field.
-    db.prepare(
-      `UPDATE summaries
-       SET created_at = '2026-04-27 10:00:00',
-           earliest_at = '2026-04-27T10:00:00.000Z'
-       WHERE summary_id IN ('sum_zeta_tiebreak', 'sum_alpha_tiebreak')`,
-    ).run();
-
-    const callFallback = () =>
-      __lcmRecentTestInternals.getRecentSummaryFallback(
-        db,
-        conversation.conversationId,
-        new Date("2026-04-27T09:00:00.000Z"),
-        new Date("2026-04-27T11:00:00.000Z"),
-      );
-
-    const a = callFallback();
-    const b = callFallback();
-    const c = callFallback();
-    const idsA = a.summaries.map((s) => s.summary_id);
-    const idsB = b.summaries.map((s) => s.summary_id);
-    const idsC = c.summaries.map((s) => s.summary_id);
-    expect(idsA).toContain("sum_alpha_tiebreak");
-    expect(idsA).toContain("sum_zeta_tiebreak");
-    expect(idsB).toEqual(idsA);
-    expect(idsC).toEqual(idsA);
-    // Deterministic ASC tiebreak puts the lexicographically smaller
-    // summary_id first when latest_at ties (the property that survives
-    // a SQL dump/restore round-trip, unlike rowid-backstop ordering).
-    const alphaIdx = idsA.indexOf("sum_alpha_tiebreak");
-    const zetaIdx = idsA.indexOf("sum_zeta_tiebreak");
-    expect(alphaIdx).toBeLessThan(zetaIdx);
-  });
-
-  it("performs the existing-row read inside the transaction in buildAggregateRollup (P1-8)", async () => {
-    // Structural assertion: reading rollup-builder.ts source must show that
-    // the FIRST `this.store.getRollup(` call inside buildAggregateRollup
-    // appears AFTER `withDatabaseTransaction(` — mirrors buildDayRollup's
-    // pattern. Pre-fix the call was outside the transaction, allowing a
-    // concurrent writer to swap the row between read and replaceRollupSources
-    // (FK violation rollback under load).
-    const fs = await import("node:fs");
-    const path = await import("node:path");
-    const url = await import("node:url");
-    const here = url.fileURLToPath(import.meta.url);
-    const source = fs.readFileSync(
-      path.join(path.dirname(here), "..", "src", "rollup-builder.ts"),
-      "utf8"
-    );
-    const buildAggregateStart = source.indexOf("async buildAggregateRollup(");
-    expect(buildAggregateStart).toBeGreaterThan(-1);
-    // Find the next function declaration so we don't accidentally read
-    // beyond buildAggregateRollup.
-    const afterAggregate = source.slice(buildAggregateStart);
-    const nextFnIdx = (() => {
-      const candidates = [
-        afterAggregate.indexOf("\n  async build", 1),
-        afterAggregate.indexOf("\n  private ", 1),
-        afterAggregate.indexOf("\n}", 1),
-      ].filter((idx) => idx > 0);
-      return candidates.length > 0 ? Math.min(...candidates) : afterAggregate.length;
-    })();
-    const body = afterAggregate.slice(0, nextFnIdx);
-    const txStart = body.indexOf("withDatabaseTransaction(");
-    const firstGetRollup = body.indexOf("this.store.getRollup(");
-    expect(firstGetRollup).toBeGreaterThan(-1);
-    expect(txStart).toBeGreaterThan(-1);
-    expect(firstGetRollup).toBeGreaterThan(txStart);
-  });
-
-  it("wraps both buildDayRollup empty-day cleanup branches in a transaction (R3-FIX-2)", async () => {
-    // Structural assertion mirroring P1-8's: P1-8 closed the FK-consistency
-    // hole in buildAggregateRollup and the non-empty buildDayRollup path, but
-    // the empty-day cleanup branches still ran getRollup + deleteRollup
-    // outside any transaction. A concurrent rebuild that upserts a fresh
-    // rollup at the same (conv, kind, key) slot had its work destroyed by a
-    // stale-empty-snapshot delete from a racing caller. The fix wraps both
-    // empty-day branches (one in buildDailyRollups' loop, one in
-    // buildDayRollup itself) in withDatabaseTransaction("BEGIN IMMEDIATE", …)
-    // and reads getRollup INSIDE the transaction.
-    //
-    // A deterministic concurrency repro is hard; the structural assertion
-    // is acceptable per the Round-1 spec (matches P1-8's approach).
-    const fs = await import("node:fs");
-    const path = await import("node:path");
-    const url = await import("node:url");
-    const here = url.fileURLToPath(import.meta.url);
-    const source = fs.readFileSync(
-      path.join(path.dirname(here), "..", "src", "rollup-builder.ts"),
-      "utf8"
-    );
-
-    // Site 1: buildDailyRollups' empty-day branch.
-    const dailyStart = source.indexOf("async buildDailyRollups(");
-    expect(dailyStart).toBeGreaterThan(-1);
-    const dailyBody = source.slice(dailyStart);
-    const emptyBranch1 = dailyBody.indexOf("if (leafSummaries.length === 0)");
-    expect(emptyBranch1).toBeGreaterThan(-1);
-    // Bound the slice so we don't fall through into the non-empty branch's
-    // own withDatabaseTransaction(...) (would mask a missing tx in the
-    // empty-day branch).
-    const branch1Region = dailyBody.slice(
-      emptyBranch1,
-      dailyBody.indexOf("\n      const fingerprint = computeFingerprint(", emptyBranch1)
-    );
-    const tx1 = branch1Region.indexOf("withDatabaseTransaction(");
-    const get1 = branch1Region.indexOf("this.store.getRollup(");
-    const del1 = branch1Region.indexOf("this.store.deleteRollup(");
-    expect(tx1).toBeGreaterThan(-1);
-    expect(get1).toBeGreaterThan(tx1);
-    expect(del1).toBeGreaterThan(tx1);
-
-    // Site 2: buildDayRollup's empty-day branch.
-    const dayStart = source.indexOf("async buildDayRollup(");
-    expect(dayStart).toBeGreaterThan(-1);
-    const dayBody = source.slice(dayStart);
-    const emptyBranch2 = dayBody.indexOf("if (summaries.length === 0)");
-    expect(emptyBranch2).toBeGreaterThan(-1);
-    const branch2Region = dayBody.slice(
-      emptyBranch2,
-      dayBody.indexOf("\n    const totalSourceTokens", emptyBranch2)
-    );
-    const tx2 = branch2Region.indexOf("withDatabaseTransaction(");
-    const get2 = branch2Region.indexOf("this.store.getRollup(");
-    const del2 = branch2Region.indexOf("this.store.deleteRollup(");
-    expect(tx2).toBeGreaterThan(-1);
-    expect(get2).toBeGreaterThan(tx2);
-    expect(del2).toBeGreaterThan(tx2);
-  });
-
-  it("does not extract just the first nested day's Key Items section for weekly/monthly aggregate rollups", () => {
-    // The regex `/##\s+Key Items[\s\S]*?(?=\n##\s|$)/` extracts up to the next
-    // ## header, so the FIRST nested day's bullets — and only those — would
-    // be returned for a weekly/monthly. The post-fix path emits a generic
-    // content prefix instead.
-    const weekly = [
-      "# Weekly summary skeleton",
-      "",
-      "## 2026-04-20",
-      "",
-      "Day 1 narrative paragraph.",
-      "",
-      "## Key Items",
-      "- day one bullet alpha",
-      "- day one bullet beta",
-      "",
-      "## 2026-04-21",
-      "",
-      "Day 2 narrative paragraph.",
-      "",
-      "## Key Items",
-      "- day two bullet gamma",
-      "- day two bullet delta",
-    ].join("\n");
-
-    // PRE-FIX behavior would be: digest === "## Key Items\n- day one bullet alpha\n- day one bullet beta"
-    // POST-FIX: digest is a generic prefix that ALSO includes the weekly skeleton header.
-    const digestWithKind =
-      __lcmRecentTestInternals.extractRollupDigest(weekly, 600, "week");
-    expect(digestWithKind.startsWith("## Key Items")).toBe(false);
-    expect(digestWithKind).toContain("Weekly summary skeleton");
-    expect(digestWithKind).toContain("2026-04-20");
-
-    // Defensive: even without the periodKind hint, embedded `## YYYY-MM-DD`
-    // headers should trigger the same generic-prefix path.
-    const digestWithoutKind = __lcmRecentTestInternals.extractRollupDigest(
-      weekly,
-      600,
-    );
-    expect(digestWithoutKind.startsWith("## Key Items")).toBe(false);
-    expect(digestWithoutKind).toContain("Weekly summary skeleton");
-
-    // Sanity: a real daily rollup's Key Items still flows through the
-    // section-extraction branch and starts with "## Key Items".
-    const daily = [
-      "# Daily 2026-04-20",
-      "",
-      "Narrative.",
-      "",
-      "## Key Items",
-      "- single-day bullet stays in digest",
-    ].join("\n");
-    const dailyDigest = __lcmRecentTestInternals.extractRollupDigest(
-      daily,
-      600,
-      "day",
-    );
-    expect(dailyDigest.startsWith("## Key Items")).toBe(true);
-    expect(dailyDigest).toContain("single-day bullet stays in digest");
-  });
-
-  it("includes sibling-conversation leaf content via relatedConversationIds for today fallback", async () => {
-    const now = new Date("2026-04-27T12:00:00.000Z");
-    vi.useFakeTimers();
-    vi.setSystemTime(now);
-    try {
-      const { conversationStore, summaryStore, rollupStore } = createStores();
-      const sharedSessionKey = "agent:main:cross-conv-fallback";
-
-      // Older sibling holds the actual leaf summaries for today.
-      const sibling = await conversationStore.createConversation({
-        sessionId: "cross-conv-fallback-sibling",
-        sessionKey: sharedSessionKey,
-        title: "Cross-conv sibling",
-      });
-      // Active conversation (created via /new) is empty.
-      const active = await conversationStore.createConversation({
-        sessionId: "cross-conv-fallback-active",
-        sessionKey: sharedSessionKey,
-        title: "Cross-conv active",
-      });
-
-      await summaryStore.insertSummary({
-        summaryId: "sum_sibling_today",
-        conversationId: sibling.conversationId,
-        kind: "leaf",
-        depth: 0,
-        content:
-          "Sibling conversation captured today's work BEFORE /new fired, must surface on the active side.",
-        tokenCount: 16,
-        latestAt: now,
-      });
-
-      const lcm = {
-        timezone: "UTC",
-        getRollupStore: () => rollupStore,
-        getConversationStore: () => ({
-          getConversationBySessionId: async () => ({
-            conversationId: active.conversationId,
-            sessionId: "cross-conv-fallback-active",
-            title: null,
-            bootstrappedAt: null,
-            createdAt: now,
-            updatedAt: now,
-          }),
-          getConversationBySessionKey: async () => ({
-            conversationId: active.conversationId,
-            sessionKey: sharedSessionKey,
-            title: null,
-            bootstrappedAt: null,
-            createdAt: now,
-            updatedAt: now,
-          }),
-          listConversationsBySessionKey: async () => [
-            { conversationId: active.conversationId },
-            { conversationId: sibling.conversationId },
-          ],
-        }),
-      };
-      const tool = createLcmRecentTool({
-        deps: makeRecentDeps(),
-        lcm: lcm as never,
-        sessionId: "cross-conv-fallback-active",
-        sessionKey: sharedSessionKey,
-      });
-
-      const result = await tool.execute("call-cross-conv", {
-        period: "today",
-        includeSources: true,
-      });
-      const text = (result.content[0] as { text: string }).text;
-      expect(text).toContain("Sibling conversation captured today's work");
-      expect(text).toContain("sum_sibling_today");
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("includes live-fallback digest entries when mode:'index' covers today's window", async () => {
-    const now = new Date("2026-04-27T12:00:00.000Z");
-    vi.useFakeTimers();
-    vi.setSystemTime(now);
-    try {
-      const { conversationStore, summaryStore, rollupStore } = createStores();
-      const conversation = await conversationStore.createConversation({
-        sessionId: "today-index-live",
-        sessionKey: "agent:main:today-index-live",
-        title: "Today index live",
-      });
-
-      await summaryStore.insertSummary({
-        summaryId: "sum_today_live_index",
-        conversationId: conversation.conversationId,
-        kind: "leaf",
-        depth: 0,
-        content:
-          "Live fallback digest content from same-day work that should appear in index mode.",
-        tokenCount: 14,
-        latestAt: now,
-      });
-
-      // No stored rollup at all for today — index mode previously returned
-      // "(no rollups in window)" because liveFallbackKeys were ignored.
-      const lcm = {
-        timezone: "UTC",
-        getRollupStore: () => rollupStore,
-        getConversationStore: () => ({
-          getConversationBySessionId: async () => ({
-            conversationId: conversation.conversationId,
-            sessionId: "today-index-live",
-            title: null,
-            bootstrappedAt: null,
-            createdAt: now,
-            updatedAt: now,
-          }),
-          getConversationBySessionKey: async () => null,
-        }),
-      };
-      const tool = createLcmRecentTool({
-        deps: makeRecentDeps(),
-        lcm: lcm as never,
-        sessionId: "today-index-live",
-      });
-
-      const result = await tool.execute("call-today-index", {
-        period: "today",
-        mode: "index",
-        includeSources: true,
-      });
-      const text = (result.content[0] as { text: string }).text;
-      expect(text).toContain("Live fallback digest content");
-      expect(text).not.toContain("(no rollups in window)");
-      expect(text).toContain("(live fallback)");
-      expect(
-        (result.details as { status?: string; usedFallback?: boolean }).status
-      ).toBe("fallback");
-      expect(
-        (result.details as { status?: string; usedFallback?: boolean })
-          .usedFallback
-      ).toBe(true);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("counts stored + live entries in the index header (R2-FIX-3)", async () => {
-    const now = new Date("2026-04-27T12:00:00.000Z");
-    vi.useFakeTimers();
-    vi.setSystemTime(now);
-    try {
-      const { conversationStore, summaryStore, rollupStore } = createStores();
-      const conversation = await conversationStore.createConversation({
-        sessionId: "index-header-count",
-        sessionKey: "agent:main:index-header-count",
-        title: "Index header count",
-      });
-
-      // Two stored daily rollups + one live-fallback (today).
-      for (const day of ["2026-04-25", "2026-04-26"]) {
-        await summaryStore.insertSummary({
-          summaryId: `sum_${day}`,
-          conversationId: conversation.conversationId,
-          kind: "leaf",
-          depth: 0,
-          content: `Stored leaf for ${day}.`,
-          tokenCount: 10,
-          sourceMessageTokenCount: 10,
-          earliestAt: new Date(`${day}T10:00:00.000Z`),
-          latestAt: new Date(`${day}T10:30:00.000Z`),
-        });
-      }
-      const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
-      await builder.buildDayRollup(conversation.conversationId, "2026-04-25");
-      await builder.buildDayRollup(conversation.conversationId, "2026-04-26");
-
-      // Today live-fallback leaf.
-      await summaryStore.insertSummary({
-        summaryId: "sum_today_live_hdr",
-        conversationId: conversation.conversationId,
-        kind: "leaf",
-        depth: 0,
-        content: "Today live fallback leaf for header-count test.",
-        tokenCount: 10,
-        latestAt: now,
-      });
-
-      const lcm = {
-        timezone: "UTC",
-        getRollupStore: () => rollupStore,
-        getConversationStore: () => ({
-          getConversationBySessionId: async () => ({
-            conversationId: conversation.conversationId,
-            sessionId: "index-header-count",
-            title: null,
-            bootstrappedAt: null,
-            createdAt: now,
-            updatedAt: now,
-          }),
-          getConversationBySessionKey: async () => null,
-        }),
-      };
-      const tool = createLcmRecentTool({
-        deps: makeRecentDeps(),
-        lcm: lcm as never,
-        sessionId: "index-header-count",
-      });
-
-      const result = await tool.execute("call-index-hdr", {
-        period: "7d",
-        mode: "index",
-        includeSources: true,
-      });
-      const text = (result.content[0] as { text: string }).text;
-
-      // 2 stored + 1 live = 3 emitted `####` entries.
-      const headerMatch = text.match(/### Rollup index \((\d+) periods?\)/);
-      expect(headerMatch).not.toBeNull();
-      expect(headerMatch?.[1]).toBe("3");
-
-      const entryCount = (text.match(/^#### /gm) ?? []).length;
-      expect(entryCount).toBe(3);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("re-truncates combined index output to effectiveOutputTokens after live-fallback append (R2-FIX-2)", async () => {
-    const now = new Date("2026-04-27T12:00:00.000Z");
-    vi.useFakeTimers();
-    vi.setSystemTime(now);
-    try {
-      const { conversationStore, summaryStore, rollupStore } = createStores();
-      const conversation = await conversationStore.createConversation({
-        sessionId: "index-budget-overflow",
-        sessionKey: "agent:main:index-budget-overflow",
-        title: "Index budget overflow",
-      });
-
-      // Stored rollups across SIX prior days. We need enough indexed.content
-      // bulk that the combined output (indexed.content + live-fallback
-      // digest sections) genuinely overflows the 500-token budget — i.e.
-      // the post-fix re-truncation path at lcm-recent-tool.ts:1944 actually
-      // FIRES, rather than the test silently passing because the content
-      // happens to fit. Each stored day digest contributes ~one block to
-      // indexed.content; the live-fallback day adds another.
-      const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
-      for (let day = 21; day <= 26; day += 1) {
-        for (let i = 0; i < 6; i += 1) {
-          await summaryStore.insertSummary({
-            summaryId: `sum_d${day}_${i}`,
-            conversationId: conversation.conversationId,
-            kind: "leaf",
-            depth: 0,
-            content: `Day-${day}-leaf-${i} ` + "L".repeat(220),
-            tokenCount: 80,
-            sourceMessageTokenCount: 80,
-            earliestAt: new Date(`2026-04-${day}T1${i}:00:00.000Z`),
-            latestAt: new Date(`2026-04-${day}T1${i}:30:00.000Z`),
-          });
-        }
-        await builder.buildDayRollup(
-          conversation.conversationId,
-          `2026-04-${day}`,
-        );
-      }
-
-      // Today: live-fallback leaves the index path will splice in AFTER the
-      // already-truncated `indexed.content`. Pre-fix this pushed the total
-      // over `effectiveOutputTokens` because the live entries were appended
-      // without re-truncation; the outer enforceResponseBudget then clamped
-      // the WHOLE response (header + structure + sources line + hint),
-      // stripping trailing structural lines like the `*Sources: ...*`
-      // footer. Post-fix the inner re-truncation cuts only combinedContent
-      // before outer wrapping is added, so the structure survives.
-      for (let i = 0; i < 4; i += 1) {
-        await summaryStore.insertSummary({
-          summaryId: `sum_today_${i}`,
-          conversationId: conversation.conversationId,
-          kind: "leaf",
-          depth: 0,
-          content: `Today-leaf-${i} ` + "T".repeat(220),
-          tokenCount: 60,
-          sourceMessageTokenCount: 60,
-          earliestAt: new Date(`2026-04-27T0${i}:00:00.000Z`),
-          latestAt: new Date(`2026-04-27T0${i}:30:00.000Z`),
-        });
-      }
-
-      const lcm = {
-        timezone: "UTC",
-        getRollupStore: () => rollupStore,
-        getConversationStore: () => ({
-          getConversationBySessionId: async () => ({
-            conversationId: conversation.conversationId,
-            sessionId: "index-budget-overflow",
-            title: null,
-            bootstrappedAt: null,
-            createdAt: now,
-            updatedAt: now,
-          }),
-          getConversationBySessionKey: async () => null,
-        }),
-      };
-      const tool = createLcmRecentTool({
-        deps: makeRecentDeps(),
-        lcm: lcm as never,
-        sessionId: "index-budget-overflow",
-      });
-
-      // Tight budget: maxOutputTokens=500 forces effectiveOutputTokens=500.
-      const result = await tool.execute("call-index-budget", {
-        period: "7d",
-        mode: "index",
-        maxOutputTokens: 500,
-        globalMaxOutputTokens: 500,
-        includeSources: true,
-      });
-      const text = (result.content[0] as { text: string }).text;
-      const details = result.details as {
-        tokenCount: number;
-        truncated?: boolean;
-      };
-
-      // (1) Budget honored. Pre-fix the outer enforceResponseBudget would
-      //     also clamp this — so this assertion alone was tautological
-      //     (R3-H ⚠ flagged this).
-      expect(details.tokenCount).toBeLessThanOrEqual(500);
-
-      // (2) The structural assembly survives the truncation pipeline.
-      //     The inner re-truncation cuts combinedContent (rollup body)
-      //     to fit `effectiveOutputTokens` BEFORE outer wrappers are
-      //     added. We discriminate from a degenerate pipeline where the
-      //     inner combined-assembly was skipped entirely (no header, no
-      //     live-fallback section) by asserting both elements are still
-      //     present in the body of the response.
-      const indexHeader = text.match(/### Rollup index \((\d+) periods?\)/);
-      expect(indexHeader).not.toBeNull();
-      // R2-FIX-3 invariant: header period count matches the number of
-      // emitted `####` entries. Re-asserted here so a future refactor
-      // that broke either fix would surface in this test rather than
-      // only the R2-FIX-3 test.
-      const claimedCount = Number(indexHeader?.[1] ?? "0");
-      const entryCount = (text.match(/^#### /gm) ?? []).length;
-      expect(claimedCount).toBeGreaterThan(0);
-      expect(claimedCount).toBe(entryCount);
-
-      // (3) The live-fallback section header for today is present —
-      //     proves the index-mode + live-fallback combined-content path
-      //     was actually exercised (rather than e.g. silently falling
-      //     through to a different rendering). Pre-R2-FIX-2 the
-      //     truncation could still emit this header; the value of this
-      //     assertion is that a refactor which accidentally re-routed
-      //     index-mode to a path that drops the live-fallback header
-      //     entirely would now fail the test.
-      expect(text).toContain("(live fallback)");
-
-      // (4) The truncated flag survived. With six prior-day digests +
-      //     a live-fallback today, combinedContent overflows 500 tokens
-      //     and SOMETHING in the truncation pipeline must have flipped
-      //     `truncated`. Whether the inner re-truncation (R2-FIX-2) or
-      //     the outer enforceResponseBudget set it is implementation
-      //     detail; what matters externally is that the caller sees an
-      //     accurate truncation signal. (The R2-H finding was that the
-      //     pre-R2-FIX-2 path could under-report `truncated` when the
-      //     outer happened to not fire — see audit/pr516/round2-B-*.md.)
-      expect(details.truncated).toBe(true);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("renders digest-style listing for mode:'index' on the global fallback path (R2-FIX-1)", async () => {
-    const now = new Date("2026-04-27T12:00:00.000Z");
-    vi.useFakeTimers();
-    vi.setSystemTime(now);
-    try {
-      const { conversationStore, summaryStore, rollupStore } = createStores();
-      const conversation = await conversationStore.createConversation({
-        sessionId: "global-fallback-index",
-        sessionKey: "agent:main:global-fallback-index",
-        title: "Global fallback index",
-      });
-
-      // Drop a leaf summary in the recent window. NO stored rollup at all,
-      // and we use a sub-day "last 30m" period whose resolution.kind is
-      // undefined — that bypasses every coverage path and falls through to
-      // the global fallback at `rollupContent == null`. Pre-fix that path
-      // unconditionally rendered renderFallbackRollupSection's full content,
-      // ignoring mode:'index'.
-      await summaryStore.insertSummary({
-        summaryId: "sum_global_fb_idx",
-        conversationId: conversation.conversationId,
-        kind: "leaf",
-        depth: 0,
-        content:
-          "FALLBACK_LONG_BODY_THAT_SHOULD_BE_DIGESTED_NOT_FULLY_RENDERED_INTO_THE_RESPONSE_BECAUSE_INDEX_MODE_IS_DIGEST_STYLE",
-        tokenCount: 14,
-        latestAt: new Date("2026-04-27T11:55:00.000Z"),
-      });
-
-      const lcm = {
-        timezone: "UTC",
-        getRollupStore: () => rollupStore,
-        getConversationStore: () => ({
-          getConversationBySessionId: async () => ({
-            conversationId: conversation.conversationId,
-            sessionId: "global-fallback-index",
-            title: null,
-            bootstrappedAt: null,
-            createdAt: now,
-            updatedAt: now,
-          }),
-          getConversationBySessionKey: async () => null,
-        }),
-      };
-      const tool = createLcmRecentTool({
-        deps: makeRecentDeps(),
-        lcm: lcm as never,
-        sessionId: "global-fallback-index",
-      });
-
-      const result = await tool.execute("call-global-fb-index", {
-        period: "last 30m",
-        mode: "index",
-        includeSources: true,
-      });
-      const text = (result.content[0] as { text: string }).text;
-
-      // Index-mode shape: a `### Rollup index (1 period)` header plus a
-      // `#### <kind>/<label> (live fallback)` entry. Pre-fix the global
-      // fallback always rendered the full-content "No pre-built rollup
-      // available. Here's what LCM captured for this period:" preamble —
-      // index mode silently violated.
-      expect(text).toContain("### Rollup index (1 period)");
-      expect(text).toContain("(live fallback)");
-      expect(text).toContain("Status: fallback | Built: (live)");
-      expect(text).not.toContain(
-        "Here's what LCM captured for this period",
-      );
     } finally {
       vi.useRealTimers();
     }
@@ -2518,176 +1711,12 @@ describe("LCM weekly and monthly rollups", () => {
   });
 
   it("rejects invalid plain dates", async () => {
-    const liveNow = new Date();
     expect(() =>
-      __lcmRecentTestInternals.resolvePeriod("date:2026-02-30", "UTC", liveNow)
+      __lcmRecentTestInternals.resolvePeriod("date:2026-02-30", "UTC")
     ).toThrow(/real calendar date/i);
     expect(() =>
-      __lcmRecentTestInternals.resolvePeriod("date:2026-13-01", "UTC", liveNow)
+      __lcmRecentTestInternals.resolvePeriod("date:2026-13-01", "UTC")
     ).toThrow(/real calendar date/i);
-  });
-
-  it("RollupStore.getTimezone returns the persisted state row tz — B6 regression", async () => {
-    const { conversationStore, rollupStore } = createStores();
-    const conversation = await conversationStore.createConversation({
-      sessionId: "tz-persistence",
-      sessionKey: "agent:main:tz-persistence",
-      title: "TZ persistence",
-    });
-
-    // No state row yet: returns null so callers fall back to engine default.
-    expect(rollupStore.getTimezone(conversation.conversationId)).toBeNull();
-
-    // Persist LA tz; reads should pick it up regardless of engine config.
-    rollupStore.upsertState(conversation.conversationId, {
-      timezone: "America/Los_Angeles",
-    });
-    expect(rollupStore.getTimezone(conversation.conversationId)).toBe(
-      "America/Los_Angeles",
-    );
-  });
-
-  it("lcm_recent reads persisted tz over engine default — B6 regression", async () => {
-    const { db, conversationStore, summaryStore, rollupStore } = createStores();
-    const conversation = await conversationStore.createConversation({
-      sessionId: "tz-pref-state",
-      sessionKey: "agent:main:tz-pref-state",
-      title: "TZ pref state",
-    });
-
-    // Persist LA tz on the rollup-state row. Engine default below is UTC.
-    rollupStore.upsertState(conversation.conversationId, {
-      timezone: "America/Los_Angeles",
-    });
-
-    // Seed a summary at 2026-04-27 23:00 UTC. This is 2026-04-27 16:00 LA
-    // and 2026-04-27 (UTC). period "date:2026-04-27 16:00-17:00" with the LA
-    // tz pointing at the row should match — proving LA was used. With UTC,
-    // it would also match (no tz contrast). Use a tz-sensitive window
-    // instead: 02:00-03:00 LA = 09:00-10:00 UTC. Engine UTC would NOT match
-    // this window for our seed, but LA WILL.
-    await summaryStore.insertSummary({
-      summaryId: "sum_la_window",
-      conversationId: conversation.conversationId,
-      kind: "leaf",
-      depth: 0,
-      content: "Recorded at 2026-04-27 02:30 LA local",
-      tokenCount: 10,
-      sourceMessageTokenCount: 10,
-      earliestAt: new Date("2026-04-27T09:30:00.000Z"),
-      latestAt: new Date("2026-04-27T09:45:00.000Z"),
-    });
-    void db; // suppress unused-var
-    void summaryStore; // suppress unused-var
-
-    // Engine default = UTC, but persisted state = LA. Tool should pick LA.
-    const tool = createLcmRecentTool({
-      deps: makeRecentDeps(),
-      lcm: makeLcmForConversation({
-        conversationId: conversation.conversationId,
-        rollupStore,
-        sessionId: "tz-pref-state",
-        timezone: "UTC",
-      }) as never,
-      sessionId: "tz-pref-state",
-    });
-
-    // 02:00-03:00 LA on 2026-04-27 = 09:00-10:00 UTC. Our seed at 09:30 UTC
-    // falls inside. If the tool incorrectly used engine UTC, the same
-    // window string ("date:2026-04-27 02:00-03:00") would resolve to
-    // 02:00-03:00 UTC (= 19:00-20:00 LA the prior day) and miss the seed.
-    const result = await tool.execute("call-tz", {
-      period: "date:2026-04-27 02:00-03:00",
-      includeSources: true,
-    });
-    const text = (result.content[0] as { text: string }).text;
-    expect(text).toContain("sum_la_window");
-  });
-
-  it("anchors 'today' off the injected now — B3 regression", () => {
-    // Frozen now independent of wall time. resolvePeriod("today") must
-    // produce the day key for 2026-04-15 in UTC, regardless of the real
-    // wall clock when the test runs. Pins the now-injection contract.
-    const frozen = new Date("2026-04-15T12:00:00Z");
-    const today = __lcmRecentTestInternals.resolvePeriod("today", "UTC", frozen);
-    expect(today.periodKey).toBe("2026-04-15");
-    expect(today.start.toISOString()).toBe("2026-04-15T00:00:00.000Z");
-    expect(today.end.toISOString()).toBe("2026-04-16T00:00:00.000Z");
-
-    // 'last 1h' must terminate at the frozen now.
-    const window = __lcmRecentTestInternals.resolvePeriod("last 1h", "UTC", frozen);
-    expect(window.end.toISOString()).toBe("2026-04-15T12:00:00.000Z");
-    expect(window.start.toISOString()).toBe("2026-04-15T11:00:00.000Z");
-  });
-
-  it("captures clock.now() exactly once per lcm_recent call (RD-FIX-4 regression)", async () => {
-    // Two read sites observe "now" within one execute(): resolvePeriod
-    // (for "today") and the currentDayKey check. A clock that advances
-    // across the local-day boundary between the two calls must NOT cause
-    // them to disagree — execute() must capture clock.now() once at entry
-    // and thread the captured Date through both sites.
-    const { conversationStore, summaryStore, rollupStore } = createStores();
-    const conversation = await conversationStore.createConversation({
-      sessionId: "rd-fix-4-day-boundary",
-      sessionKey: "agent:main:rd-fix-4-day-boundary",
-      title: "RD-FIX-4 day boundary",
-    });
-
-    // Seed a leaf summary on day 2026-04-15 so a fallback path exists for
-    // the "today" rollup-state miss. This ensures execute() reaches both
-    // read sites (resolvePeriod + currentDayKey gate).
-    await summaryStore.insertSummary({
-      summaryId: "sum_rd_fix_4",
-      conversationId: conversation.conversationId,
-      kind: "leaf",
-      depth: 0,
-      content: "Activity recorded on 2026-04-15.",
-      tokenCount: 10,
-      sourceMessageTokenCount: 10,
-      earliestAt: new Date("2026-04-15T18:00:00.000Z"),
-      latestAt: new Date("2026-04-15T18:30:00.000Z"),
-    });
-
-    // Stepper clock: first call returns 2026-04-15 23:59:59.500Z (still
-    // 2026-04-15 in UTC), second call returns 2026-04-16 00:00:00.500Z
-    // (crossed into 2026-04-16). Without the fix, resolvePeriod sees
-    // 2026-04-15 and currentDayKey sees 2026-04-16 — inconsistent.
-    let callIndex = 0;
-    const stepper = {
-      now: () => {
-        callIndex += 1;
-        return callIndex === 1
-          ? new Date("2026-04-15T23:59:59.500Z")
-          : new Date("2026-04-16T00:00:00.500Z");
-      },
-    };
-
-    const tool = createLcmRecentTool({
-      deps: makeRecentDeps({ clock: stepper }),
-      lcm: makeLcmForConversation({
-        conversationId: conversation.conversationId,
-        rollupStore,
-        sessionId: "rd-fix-4-day-boundary",
-        timezone: "UTC",
-      }) as never,
-      sessionId: "rd-fix-4-day-boundary",
-    });
-
-    const result = await tool.execute("call-rd-fix-4", {
-      period: "today",
-      includeSources: true,
-    });
-    const text = (result.content[0] as { text: string }).text;
-
-    // The "today" period must anchor at the captured callTime
-    // (2026-04-15 from the FIRST clock observation). Our seed at
-    // 2026-04-15T18:00 falls inside that day. With the bug, the two
-    // observations could disagree — the first day-key wins for the
-    // period, but the currentDayKey gate could read 2026-04-16.
-    // Net-effect of the fix: clock.now() is read exactly once, so the
-    // tool only consumes ONE step of the stepper.
-    expect(callIndex).toBe(1);
-    expect(text).toContain("2026-04-15");
   });
 
   it("builds week and month aggregates whose boundaries skip local midnight", async () => {
@@ -3711,147 +2740,5 @@ describe("LCM weekly and monthly rollups", () => {
     expect((capped.details as { rollups?: unknown[] }).rollups).toHaveLength(
       100
     );
-  });
-
-  it("re-reads rollup state INSIDE a BEGIN IMMEDIATE transaction in buildDailyRollups (P1-3)", async () => {
-    // Structural pin (mirrors P1-8 / R3-FIX-2 patterns). Pre-fix, the
-    // post-build state-update block read latestState / latestSummaryCreatedAt /
-    // latestSummaryFingerprint OUTSIDE any transaction, decided
-    // shouldClearPending, then wrote pending_rebuild=0 — a concurrent ingest
-    // that flipped pending_rebuild=1 between our read and our write was
-    // silently clobbered. The fix wraps read-decide-write in
-    // withDatabaseTransaction("BEGIN IMMEDIATE", …) and re-reads INSIDE the
-    // txn. A deterministic concurrency repro is hard once BEGIN IMMEDIATE is
-    // in place (the race is now serialized by the SQLite write lock); the
-    // structural assertion is acceptable.
-    const fs = await import("node:fs");
-    const path = await import("node:path");
-    const url = await import("node:url");
-    const here = url.fileURLToPath(import.meta.url);
-    const source = fs.readFileSync(
-      path.join(path.dirname(here), "..", "src", "rollup-builder.ts"),
-      "utf8"
-    );
-
-    const dailyStart = source.indexOf("async buildDailyRollups(");
-    expect(dailyStart).toBeGreaterThan(-1);
-    const dailyBody = source.slice(dailyStart);
-
-    // Locate the post-build "final sweep state update" block — anchored on
-    // the catch's error-message string, which is unique in the file.
-    const finalSweepCatch = dailyBody.indexOf(
-      "final sweep state update failed:"
-    );
-    expect(finalSweepCatch).toBeGreaterThan(-1);
-
-    // Walk backwards to the enclosing try-block so we can scan it.
-    const tryStart = dailyBody.lastIndexOf("try {", finalSweepCatch);
-    expect(tryStart).toBeGreaterThan(-1);
-    const blockRegion = dailyBody.slice(tryStart, finalSweepCatch);
-
-    // Inside that try-block, every wall-state read must come AFTER
-    // withDatabaseTransaction("BEGIN IMMEDIATE", …).
-    const txStart = blockRegion.indexOf('withDatabaseTransaction(');
-    expect(txStart).toBeGreaterThan(-1);
-    const beginImmediate = blockRegion.indexOf('"BEGIN IMMEDIATE"');
-    expect(beginImmediate).toBeGreaterThan(txStart);
-
-    const getStateRead = blockRegion.indexOf("this.store.getState(");
-    expect(getStateRead).toBeGreaterThan(txStart);
-    const fingerprintRead = blockRegion.indexOf(
-      "this.store.getLeafSummarySweepFingerprint("
-    );
-    expect(fingerprintRead).toBeGreaterThan(txStart);
-    const summaryAtRead = blockRegion.indexOf(
-      "this.store.getLatestLeafSummaryCreatedAt("
-    );
-    expect(summaryAtRead).toBeGreaterThan(txStart);
-
-    // The upsertState write must also be inside the txn.
-    const upsertWrite = blockRegion.indexOf("this.store.upsertState(");
-    expect(upsertWrite).toBeGreaterThan(txStart);
-  });
-
-  it("clears pending_rebuild on a clean build and re-arms when state advanced mid-sweep (P1-3)", async () => {
-    // End-to-end: a clean build without concurrent writers clears the flag.
-    // A simulated concurrent writer that advances last_message_at past
-    // scannedAt before the post-build txn runs causes shouldClearPending to
-    // observe the fresh value INSIDE the txn and re-arm pending_rebuild=1.
-    const { conversationStore, summaryStore, rollupStore } = createStores();
-    const conversation = await conversationStore.createConversation({
-      sessionId: "race-pending-rebuild",
-      sessionKey: "agent:main:race",
-      title: "race",
-    });
-
-    await summaryStore.insertSummary({
-      summaryId: "race_sum_a",
-      conversationId: conversation.conversationId,
-      kind: "leaf",
-      depth: 0,
-      content: "Leaf alpha",
-      tokenCount: 5,
-      sourceMessageTokenCount: 5,
-      earliestAt: new Date("2026-04-27T10:00:00.000Z"),
-      latestAt: new Date("2026-04-27T10:30:00.000Z"),
-    });
-
-    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
-
-    // Happy path — no concurrent writer.
-    rollupStore.upsertState(conversation.conversationId, {
-      timezone: "UTC",
-      pending_rebuild: 1,
-      last_message_at: "2026-04-27T10:30:00.000Z",
-    });
-    await builder.buildDailyRollups(conversation.conversationId, {
-      forceCurrentDay: true,
-    });
-    const cleanState = rollupStore.getState(conversation.conversationId);
-    expect(cleanState?.pending_rebuild).toBe(0);
-
-    // Race path — patch the store's getState to simulate a concurrent ingest
-    // writing last_message_at AFTER scannedAt right before the builder's
-    // post-build txn body reads state. The builder's BEGIN IMMEDIATE serializes
-    // this, but we model the "writer committed before txn started" case by
-    // mutating the row inside the same txn at the moment getState fires —
-    // which is exactly what the OLD code missed.
-    rollupStore.upsertState(conversation.conversationId, {
-      timezone: "UTC",
-      pending_rebuild: 1,
-      last_message_at: "2026-04-27T10:30:00.000Z",
-    });
-
-    const originalGetState = rollupStore.getState.bind(rollupStore);
-    let stateCallCount = 0;
-    const spy = vi
-      .spyOn(rollupStore, "getState")
-      .mockImplementation((convId: number) => {
-        stateCallCount += 1;
-        // On the post-build txn read (the SECOND call from this test path),
-        // simulate a concurrent ingest that just advanced last_message_at
-        // far past scannedAt. With the fix, the builder observes this
-        // advance INSIDE its own txn and re-arms pending_rebuild=1.
-        if (stateCallCount === 2) {
-          rollupStore.db
-            .prepare(
-              `UPDATE lcm_rollup_state
-                 SET last_message_at = ?
-               WHERE conversation_id = ?`
-            )
-            .run("2099-12-31T23:59:59.000Z", convId);
-        }
-        return originalGetState(convId);
-      });
-
-    await builder.buildDailyRollups(conversation.conversationId, {
-      forceCurrentDay: true,
-    });
-    spy.mockRestore();
-
-    // The fresh last_message_at observed inside the txn is well after
-    // scannedAt, so the builder must re-arm rather than clear.
-    const racedState = rollupStore.getState(conversation.conversationId);
-    expect(racedState?.pending_rebuild).toBe(1);
   });
 });

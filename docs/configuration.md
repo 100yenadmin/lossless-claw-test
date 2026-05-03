@@ -46,6 +46,7 @@ Most installations only need to override a handful of keys. If you want a comple
   "timezone": "America/Los_Angeles",
   "pruneHeartbeatOk": false,
   "transcriptGcEnabled": false,
+  "observedWorkMaintenanceEnabled": false,
   "maxAssemblyTokenBudget": 30000,
   "summaryMaxOverageFactor": 3,
   "customInstructions": "",
@@ -55,12 +56,9 @@ Most installations only need to override a handful of keys. If you want a comple
   "proactiveThresholdCompactionMode": "deferred",
   "cacheAwareCompaction": {
     "enabled": true,
-    "cacheTTLSeconds": 300,
     "maxColdCacheCatchupPasses": 2,
     "hotCachePressureFactor": 4,
-    "hotCacheBudgetHeadroomRatio": 0.2,
-    "coldCacheObservationThreshold": 3,
-    "criticalBudgetPressureRatio": 0.70
+    "hotCacheBudgetHeadroomRatio": 0.2
   },
   "dynamicLeafChunkTokens": {
     "enabled": true,
@@ -117,6 +115,7 @@ openclaw plugins install --link /path/to/lossless-claw
 | `pruneHeartbeatOk` | `boolean` | `false` | `LCM_PRUNE_HEARTBEAT_OK` | Retroactively removes `HEARTBEAT_OK` turn cycles from persisted storage. |
 | `transcriptGcEnabled` | `boolean` | `false` | `LCM_TRANSCRIPT_GC_ENABLED` | Enables transcript rewrite GC during `maintain()`; disabled by default so transcript rewrites stay opt-in. |
 | `rollupDebugEnabled` | `boolean` | `false` | `LCM_ROLLUP_DEBUG_ENABLED` | Registers the operator-facing `lcm_rollup_debug` inspection tool. |
+| `observedWorkMaintenanceEnabled` | `boolean` | `false` | `LCM_OBSERVED_WORK_MAINTENANCE_ENABLED` | Allows `maintain()` to run observed-work and event extraction over LCM summaries; disabled by default so evidence-derived write paths stay explicit. |
 | `proactiveThresholdCompactionMode` | `"deferred" \| "inline"` | `"deferred"` | `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` | Controls whether proactive threshold compaction is deferred into maintenance debt by default or run inline for legacy behavior. |
 
 > **Multi-profile note:** `OPENCLAW_STATE_DIR` (set by the host OpenClaw gateway) controls where state is stored. When two gateways run on the same host (e.g. separate bot personas), each gateway sets its own `OPENCLAW_STATE_DIR` and lossless-claw automatically uses that directory for the database, large-file payloads, auth-profile lookups, and legacy secrets — no per-profile plugin config is needed.
@@ -177,7 +176,6 @@ openclaw plugins install --link /path/to/lossless-claw
 | `cacheAwareCompaction.hotCachePressureFactor` | `number` | `4` | `LCM_HOT_CACHE_PRESSURE_FACTOR` | Multiplier applied to the hot-cache leaf trigger before raw-history pressure overrides cache preservation. |
 | `cacheAwareCompaction.hotCacheBudgetHeadroomRatio` | `number` | `0.2` | `LCM_HOT_CACHE_BUDGET_HEADROOM_RATIO` | Minimum fraction of the real token budget that must remain free before hot-cache incremental compaction is skipped entirely. |
 | `cacheAwareCompaction.coldCacheObservationThreshold` | `integer` | `3` | `LCM_COLD_CACHE_OBSERVATION_THRESHOLD` | Consecutive cold observations required before non-explicit cache misses are treated as truly cold. This dampens one-off routing noise and provider failover blips. |
-| `cacheAwareCompaction.criticalBudgetPressureRatio` | `number` | `0.70` | `LCM_CRITICAL_BUDGET_PRESSURE_RATIO` | Fraction of the token budget at which deferred compaction bypasses hot-cache delay so prompt-mutating debt can run before overflow. Set to `1` to disable this bypass. |
 
 #### `dynamicLeafChunkTokens`
 
@@ -194,7 +192,6 @@ When cache-aware compaction is enabled:
 - hot cache skips incremental maintenance entirely when the assembled context is still comfortably below the real token budget
 - hot cache also gets a short hysteresis window so one ambiguous turn does not immediately discard a recently healthy cache signal
 - cold cache still allows bounded catch-up passes via `cacheAwareCompaction.maxColdCacheCatchupPasses`
-- once `currentTokenCount >= criticalBudgetPressureRatio * tokenBudget`, deferred compaction bypasses hot-cache delay so prompt-mutating debt can run before emergency overflow handling
 
 When incremental leaf compaction still runs on a hot cache, follow-on condensed passes are suppressed so the maintenance cycle only pays for the leaf pass that was explicitly justified.
 

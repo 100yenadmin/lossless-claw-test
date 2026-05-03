@@ -7,7 +7,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import type { OpenClawPluginApi } from "../openclaw-bridge.js";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { resolveLcmConfigWithDiagnostics, resolveOpenclawStateDir } from "../db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection, normalizePath } from "../db/connection.js";
 import { LcmContextEngine } from "../engine.js";
@@ -21,6 +21,8 @@ import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
 import { createLcmRecentTool } from "../tools/lcm-recent-tool.js";
 import { createLcmRollupDebugTool } from "../tools/lcm-rollup-debug-tool.js";
+import { createLcmEventSearchTool } from "../tools/lcm-event-search-tool.js";
+import { createLcmWorkDensityTool } from "../tools/lcm-work-density-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
 import type { LcmDependencies } from "../types.js";
 
@@ -154,7 +156,7 @@ const AUTH_ERROR_STATUS_KEYS = ["status", "statusCode", "status_code"] as const;
 const AUTH_ERROR_NESTED_KEYS = ["error", "response", "cause", "details", "data", "body"] as const;
 
 type CompletionBridgeErrorInfo = {
-  kind: "provider_auth" | "provider_error";
+  kind: "provider_auth";
   statusCode?: number;
   code?: string;
   message?: string;
@@ -655,117 +657,6 @@ function normalizeProviderId(provider: string): string {
   return provider.trim().toLowerCase();
 }
 
-const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
-const OPENAI_CODEX_RESPONSES_API = "openai-codex-responses";
-const OPENAI_CODEX_RESPONSES_BASE_URL = "https://chatgpt.com/backend-api/codex";
-const OPENAI_API_BASE_URL = "https://api.openai.com/v1";
-const OPENAI_CODEX_NATIVE_BASE_URLS = new Set([
-  "https://chatgpt.com/backend-api",
-  "https://chatgpt.com/backend-api/v1",
-  OPENAI_CODEX_RESPONSES_BASE_URL,
-  `${OPENAI_CODEX_RESPONSES_BASE_URL}/v1`,
-]);
-const OPENAI_CODEX_NATIVE_MODEL_IDS = new Set([
-  "gpt-5.2",
-  "gpt-5.2-codex",
-  "gpt-5.3-codex",
-  "gpt-5.4",
-  "gpt-5.4-mini",
-  "gpt-5.4-pro",
-  "gpt-5.5",
-  "gpt-5.5-pro",
-]);
-
-function isOpenAICodexProvider(provider: string): boolean {
-  return normalizeProviderId(provider) === OPENAI_CODEX_PROVIDER_ID;
-}
-
-function isOpenAICodexResponsesApi(api: string | undefined): boolean {
-  return (api ?? "").trim().toLowerCase() === OPENAI_CODEX_RESPONSES_API;
-}
-
-function normalizeBaseUrl(value: string): string {
-  return value.trim().replace(/\/+$/, "");
-}
-
-function shouldUseNativeCodexBaseUrl(params: {
-  provider: string;
-  api: string | undefined;
-  baseUrl: string | undefined;
-  /** True when the user explicitly set baseUrl via runtime config. When
-   *  explicit, do not rewrite `https://api.openai.com/v1` to the ChatGPT
-   *  Codex backend — that breaks paid OpenAI API-key users who chose that
-   *  endpoint deliberately. The native rewrite still applies when the
-   *  baseUrl is empty (default) or already a ChatGPT Codex variant. */
-  isExplicitlyConfigured?: boolean;
-}): boolean {
-  if (!isOpenAICodexProvider(params.provider) || !isOpenAICodexResponsesApi(params.api)) {
-    return false;
-  }
-
-  const baseUrl = params.baseUrl?.trim();
-  if (!baseUrl) {
-    return true;
-  }
-
-  const normalized = normalizeBaseUrl(baseUrl);
-  if (params.isExplicitlyConfigured && normalized === OPENAI_API_BASE_URL) {
-    return false;
-  }
-  return normalized === OPENAI_API_BASE_URL || OPENAI_CODEX_NATIVE_BASE_URLS.has(normalized);
-}
-
-function resolveProviderModelBaseUrl(params: {
-  provider: string;
-  api: string | undefined;
-  configuredBaseUrl: unknown;
-  fallbackBaseUrl: unknown;
-}): string {
-  const configuredBaseUrl =
-    typeof params.configuredBaseUrl === "string" ? params.configuredBaseUrl : undefined;
-  const fallbackBaseUrl =
-    typeof params.fallbackBaseUrl === "string" ? params.fallbackBaseUrl : undefined;
-  const baseUrl =
-    configuredBaseUrl ?? fallbackBaseUrl ?? inferBaseUrlFromProvider(params.provider) ?? "";
-  return shouldUseNativeCodexBaseUrl({
-    provider: params.provider,
-    api: params.api,
-    baseUrl,
-    isExplicitlyConfigured: configuredBaseUrl !== undefined,
-  })
-    ? OPENAI_CODEX_RESPONSES_BASE_URL
-    : baseUrl;
-}
-
-function getOpenAICodexNativeModelDefaults(params: {
-  provider: string;
-  model: string;
-  api: string | undefined;
-}): {
-  reasoning?: boolean;
-  input?: string[];
-  contextWindow?: number;
-  maxTokens?: number;
-} {
-  // OpenClaw can know about newer ChatGPT Codex models before the pi-ai
-  // package does.  Give those uncataloged models the same broad capabilities as
-  // the native Codex provider instead of falling back to a text-only stub.
-  if (
-    !isOpenAICodexProvider(params.provider) ||
-    !isOpenAICodexResponsesApi(params.api) ||
-    !OPENAI_CODEX_NATIVE_MODEL_IDS.has(params.model.trim().toLowerCase())
-  ) {
-    return {};
-  }
-
-  return {
-    reasoning: true,
-    input: ["text", "image"],
-    contextWindow: 1_000_000,
-    maxTokens: 128_000,
-  };
-}
-
 /** Resolve known provider API defaults when model lookup misses. */
 function inferApiFromProvider(provider: string): string | undefined {
   const normalized = normalizeProviderId(provider);
@@ -775,8 +666,8 @@ function inferApiFromProvider(provider: string): string | undefined {
     groq: "openai-completions",
     mistral: "openai-completions",
     openai: "openai-responses",
-    [OPENAI_CODEX_PROVIDER_ID]: OPENAI_CODEX_RESPONSES_API,
-    "github-copilot": OPENAI_CODEX_RESPONSES_API,
+    "openai-codex": "openai-codex-responses",
+    "github-copilot": "openai-codex-responses",
     openrouter: "openai-completions",
     together: "openai-completions",
     google: "google-generative-ai",
@@ -789,21 +680,50 @@ function inferApiFromProvider(provider: string): string | undefined {
   return map[normalized];
 }
 
-/** Codex Responses rejects `temperature`; omit it for that API family. */
-export function shouldOmitTemperatureForApi(api: string | undefined): boolean {
-  return isOpenAICodexResponsesApi(api);
+const OPENAI_CODEX_RESPONSES_BASE_URL = "https://chatgpt.com/backend-api/codex";
+const OPENAI_CODEX_NATIVE_MODEL_IDS = new Set([
+  "gpt-5.2",
+  "gpt-5.2-codex",
+  "gpt-5.3-codex",
+  "gpt-5.4",
+  "gpt-5.4-mini",
+  "gpt-5.4-pro",
+  "gpt-5.5",
+  "gpt-5.5-pro",
+]);
+
+function isOpenAICodexResponsesApi(api: string | undefined): boolean {
+  return (api ?? "").trim().toLowerCase() === "openai-codex-responses";
 }
 
-/** Resolve known provider base URLs when model lookup misses.
- *
- *  Note: ollama is intentionally absent. Cloud Ollama (`https://ollama.com`)
- *  and self-hosted setups both rely on explicit baseUrl configuration; a
- *  silent `http://localhost:11434` fallback would silently route cloud
- *  configs to localhost and produce confusing connection errors. Returning
- *  undefined here drops the inferred default — `resolveProviderModelBaseUrl`
- *  still passes `""` through to the dispatcher when no other source yields
- *  a baseUrl, which surfaces a clearer downstream error than a silent
- *  wrong-target connect. */
+function getOpenAICodexNativeModelDefaults(params: {
+  provider: string;
+  model: string;
+  api: string | undefined;
+}): {
+  reasoning?: boolean;
+  input?: string[];
+  contextWindow?: number;
+  maxTokens?: number;
+  baseUrl?: string;
+} {
+  if (
+    normalizeProviderId(params.provider) !== "openai-codex" ||
+    !isOpenAICodexResponsesApi(params.api) ||
+    !OPENAI_CODEX_NATIVE_MODEL_IDS.has(params.model.trim().toLowerCase())
+  ) {
+    return {};
+  }
+  return {
+    reasoning: true,
+    input: ["text", "image"],
+    contextWindow: 1_000_000,
+    maxTokens: 128_000,
+    baseUrl: OPENAI_CODEX_RESPONSES_BASE_URL,
+  };
+}
+
+/** Resolve known provider base URLs when model lookup misses. */
 function inferBaseUrlFromProvider(provider: string): string | undefined {
   const normalized = normalizeProviderId(provider);
   const map: Record<string, string> = {
@@ -818,6 +738,58 @@ function inferBaseUrlFromProvider(provider: string): string | undefined {
     openrouter: "https://openrouter.ai/api/v1",
   };
   return map[normalized];
+}
+
+/** Codex Responses rejects `temperature`; omit it for that API family. */
+export function shouldOmitTemperatureForApi(api: string | undefined): boolean {
+  return (api ?? "").trim().toLowerCase() === "openai-codex-responses";
+}
+
+/**
+ * Build a model contextWindow resolver from a runtimeConfig snapshot.
+ *
+ * Walks `runtimeConfig.models.providers[*].models[*]` for `{ id, contextWindow }`
+ * and records the value per model id (last-write-wins across object iteration
+ * order, which is well-defined for own string keys in object literals).
+ *
+ * Returns `(model: string) => number | null`. Returns null when the model is
+ * unknown, when contextWindow is missing or non-positive, or when the runtime
+ * config is malformed.
+ */
+export function buildModelContextWindowResolver(
+  runtimeConfig: unknown,
+): (model: string) => number | null {
+  const map = new Map<string, number>();
+
+  const providers = isRecord(runtimeConfig)
+    ? (runtimeConfig as { models?: { providers?: unknown } }).models?.providers
+    : undefined;
+
+  if (isRecord(providers)) {
+    for (const provider of Object.values(providers)) {
+      if (!isRecord(provider)) continue;
+      const models = (provider as { models?: unknown }).models;
+      if (!Array.isArray(models)) continue;
+      for (const entry of models) {
+        if (!isRecord(entry)) continue;
+        const id = typeof entry.id === "string" ? entry.id.trim() : null;
+        const ctx =
+          typeof entry.contextWindow === "number" &&
+          Number.isFinite(entry.contextWindow) &&
+          entry.contextWindow > 0
+            ? entry.contextWindow
+            : null;
+        if (id && ctx) map.set(id, ctx);
+      }
+    }
+  }
+
+  return (model: string) => {
+    if (typeof model !== "string") return null;
+    const trimmed = model.trim();
+    if (!trimmed) return null;
+    return map.get(trimmed) ?? null;
+  };
 }
 
 /** Build provider-aware options for pi-ai completeSimple. */
@@ -952,56 +924,6 @@ export function resolveModelApiFromRuntimeConfig(
   return undefined;
 }
 
-/**
- * Build a synchronous (model) → contextWindow resolver from a runtime config
- * snapshot. The resulting closure is a pure function over the snapshot —
- * suitable for replay determinism (no live RPCs, no TTL caches).
- *
- * Walks `runtimeConfig.models.providers[*].models[*]` for `{ id, contextWindow }`
- * and records the value per model id (last-write-wins across object iteration
- * order, which is well-defined for own string keys in object literals).
- *
- * Returns `(model: string) => number | null`. Returns null when the model is
- * unknown, when contextWindow is missing or non-positive, or when the runtime
- * config is malformed.
- */
-export function buildModelContextWindowResolver(
-  runtimeConfig: unknown,
-): (model: string) => number | null {
-  const map = new Map<string, number>();
-
-  const providers = isRecord(runtimeConfig)
-    ? (runtimeConfig as { models?: { providers?: unknown } }).models?.providers
-    : undefined;
-
-  if (isRecord(providers)) {
-    // Explicit overrides from runtimeConfig.
-    for (const provider of Object.values(providers)) {
-      if (!isRecord(provider)) continue;
-      const models = (provider as { models?: unknown }).models;
-      if (!Array.isArray(models)) continue;
-      for (const entry of models) {
-        if (!isRecord(entry)) continue;
-        const id = typeof entry.id === "string" ? entry.id.trim() : null;
-        const ctx =
-          typeof entry.contextWindow === "number" &&
-          Number.isFinite(entry.contextWindow) &&
-          entry.contextWindow > 0
-            ? entry.contextWindow
-            : null;
-        if (id && ctx) map.set(id, ctx);
-      }
-    }
-  }
-
-  return (model: string) => {
-    if (typeof model !== "string") return null;
-    const trimmed = model.trim();
-    if (!trimmed) return null;
-    return map.get(trimmed) ?? null;
-  };
-}
-
 /** Resolve runtime.modelAuth from plugin runtime when available. */
 function getRuntimeModelAuth(api: OpenClawPluginApi): RuntimeModelAuth | undefined {
   const runtime = api.runtime as OpenClawPluginApi["runtime"] & {
@@ -1017,24 +939,18 @@ function buildModelAuthLookupModel(params: {
   api?: string;
   contextWindow?: number;
 }): RuntimeModelAuthModel {
-  const api = params.api?.trim() || inferApiFromProvider(params.provider) || "";
-  const codexDefaults = getOpenAICodexNativeModelDefaults({
-    provider: params.provider,
-    model: params.model,
-    api,
-  });
   const contextWindow =
     typeof params.contextWindow === "number" && Number.isFinite(params.contextWindow) && params.contextWindow > 0
       ? params.contextWindow
-      : codexDefaults.contextWindow ?? 1_000_000;
+      : 1_000_000;
 
   return {
     id: params.model,
     name: params.model,
     provider: params.provider,
-    api,
-    reasoning: codexDefaults.reasoning ?? false,
-    input: codexDefaults.input ?? ["text"],
+    api: params.api?.trim() || inferApiFromProvider(params.provider) || "",
+    reasoning: false,
+    input: ["text"],
     cost: {
       input: 0,
       output: 0,
@@ -1042,7 +958,7 @@ function buildModelAuthLookupModel(params: {
       cacheWrite: 0,
     },
     contextWindow,
-    maxTokens: codexDefaults.maxTokens ?? 8_000,
+    maxTokens: 8_000,
   };
 }
 
@@ -1852,16 +1768,6 @@ function createLcmDependencies(
           return isRecord(cfg) ? cfg : {};
         })();
 
-        const resolvedKnownApi =
-          isRecord(knownModel) && typeof knownModel.api === "string"
-            ? modelRuntimeApi || providerRuntimeApi || knownModel.api
-            : undefined;
-        const codexDefaults = getOpenAICodexNativeModelDefaults({
-          provider: providerId,
-          model: modelId,
-          api: fallbackApi,
-        });
-
         let resolvedModel =
           isRecord(knownModel) &&
           typeof knownModel.api === "string" &&
@@ -1871,19 +1777,19 @@ function createLcmDependencies(
                 ...knownModel,
                 id: knownModel.id,
                 provider: knownModel.provider,
-                api: resolvedKnownApi ?? knownModel.api,
+                api: modelRuntimeApi || providerRuntimeApi || knownModel.api,
                 // Provider config must be able to override built-in transport defaults.
                 // Otherwise built-in providers like `openai` keep their catalog baseUrl
                 // (`https://api.openai.com/v1`) even when OpenClaw runtime config points
                 // that provider id at a custom proxy.
                 // Always set baseUrl to a string — pi-ai's detectCompat() crashes when
                 // baseUrl is undefined.
-                baseUrl: resolveProviderModelBaseUrl({
-                  provider: providerId,
-                  api: resolvedKnownApi ?? knownModel.api,
-                  configuredBaseUrl: providerLevelConfig.baseUrl,
-                  fallbackBaseUrl: knownModel.baseUrl,
-                }),
+                baseUrl:
+                  typeof providerLevelConfig.baseUrl === "string"
+                    ? providerLevelConfig.baseUrl
+                    : typeof knownModel.baseUrl === "string"
+                      ? knownModel.baseUrl
+                      : "",
                 ...(isRecord(providerLevelConfig.headers)
                   ? {
                       headers: {
@@ -1893,33 +1799,39 @@ function createLcmDependencies(
                     }
                   : {}),
               }
-            : {
-                id: modelId,
-                name: modelId,
-                provider: providerId,
-                api: fallbackApi,
-                reasoning: codexDefaults.reasoning ?? false,
-                input: codexDefaults.input ?? ["text"],
-                cost: {
-                  input: 0,
-                  output: 0,
-                  cacheRead: 0,
-                  cacheWrite: 0,
-                },
-                contextWindow: codexDefaults.contextWindow ?? 1_000_000,
-                maxTokens: codexDefaults.maxTokens ?? 8_000,
-                // Always set baseUrl to a string — pi-ai's detectCompat() crashes when
-                // baseUrl is undefined.
-                baseUrl: resolveProviderModelBaseUrl({
+            : (() => {
+                const codexDefaults = getOpenAICodexNativeModelDefaults({
+                  provider: providerId,
+                  model: modelId,
+                  api: fallbackApi,
+                });
+                return {
+                  id: modelId,
+                  name: modelId,
                   provider: providerId,
                   api: fallbackApi,
-                  configuredBaseUrl: providerLevelConfig.baseUrl,
-                  fallbackBaseUrl: undefined,
-                }),
-                ...(isRecord(providerLevelConfig.headers)
-                  ? { headers: providerLevelConfig.headers }
-                  : {}),
-              };
+                  reasoning: codexDefaults.reasoning ?? false,
+                  input: codexDefaults.input ?? ["text"],
+                  cost: {
+                    input: 0,
+                    output: 0,
+                    cacheRead: 0,
+                    cacheWrite: 0,
+                  },
+                  contextWindow: codexDefaults.contextWindow ?? 1_000_000,
+                  maxTokens: codexDefaults.maxTokens ?? 8_000,
+                  // Always set baseUrl to a string — pi-ai's detectCompat() crashes when
+                  // baseUrl is undefined.
+                  baseUrl: typeof providerLevelConfig.baseUrl === "string"
+                    ? providerLevelConfig.baseUrl
+                    : codexDefaults.baseUrl
+                      ?? inferBaseUrlFromProvider(providerId)
+                      ?? "",
+                  ...(isRecord(providerLevelConfig.headers)
+                    ? { headers: providerLevelConfig.headers }
+                    : {}),
+                };
+              })();
 
         let runtimeAuth: RuntimeModelAuthResult | undefined;
         if (modelAuth && skipModelAuth !== true && typeof modelAuth.getRuntimeAuthForModel === "function") {
@@ -2090,7 +2002,7 @@ function createLcmDependencies(
           err instanceof Error &&
           err.message.startsWith(PROVIDER_API_RESOLUTION_ERROR_PREFIX)
             ? {
-                kind: "provider_config",
+                kind: "provider_config" as const,
                 message: err.message,
               }
             : undefined;
@@ -2299,6 +2211,20 @@ function wirePluginHandlers(
   );
   api.registerTool((ctx) =>
     createLcmRecentTool({
+      deps,
+      getLcm: shared.waitForEngine,
+      sessionKey: ctx.sessionKey,
+    }),
+  );
+  api.registerTool((ctx) =>
+    createLcmWorkDensityTool({
+      deps,
+      getLcm: shared.waitForEngine,
+      sessionKey: ctx.sessionKey,
+    }),
+  );
+  api.registerTool((ctx) =>
+    createLcmEventSearchTool({
       deps,
       getLcm: shared.waitForEngine,
       sessionKey: ctx.sessionKey,

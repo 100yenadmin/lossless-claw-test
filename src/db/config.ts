@@ -129,6 +129,8 @@ export type LcmConfig = {
   rollupWeeklyMaxTokens: number;
   /** Maximum tokens for monthly rollup content. Default 560000 (≈4 weeks × 140K). */
   rollupMonthlyMaxTokens: number;
+  /** When true, maintain() may run observed-work and event extraction over summaries. */
+  observedWorkMaintenanceEnabled: boolean;
   /** Controls whether proactive threshold compaction runs inline or is deferred. */
   proactiveThresholdCompactionMode: ProactiveThresholdCompactionMode;
   /** Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. */
@@ -505,6 +507,10 @@ export function resolveLcmConfigWithDiagnostics(
       rollupMonthlyMaxTokens:
         parseFinitePositiveInt(env.LCM_ROLLUP_MONTHLY_MAX_TOKENS)
           ?? toPositiveNumber(pc.rollupMonthlyMaxTokens) ?? 560000,
+      observedWorkMaintenanceEnabled:
+        env.LCM_OBSERVED_WORK_MAINTENANCE_ENABLED !== undefined
+          ? env.LCM_OBSERVED_WORK_MAINTENANCE_ENABLED === "true"
+          : toBool(pc.observedWorkMaintenanceEnabled) ?? false,
       proactiveThresholdCompactionMode,
       maxAssemblyTokenBudget:
         parseFiniteInt(env.LCM_MAX_ASSEMBLY_TOKEN_BUDGET)
