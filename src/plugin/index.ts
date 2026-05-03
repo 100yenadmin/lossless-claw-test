@@ -2216,20 +2216,22 @@ function wirePluginHandlers(
       sessionKey: ctx.sessionKey,
     }),
   );
-  api.registerTool((ctx) =>
-    createLcmWorkDensityTool({
-      deps,
-      getLcm: shared.waitForEngine,
-      sessionKey: ctx.sessionKey,
-    }),
-  );
-  api.registerTool((ctx) =>
-    createLcmEventSearchTool({
-      deps,
-      getLcm: shared.waitForEngine,
-      sessionKey: ctx.sessionKey,
-    }),
-  );
+  if (deps.config.observedWorkMaintenanceEnabled) {
+    api.registerTool((ctx) =>
+      createLcmWorkDensityTool({
+        deps,
+        getLcm: shared.waitForEngine,
+        sessionKey: ctx.sessionKey,
+      }),
+    );
+    api.registerTool((ctx) =>
+      createLcmEventSearchTool({
+        deps,
+        getLcm: shared.waitForEngine,
+        sessionKey: ctx.sessionKey,
+      }),
+    );
+  }
   if (deps.config.rollupDebugEnabled) {
     api.registerTool((ctx) =>
       createLcmRollupDebugTool({
