@@ -11,7 +11,10 @@
       "lcm_expand",
       "lcm_expand_query",
       "lcm_recent",
-      "lcm_rollup_debug"
+      "lcm_rollup_debug",
+      "lcm_task_suggestion_review",
+      "lcm_task_suggestions",
+      "lcm_work_density"
     ]
   },
   "uiHints": {
@@ -222,6 +225,10 @@
     "rollupMonthlyMaxTokens": {
       "label": "Rollup Monthly Max Tokens",
       "help": "Maximum tokens for monthly rollup content. Default 560000 (≈4 weeks × 140K)."
+    },
+    "taskBridgeToolsEnabled": {
+      "label": "Task Bridge Suggestion Tools",
+      "help": "Register opt-in inert LCM task suggestion tools; they write only to the LCM suggestion ledger and never mutate external tasks"
     },
     "proactiveThresholdCompactionMode": {
       "label": "Proactive Threshold Compaction Mode",
@@ -441,6 +448,9 @@
       "rollupMonthlyMaxTokens": {
         "type": "integer",
         "minimum": 1
+      },
+      "taskBridgeToolsEnabled": {
+        "type": "boolean"
       },
       "proactiveThresholdCompactionMode": {
         "type": "string",

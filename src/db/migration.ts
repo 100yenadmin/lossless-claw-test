@@ -7,7 +7,7 @@ type MigrationLogger = {
   info?: (message: string) => void;
 };
 
-type SummaryColumnInfo = {
+type TableColumnInfo = {
   name?: string;
 };
 
@@ -240,7 +240,7 @@ const LCM_INITIAL_SCHEMA_STATEMENTS: readonly string[] = [
 ];
 
 function ensureSummaryDepthColumn(db: DatabaseSync): void {
-  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
+  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as TableColumnInfo[];
   const hasDepth = summaryColumns.some((col) => col.name === "depth");
   if (!hasDepth) {
     db.exec(`ALTER TABLE summaries ADD COLUMN depth INTEGER NOT NULL DEFAULT 0`);
@@ -248,7 +248,7 @@ function ensureSummaryDepthColumn(db: DatabaseSync): void {
 }
 
 function ensureSummaryMetadataColumns(db: DatabaseSync): void {
-  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
+  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as TableColumnInfo[];
   const hasEarliestAt = summaryColumns.some((col) => col.name === "earliest_at");
   const hasLatestAt = summaryColumns.some((col) => col.name === "latest_at");
   const hasDescendantCount = summaryColumns.some((col) => col.name === "descendant_count");
@@ -283,7 +283,7 @@ function isoStringOrNull(value: Date | null): string | null {
 }
 
 function ensureSummaryModelColumn(db: DatabaseSync): void {
-  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
+  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as TableColumnInfo[];
   const hasModel = summaryColumns.some((col) => col.name === "model");
   if (!hasModel) {
     db.exec(`ALTER TABLE summaries ADD COLUMN model TEXT NOT NULL DEFAULT 'unknown'`);
@@ -291,7 +291,7 @@ function ensureSummaryModelColumn(db: DatabaseSync): void {
 }
 
 function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
-  const telemetryColumns = db.prepare(`PRAGMA table_info(conversation_compaction_telemetry)`).all() as SummaryColumnInfo[];
+  const telemetryColumns = db.prepare(`PRAGMA table_info(conversation_compaction_telemetry)`).all() as TableColumnInfo[];
   const hasConsecutiveColdObservations = telemetryColumns.some(
     (col) => col.name === "consecutive_cold_observations",
   );
@@ -423,7 +423,7 @@ function ensureMessagePartsTable(db: DatabaseSync): void {
 }
 
 function ensureMessageIdentityHashColumn(db: DatabaseSync): void {
-  const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
+  const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as TableColumnInfo[];
   const hasIdentityHash = messageColumns.some((col) => col.name === "identity_hash");
   if (!hasIdentityHash) {
     db.exec(`ALTER TABLE messages ADD COLUMN identity_hash TEXT`);
@@ -949,7 +949,7 @@ function addColumnIfMissing(
   columnName: string,
   columnDefinition: string,
 ): void {
-  const columns = db.prepare(`PRAGMA table_info(${quoteSqlIdentifier(tableName)})`).all() as SummaryColumnInfo[];
+  const columns = db.prepare(`PRAGMA table_info(${quoteSqlIdentifier(tableName)})`).all() as TableColumnInfo[];
   if (!columns.some((col) => col.name === columnName)) {
     db.exec(
       `ALTER TABLE ${quoteSqlIdentifier(tableName)} ADD COLUMN ${quoteSqlIdentifier(columnName)} ${columnDefinition}`,
@@ -978,7 +978,7 @@ function shouldRecreateStandaloneFtsTable(db: DatabaseSync, spec: FtsTableSpec):
 
     const columns = db
       .prepare(`PRAGMA table_info(${quoteSqlIdentifier(spec.tableName)})`)
-      .all() as SummaryColumnInfo[];
+      .all() as TableColumnInfo[];
     const columnNames = new Set(
       columns
         .map((col) => col.name)
@@ -1215,6 +1215,144 @@ export function runLcmMigrations(
 
         CREATE VIEW IF NOT EXISTS monthly_rollups AS
         SELECT * FROM lcm_rollups WHERE period_kind = 'month';
+      `);
+    });
+
+    runMigrationStep("ensureObservedWorkTables", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_observed_work_items (
+          work_item_id TEXT PRIMARY KEY,
+          conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+          owner_id TEXT,
+          title TEXT NOT NULL,
+          description TEXT,
+          observed_status TEXT NOT NULL CHECK (observed_status IN (
+            'observed_completed',
+            'observed_unfinished',
+            'observed_ambiguous',
+            'decision_recorded',
+            'dismissed'
+          )),
+          kind TEXT NOT NULL CHECK (kind IN (
+            'implementation',
+            'review',
+            'blocker',
+            'decision',
+            'question',
+            'follow_up',
+            'test',
+            'deploy',
+            'research',
+            'other'
+          )),
+          confidence REAL NOT NULL DEFAULT 0.5 CHECK (confidence >= 0 AND confidence <= 1),
+          confidence_band TEXT NOT NULL DEFAULT 'medium' CHECK (confidence_band IN ('low', 'medium', 'medium-high', 'high')),
+          rationale TEXT,
+          topic_key TEXT,
+          first_seen_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL,
+          completed_at TEXT,
+          completion_confidence REAL CHECK (completion_confidence IS NULL OR (completion_confidence >= 0 AND completion_confidence <= 1)),
+          evidence_count INTEGER NOT NULL DEFAULT 0,
+          source_message_count INTEGER NOT NULL DEFAULT 0,
+          source_token_count INTEGER NOT NULL DEFAULT 0,
+          authority_source TEXT NOT NULL DEFAULT 'lcm_observed',
+          sensitivity TEXT,
+          visibility TEXT,
+          fingerprint TEXT NOT NULL,
+          fingerprint_version INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS lcm_observed_work_sources (
+          work_item_id TEXT NOT NULL REFERENCES lcm_observed_work_items(work_item_id) ON DELETE CASCADE,
+          source_type TEXT NOT NULL CHECK (source_type IN ('summary', 'rollup', 'message')),
+          source_id TEXT NOT NULL,
+          ordinal INTEGER NOT NULL,
+          evidence_kind TEXT NOT NULL CHECK (evidence_kind IN (
+            'created',
+            'reinforced',
+            'possible_completion',
+            'completed',
+            'contradicted',
+            'dismissed'
+          )),
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (work_item_id, source_type, source_id, evidence_kind)
+        );
+
+        CREATE TABLE IF NOT EXISTS lcm_observed_work_state (
+          conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+          last_processed_summary_created_at TEXT,
+          last_processed_summary_id TEXT,
+          pending_rebuild INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+    });
+
+    runMigrationStep("ensureObservedWorkIndexes", log, () => {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_status_kind_seen_idx
+          ON lcm_observed_work_items(conversation_id, observed_status, kind, last_seen_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_owner_status_kind_seen_idx
+          ON lcm_observed_work_items(owner_id, observed_status, kind, last_seen_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_topic_status_seen_idx
+          ON lcm_observed_work_items(topic_key, observed_status, last_seen_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_fingerprint_idx
+          ON lcm_observed_work_items(fingerprint);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_sources_source_idx
+          ON lcm_observed_work_sources(source_type, source_id);
+      `);
+    });
+
+    runMigrationStep("ensureTaskBridgeSuggestionTables", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_task_bridge_suggestions (
+          suggestion_id TEXT PRIMARY KEY,
+          work_item_id TEXT NOT NULL REFERENCES lcm_observed_work_items(work_item_id) ON DELETE CASCADE,
+          task_id TEXT,
+          suggestion_kind TEXT NOT NULL CHECK (suggestion_kind IN (
+            'create_task',
+            'link_task',
+            'mark_task_done',
+            'mark_task_blocked',
+            'add_task_evidence'
+          )),
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN (
+            'pending',
+            'accepted',
+            'rejected',
+            'dismissed',
+            'expired'
+          )),
+          confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+          rationale TEXT NOT NULL,
+          source_ids TEXT NOT NULL,
+          created_by TEXT NOT NULL DEFAULT 'lcm_observed',
+          reviewed_by TEXT,
+          reviewed_at TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+    });
+
+    runMigrationStep("ensureTaskBridgeSuggestionIndexes", log, () => {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_status_kind_idx
+          ON lcm_task_bridge_suggestions(status, suggestion_kind, created_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_work_item_idx
+          ON lcm_task_bridge_suggestions(work_item_id, status);
+
+        CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_task_idx
+          ON lcm_task_bridge_suggestions(task_id, status);
       `);
     });
 
