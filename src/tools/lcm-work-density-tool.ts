@@ -59,13 +59,14 @@ const LcmWorkDensitySchema = Type.Object({
 
 function resolvePeriodBounds(
   period: unknown,
-  timezone: string
+  timezone: string,
+  getNow: () => Date
 ): { label?: string; since?: string; before?: string } {
   if (typeof period !== "string" || period.trim().length === 0) {
     return {};
   }
   const normalized = period.trim().toLowerCase().replace(/\s+/g, " ");
-  const today = getZonedDayString(new Date(), timezone);
+  const today = getZonedDayString(getNow(), timezone);
   if (normalized === "today") {
     return dayBounds("today", today, timezone);
   }
@@ -287,7 +288,7 @@ export function createLcmWorkDensityTool(input: {
       let kinds: ObservedWorkKind[] | undefined;
       let periodLabel: string | undefined;
       try {
-        const periodBounds = resolvePeriodBounds(p.period, lcm.timezone);
+        const periodBounds = resolvePeriodBounds(p.period, lcm.timezone, () => input.deps.clock.now());
         periodLabel = periodBounds.label;
         since = parseIsoTimestampParam(p, "since")?.toISOString() ?? periodBounds.since;
         before = parseIsoTimestampParam(p, "before")?.toISOString() ?? periodBounds.before;
