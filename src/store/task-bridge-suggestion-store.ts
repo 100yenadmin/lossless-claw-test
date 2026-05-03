@@ -175,15 +175,96 @@ export class TaskBridgeSuggestionStore {
     if (TASK_TARGETING_KINDS.has(input.suggestionKind) && !taskId) {
       throw new Error(`${input.suggestionKind} suggestions require taskId.`);
     }
-    const existingStatus = this.getSuggestionStatus(suggestionId);
-    if (existingStatus && existingStatus !== "pending") {
-      return "preserved_reviewed";
-    }
     const sourceIds = normalizeSourceIds(input.sourceIds);
     if (sourceIds.length === 0) {
       throw new Error("at least one source ID is required.");
     }
-    this.assertSourceIdsBelongToWorkItem(workItemId, sourceIds);
+    return this.runInTransaction(() => this.upsertSuggestionInTransaction({
+      suggestionId,
+      workItemId,
+      taskId,
+      suggestionKind: input.suggestionKind,
+      confidence: input.confidence,
+      rationale: input.rationale.trim(),
+      sourceIds,
+      createdBy: input.createdBy?.trim() || "lcm_observed",
+    }));
+  }
+
+  /**
+   * Upsert many suggestions inside a single SQLite transaction.
+   *
+   * Each individual upsert still preserves the same CASE-WHEN guards as
+   * `upsertSuggestion`, but the whole batch commits with one fsync, which is a
+   * dramatic speed-up when callers (e.g. the LCM task suggestion tool's
+   * `record` mode) push 50 candidates at once.
+   */
+  bulkUpsertSuggestions(
+    inputs: TaskBridgeSuggestionInput[]
+  ): TaskBridgeSuggestionUpsertResult[] {
+    if (inputs.length === 0) {
+      return [];
+    }
+    const prepared = inputs.map((input) => {
+      const suggestionId = input.suggestionId.trim();
+      if (suggestionId.length === 0) {
+        throw new Error("suggestionId is required.");
+      }
+      const workItemId = input.workItemId.trim();
+      if (workItemId.length === 0) {
+        throw new Error("workItemId is required.");
+      }
+      if (!Number.isFinite(input.confidence) || input.confidence < 0 || input.confidence > 1) {
+        throw new Error("confidence must be between 0 and 1.");
+      }
+      if (input.rationale.trim().length === 0) {
+        throw new Error("rationale is required.");
+      }
+      const requestedStatus = input.status ?? "pending";
+      if (requestedStatus !== "pending") {
+        throw new Error(
+          "upsertSuggestion only creates or refreshes pending suggestions; use reviewSuggestion for reviewed states."
+        );
+      }
+      const taskId = input.taskId?.trim();
+      if (TASK_TARGETING_KINDS.has(input.suggestionKind) && !taskId) {
+        throw new Error(`${input.suggestionKind} suggestions require taskId.`);
+      }
+      const sourceIds = normalizeSourceIds(input.sourceIds);
+      if (sourceIds.length === 0) {
+        throw new Error("at least one source ID is required.");
+      }
+      return {
+        suggestionId,
+        workItemId,
+        taskId,
+        suggestionKind: input.suggestionKind,
+        confidence: input.confidence,
+        rationale: input.rationale.trim(),
+        sourceIds,
+        createdBy: input.createdBy?.trim() || "lcm_observed",
+      };
+    });
+    return this.runInTransaction(() =>
+      prepared.map((args) => this.upsertSuggestionInTransaction(args))
+    );
+  }
+
+  private upsertSuggestionInTransaction(args: {
+    suggestionId: string;
+    workItemId: string;
+    taskId: string | undefined;
+    suggestionKind: TaskBridgeSuggestionKind;
+    confidence: number;
+    rationale: string;
+    sourceIds: string[];
+    createdBy: string;
+  }): TaskBridgeSuggestionUpsertResult {
+    const existingStatus = this.getSuggestionStatus(args.suggestionId);
+    if (existingStatus && existingStatus !== "pending") {
+      return "preserved_reviewed";
+    }
+    this.assertSourceIdsBelongToWorkItem(args.workItemId, args.sourceIds);
     this.db.prepare(
       `INSERT INTO lcm_task_bridge_suggestions (
         suggestion_id, work_item_id, task_id, suggestion_kind, status, confidence,
@@ -220,18 +301,61 @@ export class TaskBridgeSuggestionStore {
           ELSE lcm_task_bridge_suggestions.updated_at
         END`,
     ).run(
-      suggestionId,
-      workItemId,
-      taskId ?? null,
-      input.suggestionKind,
+      args.suggestionId,
+      args.workItemId,
+      args.taskId ?? null,
+      args.suggestionKind,
       "pending",
-      input.confidence,
-      input.rationale.trim(),
-      JSON.stringify(sourceIds),
-      input.createdBy?.trim() || "lcm_observed",
+      args.confidence,
+      args.rationale,
+      JSON.stringify(args.sourceIds),
+      args.createdBy,
     );
     return existingStatus === "pending" ? "refreshed" : "inserted";
   }
+
+  /**
+   * Run `operation` inside a synchronous SQLite transaction.
+   *
+   * If we are already inside a transaction (either the per-database mutex's
+   * `BEGIN`, or a nested call into the store), we use a SAVEPOINT instead so
+   * SQLite does not raise "cannot start a transaction within a transaction".
+   *
+   * The whole closure runs synchronously — no `await` allowed — which keeps the
+   * outer `upsertSuggestion` API sync-callable from existing tests and tools.
+   */
+  private runInTransaction<T>(operation: () => T): T {
+    const inTransaction = (this.db as unknown as { inTransaction?: boolean }).inTransaction;
+    if (inTransaction) {
+      const savepointName = `lcm_task_bridge_sp_${++TaskBridgeSuggestionStore.savepointId}`;
+      this.db.exec(`SAVEPOINT ${savepointName}`);
+      try {
+        const result = operation();
+        this.db.exec(`RELEASE SAVEPOINT ${savepointName}`);
+        return result;
+      } catch (error) {
+        this.db.exec(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+        this.db.exec(`RELEASE SAVEPOINT ${savepointName}`);
+        throw error;
+      }
+    }
+    let transactionActive = false;
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+      transactionActive = true;
+      const result = operation();
+      this.db.exec("COMMIT");
+      transactionActive = false;
+      return result;
+    } catch (error) {
+      if (transactionActive) {
+        this.db.exec("ROLLBACK");
+      }
+      throw error;
+    }
+  }
+
+  private static savepointId = 0;
 
   listSuggestions(input?: {
     status?: TaskBridgeSuggestionStatus;

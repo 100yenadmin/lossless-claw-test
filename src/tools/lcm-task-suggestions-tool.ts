@@ -228,16 +228,19 @@ export function createLcmTaskSuggestionsTool(input: {
       };
       if (mode === "record") {
         const store = lcm.getTaskBridgeSuggestionStore();
-        for (const suggestion of suggestions) {
-          const sourceIds = sourceIdsByWorkItemId.get(suggestion.workItemId) ?? [];
-          const result = store.upsertSuggestion({
-            suggestionId: suggestion.suggestionId,
-            workItemId: suggestion.workItemId,
-            suggestionKind: suggestion.suggestionKind,
-            confidence: suggestion.confidence,
-            rationale: suggestion.rationale,
-            sourceIds,
-          });
+        const inputs = suggestions.map((suggestion) => ({
+          suggestionId: suggestion.suggestionId,
+          workItemId: suggestion.workItemId,
+          suggestionKind: suggestion.suggestionKind,
+          confidence: suggestion.confidence,
+          rationale: suggestion.rationale,
+          sourceIds: sourceIdsByWorkItemId.get(suggestion.workItemId) ?? [],
+        }));
+        // Single transaction → one fsync for the whole batch (cap is 50 above)
+        // and a deterministic accounting bucket for each input even if a
+        // concurrent reviewer is racing the store.
+        const results = store.bulkUpsertSuggestions(inputs);
+        for (const result of results) {
           if (result === "inserted") {
             recordAccounting.inserted += 1;
           } else if (result === "refreshed") {
