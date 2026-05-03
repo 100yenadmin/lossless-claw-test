@@ -1,4 +1,4 @@
-import type { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 
 export type ObservedWorkStatus =
   | "observed_completed"
@@ -628,17 +628,20 @@ export class ObservedWorkStore {
         WHERE src.work_item_id = lcm_observed_work_items.work_item_id
       )`,
     ];
-    const args: unknown[] = [];
+    const args: SQLInputValue[] = [];
     if (query.conversationId != null) {
       where.push("conversation_id = ?");
       args.push(query.conversationId);
     }
     if (query.since) {
-      where.push("julianday(last_seen_at) >= julianday(?)");
+      // ISO 8601 Z timestamps sort lexicographically, so a direct range
+      // predicate is index-friendly (composite idx on
+      // conversation_id, observed_status, kind, last_seen_at DESC).
+      where.push("last_seen_at >= ?");
       args.push(query.since);
     }
     if (query.before) {
-      where.push("julianday(first_seen_at) < julianday(?)");
+      where.push("first_seen_at < ?");
       args.push(query.before);
     }
     if (query.statuses?.length) {
