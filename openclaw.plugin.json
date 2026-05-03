@@ -11,7 +11,9 @@
       "lcm_expand",
       "lcm_expand_query",
       "lcm_recent",
-      "lcm_rollup_debug"
+      "lcm_rollup_debug",
+      "lcm_work_density",
+      "lcm_event_search"
     ]
   },
   "uiHints": {
