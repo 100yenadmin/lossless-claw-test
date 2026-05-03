@@ -1,4 +1,4 @@
-import type { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 
 export type TaskBridgeSuggestionKind =
   | "create_task"
@@ -241,7 +241,7 @@ export class TaskBridgeSuggestionStore {
     limit?: number;
   }): TaskBridgeSuggestion[] {
     const where: string[] = [];
-    const args: unknown[] = [];
+    const args: SQLInputValue[] = [];
     if (input?.status) {
       where.push("status = ?");
       args.push(input.status);
