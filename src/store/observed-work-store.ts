@@ -1,4 +1,4 @@
-import type { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 
 export type ObservedWorkStatus =
   | "observed_completed"
@@ -317,7 +317,7 @@ export class ObservedWorkStore {
         WHERE src.work_item_id = lcm_observed_work_items.work_item_id
       )`,
     ];
-    const args: unknown[] = [];
+    const args: SQLInputValue[] = [];
     if (query.conversationId != null) {
       where.push("conversation_id = ?");
       args.push(query.conversationId);
