@@ -9,7 +9,9 @@
       "lcm_grep",
       "lcm_describe",
       "lcm_expand",
-      "lcm_expand_query"
+      "lcm_expand_query",
+      "lcm_recent",
+      "lcm_rollup_debug"
     ]
   },
   "uiHints": {
