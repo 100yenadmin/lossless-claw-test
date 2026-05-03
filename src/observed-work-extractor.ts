@@ -451,8 +451,11 @@ export class ObservedWorkExtractor {
       where.push("s.rowid > ?");
       args.push(cursorRowid);
     } else if (state?.lastProcessedSummaryCreatedAt) {
+      // ISO-8601 timestamps sort lexicographically; avoid julianday() so we
+      // keep the (created_at, summary_id) index-friendly and consistent with
+      // the rest of the LCM cursor comparators (Wave 1 fix).
       where.push(
-        `(julianday(s.created_at) > julianday(?) OR (julianday(s.created_at) = julianday(?) AND s.summary_id > ?))`,
+        `(s.created_at > ? OR (s.created_at = ? AND s.summary_id > ?))`,
       );
       args.push(
         state.lastProcessedSummaryCreatedAt,
