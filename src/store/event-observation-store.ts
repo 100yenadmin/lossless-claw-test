@@ -206,8 +206,17 @@ export class EventObservationStore {
     const query = normalizeQueryKey(input?.query);
     if (query) {
       const likeQuery = `%${escapeLikePattern(query)}%`;
+      // INVARIANT: query_key is stored already lowercased+normalized via
+      // normalizeQueryKey() at insert time (see insertObservation). So we
+      // compare directly against the column rather than wrapping in
+      // lower(coalesce(...)) — that wrapper would prevent SQLite from
+      // using lcm_event_observations_query_time_idx and force a scan.
+      //
+      // The title/description LIKE clauses are inherently full-scan, but
+      // their cost is bounded by the time-window filters (since/before)
+      // appended below, which select on (event_time, ingest_time).
       where.push(
-        "(lower(coalesce(query_key, '')) = ? OR lower(title) LIKE ? ESCAPE '\\' OR lower(coalesce(description, '')) LIKE ? ESCAPE '\\')"
+        "(query_key = ? OR lower(title) LIKE ? ESCAPE '\\' OR lower(coalesce(description, '')) LIKE ? ESCAPE '\\')"
       );
       args.push(query, likeQuery, likeQuery);
     }
