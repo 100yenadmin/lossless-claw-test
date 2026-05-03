@@ -731,6 +731,7 @@ describe("ObservedWorkStore", () => {
     };
     const deps = {
       resolveSessionIdFromSessionKey: async () => undefined,
+      clock: { now: () => new Date() },
     } as unknown as LcmDependencies;
     const tool = createLcmWorkDensityTool({
       deps,
@@ -840,6 +841,7 @@ describe("ObservedWorkStore", () => {
     };
     const deps = {
       resolveSessionIdFromSessionKey: async () => undefined,
+      clock: { now: () => new Date() },
     } as unknown as LcmDependencies;
     const tool = createLcmWorkDensityTool({
       deps,
