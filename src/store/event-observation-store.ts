@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
 export type EventObservationKind =
@@ -25,6 +26,11 @@ export type EventObservationInput = {
   sourceIds?: string[];
 };
 
+export type EventSource = {
+  sourceType?: "summary" | "rollup" | "message";
+  sourceId: string;
+};
+
 export type EventObservation = {
   eventId: string;
   conversationId: number;
@@ -36,7 +42,22 @@ export type EventObservation = {
   ingestTime: string;
   confidence: number;
   rationale: string;
-  sources?: Array<{ sourceType: "summary" | "rollup" | "message"; sourceId: string }>;
+  sources?: EventSource[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type EventEpisode = {
+  episodeId: string;
+  conversationId: number;
+  episodeKind: EventObservationKind;
+  topicKey: string;
+  title: string;
+  firstEventTime: string;
+  lastEventTime: string;
+  observationCount: number;
+  confidence: number;
+  sources?: EventSource[];
   createdAt: string;
   updatedAt: string;
 };
@@ -89,7 +110,6 @@ function hashId(prefix: string, value: string): string {
   return `${prefix}_${createHash("sha256").update(value).digest("hex").slice(0, 24)}`;
 }
 
-
 function placeholders(values: readonly unknown[]): string {
   return values.map(() => "?").join(", ");
 }
@@ -115,28 +135,84 @@ function normalizeQueryKey(value: string | undefined): string | null {
   }
   const pr =
     /^(?:pr|pull request)\s*#?\s*(\d{1,6})$/.exec(normalized) ??
-    /^pr[-\s#]*(\d{1,6})$/.exec(normalized);
+    /^pr[-\s#]*(\d{1,6})$/.exec(normalized) ??
+    /(?:^|\/)pull\/(\d{1,6})(?:\b|$)/.exec(normalized);
   if (pr?.[1]) {
     return `pr-${pr[1]}`;
   }
   return normalized;
 }
 
-function parseSourceIds(raw: string, sourceType: "summary" | "rollup" | "message"): Array<{
-  sourceType: "summary" | "rollup" | "message";
-  sourceId: string;
-}> {
+function isEventSourceType(value: unknown): value is "summary" | "rollup" | "message" {
+  return value === "summary" || value === "rollup" || value === "message";
+}
+
+function parseSources(
+  raw: string,
+  fallbackSourceType?: "summary" | "rollup" | "message",
+): EventSource[] {
   try {
     const parsed = JSON.parse(raw) as unknown;
     if (!Array.isArray(parsed)) {
       return [];
     }
     return parsed
-      .filter((sourceId): sourceId is string => typeof sourceId === "string" && sourceId.trim().length > 0)
-      .map((sourceId) => ({ sourceType, sourceId }));
+      .map((source): EventSource | null => {
+        if (typeof source === "string" && source.trim().length > 0) {
+          return {
+            ...(fallbackSourceType ? { sourceType: fallbackSourceType } : {}),
+            sourceId: source.trim(),
+          };
+        }
+        if (
+          typeof source === "object" &&
+          source != null &&
+          "sourceId" in source &&
+          typeof source.sourceId === "string" &&
+          source.sourceId.trim().length > 0
+        ) {
+          const sourceType = "sourceType" in source ? source.sourceType : undefined;
+          return {
+            ...(isEventSourceType(sourceType) ? { sourceType } : {}),
+            sourceId: source.sourceId.trim(),
+          };
+        }
+        return null;
+      })
+      .filter((source): source is EventSource => source != null);
   } catch {
     return [];
   }
+}
+
+function normalizeSources(sources: EventSource[]): EventSource[] {
+  const seen = new Set<string>();
+  const normalized: EventSource[] = [];
+  for (const source of sources) {
+    const sourceId = source.sourceId.trim();
+    if (!sourceId) {
+      continue;
+    }
+    const key = `${source.sourceType ?? ""}:${sourceId}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    normalized.push({
+      ...(source.sourceType ? { sourceType: source.sourceType } : {}),
+      sourceId,
+    });
+  }
+  return normalized;
+}
+
+function sourcesFromIds(
+  sourceType: "summary" | "rollup" | "message",
+  sourceIds: string[],
+): EventSource[] {
+  return normalizeSources(
+    sourceIds.map((sourceId) => ({ sourceType, sourceId })),
+  );
 }
 
 function rowToEvent(row: EventObservationRow, includeSources: boolean): EventObservation {
@@ -152,11 +228,41 @@ function rowToEvent(row: EventObservationRow, includeSources: boolean): EventObs
     confidence: row.confidence,
     rationale: row.rationale,
     ...(includeSources
-      ? { sources: parseSourceIds(row.source_ids, row.source_type) }
+      ? { sources: parseSources(row.source_ids, row.source_type) }
       : {}),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function rowToEpisode(row: EventEpisodeRow, includeSources: boolean): EventEpisode {
+  return {
+    episodeId: row.episode_id,
+    conversationId: row.conversation_id,
+    episodeKind: row.episode_kind,
+    topicKey: row.topic_key,
+    title: row.title,
+    firstEventTime: row.first_event_time,
+    lastEventTime: row.last_event_time,
+    observationCount: row.observation_count,
+    confidence: row.confidence,
+    ...(includeSources
+      ? { sources: parseSources(row.source_ids).slice(0, MAX_EPISODE_SOURCES) }
+      : {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function compareIso(a: string, b: string, pick: "min" | "max"): string {
+  const aTime = new Date(a).getTime();
+  const bTime = new Date(b).getTime();
+  if (!Number.isFinite(aTime)) return b;
+  if (!Number.isFinite(bTime)) return a;
+  if (pick === "min") {
+    return aTime <= bTime ? a : b;
+  }
+  return aTime >= bTime ? a : b;
 }
 
 export class EventObservationStore {
@@ -541,26 +647,17 @@ export class EventObservationStore {
     const query = normalizeQueryKey(input?.query);
     if (query) {
       const likeQuery = `%${escapeLikePattern(query)}%`;
-      // INVARIANT: query_key is stored already lowercased+normalized via
-      // normalizeQueryKey() at insert time (see insertObservation). So we
-      // compare directly against the column rather than wrapping in
-      // lower(coalesce(...)) — that wrapper would prevent SQLite from
-      // using lcm_event_observations_query_time_idx and force a scan.
-      //
-      // The title/description LIKE clauses are inherently full-scan, but
-      // their cost is bounded by the time-window filters (since/before)
-      // appended below, which select on (event_time, ingest_time).
       where.push(
-        "(query_key = ? OR lower(title) LIKE ? ESCAPE '\\' OR lower(coalesce(description, '')) LIKE ? ESCAPE '\\')"
+        "(lower(coalesce(query_key, '')) = ? OR lower(title) LIKE ? ESCAPE '\\' OR lower(coalesce(description, '')) LIKE ? ESCAPE '\\')"
       );
       args.push(query, likeQuery, likeQuery);
     }
     if (input?.since) {
-      where.push("julianday(coalesce(event_time, ingest_time)) >= julianday(?)");
+      where.push("coalesce(event_time, ingest_time) >= ?");
       args.push(input.since);
     }
     if (input?.before) {
-      where.push("julianday(coalesce(event_time, ingest_time)) < julianday(?)");
+      where.push("coalesce(event_time, ingest_time) < ?");
       args.push(input.before);
     }
     const limit = Math.max(1, Math.min(input?.limit ?? 20, 100));
@@ -572,9 +669,61 @@ export class EventObservationStore {
               source_ids, created_at, updated_at
        FROM lcm_event_observations
        ${whereSql}
-       ORDER BY julianday(coalesce(event_time, ingest_time)) ${order}, confidence DESC
+       ORDER BY coalesce(event_time, ingest_time) ${order}, confidence DESC, event_id ASC
        LIMIT ?`,
     ).all(...args, limit) as EventObservationRow[];
     return rows.map((row) => rowToEvent(row, input?.includeSources === true));
+  }
+
+  listEpisodes(input?: {
+    conversationId?: number;
+    eventKinds?: EventObservationKind[];
+    query?: string;
+    since?: string;
+    before?: string;
+    first?: boolean;
+    includeSources?: boolean;
+    limit?: number;
+  }): EventEpisode[] {
+    const where: string[] = [];
+    const args: Array<string | number> = [];
+    if (input?.conversationId != null) {
+      where.push("conversation_id = ?");
+      args.push(input.conversationId);
+    }
+    if (input?.eventKinds?.length) {
+      where.push(`episode_kind IN (${placeholders(input.eventKinds)})`);
+      args.push(...input.eventKinds);
+    }
+    const query = normalizeQueryKey(input?.query);
+    if (query) {
+      const likeQuery = `%${escapeLikePattern(query)}%`;
+      where.push(
+        "(lower(topic_key) = ? OR lower(title) LIKE ? ESCAPE '\\')"
+      );
+      args.push(query, likeQuery);
+    }
+    if (input?.since) {
+      where.push("last_event_time >= ?");
+      args.push(input.since);
+    }
+    if (input?.before) {
+      where.push("first_event_time < ?");
+      args.push(input.before);
+    }
+    const limit = Math.max(1, Math.min(input?.limit ?? 20, 100));
+    const order = input?.first ? "ASC" : "DESC";
+    const orderColumn = input?.first ? "first_event_time" : "last_event_time";
+    const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    const rows = this.db.prepare(
+      `SELECT episode_id, conversation_id, episode_kind, topic_key, title,
+              first_event_time, last_event_time, observation_count, confidence,
+              source_ids, created_at, updated_at
+       FROM lcm_event_episodes
+       ${whereSql}
+       ORDER BY ${orderColumn} ${order}, confidence DESC, episode_id ASC
+       LIMIT ?`,
+    ).all(...args, limit) as EventEpisodeRow[];
+    return rows.map((row) => rowToEpisode(row, input?.includeSources === true));
   }
 }
