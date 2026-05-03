@@ -225,6 +225,7 @@ export function createLcmTaskSuggestionsTool(input: {
         inserted: 0,
         refreshed: 0,
         preservedReviewed: 0,
+        skipped: 0,
       };
       if (mode === "record") {
         const store = lcm.getTaskBridgeSuggestionStore();
@@ -236,17 +237,21 @@ export function createLcmTaskSuggestionsTool(input: {
           rationale: suggestion.rationale,
           sourceIds: sourceIdsByWorkItemId.get(suggestion.workItemId) ?? [],
         }));
-        // Single transaction → one fsync for the whole batch (cap is 50 above)
-        // and a deterministic accounting bucket for each input even if a
-        // concurrent reviewer is racing the store.
-        const results = store.bulkUpsertSuggestions(inputs);
+        // Single transaction (routed through the per-database mutex) → one
+        // fsync for the whole batch (cap is 50 above) and a deterministic
+        // accounting bucket for each input even if a concurrent reviewer is
+        // racing the store. Per-row failures are demoted to "skipped" so a
+        // single FK-deletion race does not poison the rest of the batch.
+        const results = await store.bulkUpsertSuggestions(inputs);
         for (const result of results) {
           if (result === "inserted") {
             recordAccounting.inserted += 1;
           } else if (result === "refreshed") {
             recordAccounting.refreshed += 1;
-          } else {
+          } else if (result === "preserved_reviewed") {
             recordAccounting.preservedReviewed += 1;
+          } else {
+            recordAccounting.skipped += 1;
           }
         }
       }
@@ -264,6 +269,7 @@ export function createLcmTaskSuggestionsTool(input: {
               : 0,
           preservedReviewed:
             mode === "record" ? recordAccounting.preservedReviewed : 0,
+          skipped: mode === "record" ? recordAccounting.skipped : 0,
         },
         disclaimer:
           "Suggestions are inert LCM ledger records. They do not create, close, assign, remind, wake, or sync external tasks.",

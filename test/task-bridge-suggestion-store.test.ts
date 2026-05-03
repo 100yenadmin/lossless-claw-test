@@ -77,11 +77,11 @@ describe("TaskBridgeSuggestionStore", () => {
     expect(row?.name).toBe("lcm_task_bridge_suggestions");
   });
 
-  it("stores suggestions as pending records without applying task writes", () => {
+  it("stores suggestions as pending records without applying task writes", async () => {
     const db = makeDb();
     createObservedWorkItem(db, "work_1", ["sum_a", "sum_b"]);
     const store = new TaskBridgeSuggestionStore(db);
-    expect(store.upsertSuggestion({
+    expect(await store.upsertSuggestion({
       suggestionId: "sug_1",
       workItemId: "work_1",
       suggestionKind: "create_task",
@@ -89,7 +89,7 @@ describe("TaskBridgeSuggestionStore", () => {
       rationale: "Observed repeated unfinished blocker evidence.",
       sourceIds: ["sum_a", "sum_b", "sum_a", ""],
     })).toBe("inserted");
-    expect(store.upsertSuggestion({
+    expect(await store.upsertSuggestion({
       suggestionId: "sug_1",
       workItemId: "work_1",
       suggestionKind: "create_task",
@@ -114,11 +114,11 @@ describe("TaskBridgeSuggestionStore", () => {
     ).toBeUndefined();
   });
 
-  it("records review status without modifying external task state", () => {
+  it("records review status without modifying external task state", async () => {
     const db = makeDb();
     createObservedWorkItem(db, "work_2", ["sum_done", "sum_done_later"]);
     const store = new TaskBridgeSuggestionStore(db);
-    expect(store.upsertSuggestion({
+    expect(await store.upsertSuggestion({
       suggestionId: "sug_2",
       workItemId: "work_2",
       taskId: "task_123",
@@ -163,7 +163,7 @@ describe("TaskBridgeSuggestionStore", () => {
       evidenceKind: "created",
     });
 
-    expect(store.upsertSuggestion({
+    expect(await store.upsertSuggestion({
       suggestionId: "sug_2",
       workItemId: "work_2b",
       suggestionKind: "create_task",
@@ -204,12 +204,12 @@ describe("TaskBridgeSuggestionStore", () => {
     });
   });
 
-  it("orders refreshed pending suggestions by updated time", () => {
+  it("orders refreshed pending suggestions by updated time", async () => {
     const db = makeDb();
     createObservedWorkItem(db, "work_order", ["sum_order"]);
     const store = new TaskBridgeSuggestionStore(db);
 
-    expect(store.upsertSuggestion({
+    expect(await store.upsertSuggestion({
       suggestionId: "sug_old",
       workItemId: "work_order",
       suggestionKind: "create_task",
@@ -217,7 +217,7 @@ describe("TaskBridgeSuggestionStore", () => {
       rationale: "Older suggestion.",
       sourceIds: ["sum_order"],
     })).toBe("inserted");
-    expect(store.upsertSuggestion({
+    expect(await store.upsertSuggestion({
       suggestionId: "sug_refreshed",
       workItemId: "work_order",
       suggestionKind: "create_task",
@@ -240,12 +240,12 @@ describe("TaskBridgeSuggestionStore", () => {
       .toEqual(["sug_refreshed", "sug_old"]);
   });
 
-  it("rejects invalid suggestion records and reports missing review targets", () => {
+  it("rejects invalid suggestion records and reports missing review targets", async () => {
     const db = makeDb();
     createObservedWorkItem(db, "work_3", ["sum_bad"]);
     const store = new TaskBridgeSuggestionStore(db);
 
-    expect(() =>
+    await expect(
       store.upsertSuggestion({
         suggestionId: "bad_confidence",
         workItemId: "work_3",
@@ -254,8 +254,8 @@ describe("TaskBridgeSuggestionStore", () => {
         rationale: "too confident",
         sourceIds: ["sum_bad"],
       })
-    ).toThrow(/confidence/);
-    expect(() =>
+    ).rejects.toThrow(/confidence/);
+    await expect(
       store.upsertSuggestion({
         suggestionId: "bad_sources",
         workItemId: "work_3",
@@ -264,8 +264,8 @@ describe("TaskBridgeSuggestionStore", () => {
         rationale: "missing sources",
         sourceIds: [],
       })
-    ).toThrow(/source ID/);
-    expect(() =>
+    ).rejects.toThrow(/source ID/);
+    await expect(
       store.upsertSuggestion({
         suggestionId: " ",
         workItemId: "work_3",
@@ -274,8 +274,8 @@ describe("TaskBridgeSuggestionStore", () => {
         rationale: "blank suggestion ID",
         sourceIds: ["sum_bad"],
       })
-    ).toThrow(/suggestionId/);
-    expect(() =>
+    ).rejects.toThrow(/suggestionId/);
+    await expect(
       store.upsertSuggestion({
         suggestionId: "bad_work_item",
         workItemId: " ",
@@ -284,8 +284,8 @@ describe("TaskBridgeSuggestionStore", () => {
         rationale: "blank work item ID",
         sourceIds: ["sum_bad"],
       })
-    ).toThrow(/workItemId/);
-    expect(() =>
+    ).rejects.toThrow(/workItemId/);
+    await expect(
       store.upsertSuggestion({
         suggestionId: "missing_work",
         workItemId: "missing_work_item",
@@ -294,8 +294,8 @@ describe("TaskBridgeSuggestionStore", () => {
         rationale: "missing FK target",
         sourceIds: ["sum_bad"],
       })
-    ).toThrow();
-    expect(() =>
+    ).rejects.toThrow();
+    await expect(
       store.upsertSuggestion({
         suggestionId: "missing_source",
         workItemId: "work_3",
@@ -304,8 +304,8 @@ describe("TaskBridgeSuggestionStore", () => {
         rationale: "missing observed source",
         sourceIds: ["missing_source"],
       })
-    ).toThrow(/source IDs/);
-    expect(() =>
+    ).rejects.toThrow(/source IDs/);
+    await expect(
       store.upsertSuggestion({
         suggestionId: "reviewed_on_upsert",
         workItemId: "work_3",
@@ -315,8 +315,8 @@ describe("TaskBridgeSuggestionStore", () => {
         rationale: "review state attempted on upsert",
         sourceIds: ["sum_bad"],
       })
-    ).toThrow(/reviewSuggestion/);
-    expect(() =>
+    ).rejects.toThrow(/reviewSuggestion/);
+    await expect(
       store.upsertSuggestion({
         suggestionId: "missing_task_id",
         workItemId: "work_3",
@@ -325,7 +325,7 @@ describe("TaskBridgeSuggestionStore", () => {
         rationale: "targeted task action without task target",
         sourceIds: ["sum_bad"],
       })
-    ).toThrow(/taskId/);
+    ).rejects.toThrow(/taskId/);
     expect(
       store.reviewSuggestion({
         suggestionId: "missing",
@@ -490,5 +490,175 @@ describe("TaskBridgeSuggestionStore", () => {
     const pending = taskBridge.listSuggestions({ status: "pending" });
     expect(pending).toHaveLength(1);
     expect(pending[0]?.suggestionKind).toBe("create_task");
+  });
+
+  describe("bulkUpsertSuggestions", () => {
+    it("returns [] for an empty input without opening a transaction", async () => {
+      const db = makeDb();
+      const store = new TaskBridgeSuggestionStore(db);
+      // If this opened a tx, a follow-up BEGIN IMMEDIATE would fail with
+      // "cannot start a transaction within a transaction".
+      const results = await store.bulkUpsertSuggestions([]);
+      expect(results).toEqual([]);
+      db.exec("BEGIN IMMEDIATE");
+      db.exec("COMMIT");
+    });
+
+    it("inserts new rows and refreshes existing pending rows in one batch", async () => {
+      const db = makeDb();
+      createObservedWorkItem(db, "work_bulk_a", ["sum_a1", "sum_a2"]);
+      const observedWork = new ObservedWorkStore(db);
+      observedWork.upsertItem({
+        workItemId: "work_bulk_b",
+        conversationId: 1,
+        firstSeenAt: "2026-04-28T00:00:00.000Z",
+        lastSeenAt: "2026-04-28T01:00:00.000Z",
+        title: "Bulk B",
+        observedStatus: "observed_unfinished",
+        kind: "follow_up",
+        confidence: 0.8,
+        fingerprint: "observed:work_bulk_b",
+      });
+      addObservedSources(db, "work_bulk_b", ["sum_b1"]);
+
+      const store = new TaskBridgeSuggestionStore(db);
+      // Pre-seed `sug_a` so it should come back as "refreshed" on the second
+      // pass; `sug_b` is brand new and should come back as "inserted".
+      expect(
+        await store.upsertSuggestion({
+          suggestionId: "sug_a",
+          workItemId: "work_bulk_a",
+          suggestionKind: "create_task",
+          confidence: 0.7,
+          rationale: "Initial insert.",
+          sourceIds: ["sum_a1"],
+        })
+      ).toBe("inserted");
+
+      const results = await store.bulkUpsertSuggestions([
+        {
+          suggestionId: "sug_a",
+          workItemId: "work_bulk_a",
+          suggestionKind: "create_task",
+          confidence: 0.85,
+          rationale: "Refreshed via bulk.",
+          sourceIds: ["sum_a1", "sum_a2"],
+        },
+        {
+          suggestionId: "sug_b",
+          workItemId: "work_bulk_b",
+          suggestionKind: "create_task",
+          confidence: 0.6,
+          rationale: "Brand new via bulk.",
+          sourceIds: ["sum_b1"],
+        },
+      ]);
+      expect(results).toEqual(["refreshed", "inserted"]);
+      const pending = store.listSuggestions({ status: "pending" });
+      expect(pending.map((row) => row.suggestionId).sort()).toEqual([
+        "sug_a",
+        "sug_b",
+      ]);
+    });
+
+    it("preserves the result order and reports preserved_reviewed for reviewed rows", async () => {
+      const db = makeDb();
+      createObservedWorkItem(db, "work_bulk_pres", ["sum_p1", "sum_p2"]);
+      const store = new TaskBridgeSuggestionStore(db);
+      await store.upsertSuggestion({
+        suggestionId: "sug_p1",
+        workItemId: "work_bulk_pres",
+        suggestionKind: "create_task",
+        confidence: 0.7,
+        rationale: "Reviewed already.",
+        sourceIds: ["sum_p1"],
+      });
+      expect(
+        store.reviewSuggestion({
+          suggestionId: "sug_p1",
+          status: "accepted",
+          reviewedBy: "tester",
+        })
+      ).toBe(true);
+
+      const results = await store.bulkUpsertSuggestions([
+        {
+          suggestionId: "sug_p2",
+          workItemId: "work_bulk_pres",
+          suggestionKind: "create_task",
+          confidence: 0.65,
+          rationale: "New row arriving first in the array.",
+          sourceIds: ["sum_p2"],
+        },
+        {
+          suggestionId: "sug_p1",
+          workItemId: "work_bulk_pres",
+          suggestionKind: "create_task",
+          confidence: 0.95,
+          rationale: "Re-scan a reviewed row.",
+          sourceIds: ["sum_p1"],
+        },
+      ]);
+      expect(results).toEqual(["inserted", "preserved_reviewed"]);
+      const accepted = store.listSuggestions({ status: "accepted" });
+      expect(accepted).toHaveLength(1);
+      expect(accepted[0]?.suggestionId).toBe("sug_p1");
+      expect(accepted[0]?.confidence).toBe(0.7);
+    });
+
+    it("demotes a row whose source ID does not belong to its work item to skipped", async () => {
+      const db = makeDb();
+      createObservedWorkItem(db, "work_bulk_ok", ["sum_ok"]);
+      const observedWork = new ObservedWorkStore(db);
+      observedWork.upsertItem({
+        workItemId: "work_bulk_other",
+        conversationId: 1,
+        firstSeenAt: "2026-04-28T00:00:00.000Z",
+        lastSeenAt: "2026-04-28T01:00:00.000Z",
+        title: "Other",
+        observedStatus: "observed_unfinished",
+        kind: "follow_up",
+        confidence: 0.8,
+        fingerprint: "observed:work_bulk_other",
+      });
+      addObservedSources(db, "work_bulk_other", ["sum_other"]);
+      const store = new TaskBridgeSuggestionStore(db);
+      // Middle row has a source ID that exists but does NOT belong to its
+      // declared work item — assertSourceIdsBelongToWorkItem throws inside the
+      // savepoint, which should demote that single row to "skipped" while the
+      // surrounding good rows commit.
+      const results = await store.bulkUpsertSuggestions([
+        {
+          suggestionId: "sug_ok_1",
+          workItemId: "work_bulk_ok",
+          suggestionKind: "create_task",
+          confidence: 0.7,
+          rationale: "Good row 1.",
+          sourceIds: ["sum_ok"],
+        },
+        {
+          suggestionId: "sug_bad",
+          workItemId: "work_bulk_ok",
+          suggestionKind: "create_task",
+          confidence: 0.8,
+          rationale: "Source belongs to a different work item.",
+          sourceIds: ["sum_other"],
+        },
+        {
+          suggestionId: "sug_ok_2",
+          workItemId: "work_bulk_other",
+          suggestionKind: "create_task",
+          confidence: 0.6,
+          rationale: "Good row 2 on a different work item.",
+          sourceIds: ["sum_other"],
+        },
+      ]);
+      expect(results).toEqual(["inserted", "skipped", "inserted"]);
+      const pending = store
+        .listSuggestions({ status: "pending" })
+        .map((row) => row.suggestionId)
+        .sort();
+      expect(pending).toEqual(["sug_ok_1", "sug_ok_2"]);
+    });
   });
 });

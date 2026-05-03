@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { withDatabaseTransaction } from "../transaction-mutex.js";
 
 export type TaskBridgeSuggestionKind =
   | "create_task"
@@ -45,7 +46,8 @@ export type TaskBridgeSuggestion = {
 export type TaskBridgeSuggestionUpsertResult =
   | "inserted"
   | "refreshed"
-  | "preserved_reviewed";
+  | "preserved_reviewed"
+  | "skipped";
 
 type TaskBridgeSuggestionRow = {
   suggestion_id: string;
@@ -150,7 +152,25 @@ export class TaskBridgeSuggestionStore {
     }
   }
 
-  upsertSuggestion(input: TaskBridgeSuggestionInput): TaskBridgeSuggestionUpsertResult {
+  async upsertSuggestion(
+    input: TaskBridgeSuggestionInput
+  ): Promise<TaskBridgeSuggestionUpsertResult> {
+    const args = this.validateAndNormalizeUpsertInput(input);
+    return withDatabaseTransaction(this.db, "BEGIN IMMEDIATE", () =>
+      this.upsertSuggestionInTransaction(args)
+    );
+  }
+
+  private validateAndNormalizeUpsertInput(input: TaskBridgeSuggestionInput): {
+    suggestionId: string;
+    workItemId: string;
+    taskId: string | undefined;
+    suggestionKind: TaskBridgeSuggestionKind;
+    confidence: number;
+    rationale: string;
+    sourceIds: string[];
+    createdBy: string;
+  } {
     const suggestionId = input.suggestionId.trim();
     if (suggestionId.length === 0) {
       throw new Error("suggestionId is required.");
@@ -179,7 +199,7 @@ export class TaskBridgeSuggestionStore {
     if (sourceIds.length === 0) {
       throw new Error("at least one source ID is required.");
     }
-    return this.runInTransaction(() => this.upsertSuggestionInTransaction({
+    return {
       suggestionId,
       workItemId,
       taskId,
@@ -188,7 +208,7 @@ export class TaskBridgeSuggestionStore {
       rationale: input.rationale.trim(),
       sourceIds,
       createdBy: input.createdBy?.trim() || "lcm_observed",
-    }));
+    };
   }
 
   /**
@@ -198,55 +218,43 @@ export class TaskBridgeSuggestionStore {
    * `upsertSuggestion`, but the whole batch commits with one fsync, which is a
    * dramatic speed-up when callers (e.g. the LCM task suggestion tool's
    * `record` mode) push 50 candidates at once.
+   *
+   * Per-row failure semantics: input validation errors (bad confidence, blank
+   * IDs, requested non-pending status, missing taskId for targeted kinds, no
+   * source IDs) still throw before the transaction opens — the whole batch
+   * aborts with no fsync. Once inside the transaction, per-row INSERT/UPSERT
+   * errors (e.g. a concurrent FK-deletion of the work item or its source
+   * evidence) are demoted to a "skipped" outcome via SQLite SAVEPOINTs around
+   * each row, so a single bad row does not poison the rest of the batch. The
+   * result array is order-preserving: `results[i]` corresponds to `inputs[i]`.
    */
-  bulkUpsertSuggestions(
+  async bulkUpsertSuggestions(
     inputs: TaskBridgeSuggestionInput[]
-  ): TaskBridgeSuggestionUpsertResult[] {
+  ): Promise<TaskBridgeSuggestionUpsertResult[]> {
     if (inputs.length === 0) {
+      // Skip transaction entirely when there's nothing to do.
       return [];
     }
-    const prepared = inputs.map((input) => {
-      const suggestionId = input.suggestionId.trim();
-      if (suggestionId.length === 0) {
-        throw new Error("suggestionId is required.");
-      }
-      const workItemId = input.workItemId.trim();
-      if (workItemId.length === 0) {
-        throw new Error("workItemId is required.");
-      }
-      if (!Number.isFinite(input.confidence) || input.confidence < 0 || input.confidence > 1) {
-        throw new Error("confidence must be between 0 and 1.");
-      }
-      if (input.rationale.trim().length === 0) {
-        throw new Error("rationale is required.");
-      }
-      const requestedStatus = input.status ?? "pending";
-      if (requestedStatus !== "pending") {
-        throw new Error(
-          "upsertSuggestion only creates or refreshes pending suggestions; use reviewSuggestion for reviewed states."
-        );
-      }
-      const taskId = input.taskId?.trim();
-      if (TASK_TARGETING_KINDS.has(input.suggestionKind) && !taskId) {
-        throw new Error(`${input.suggestionKind} suggestions require taskId.`);
-      }
-      const sourceIds = normalizeSourceIds(input.sourceIds);
-      if (sourceIds.length === 0) {
-        throw new Error("at least one source ID is required.");
-      }
-      return {
-        suggestionId,
-        workItemId,
-        taskId,
-        suggestionKind: input.suggestionKind,
-        confidence: input.confidence,
-        rationale: input.rationale.trim(),
-        sourceIds,
-        createdBy: input.createdBy?.trim() || "lcm_observed",
-      };
-    });
-    return this.runInTransaction(() =>
-      prepared.map((args) => this.upsertSuggestionInTransaction(args))
+    const prepared = inputs.map((input) =>
+      this.validateAndNormalizeUpsertInput(input)
+    );
+    return withDatabaseTransaction(this.db, "BEGIN IMMEDIATE", () =>
+      prepared.map((args) => {
+        const savepointName = `lcm_task_bridge_row_sp_${++TaskBridgeSuggestionStore.savepointId}`;
+        this.db.exec(`SAVEPOINT ${savepointName}`);
+        try {
+          const result = this.upsertSuggestionInTransaction(args);
+          this.db.exec(`RELEASE SAVEPOINT ${savepointName}`);
+          return result;
+        } catch {
+          // Demote to "skipped" instead of poisoning the whole batch. Common
+          // causes: concurrent FK-deletion of the work item or its observed
+          // source evidence between candidate scan and INSERT.
+          this.db.exec(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+          this.db.exec(`RELEASE SAVEPOINT ${savepointName}`);
+          return "skipped" as TaskBridgeSuggestionUpsertResult;
+        }
+      })
     );
   }
 
@@ -314,47 +322,7 @@ export class TaskBridgeSuggestionStore {
     return existingStatus === "pending" ? "refreshed" : "inserted";
   }
 
-  /**
-   * Run `operation` inside a synchronous SQLite transaction.
-   *
-   * If we are already inside a transaction (either the per-database mutex's
-   * `BEGIN`, or a nested call into the store), we use a SAVEPOINT instead so
-   * SQLite does not raise "cannot start a transaction within a transaction".
-   *
-   * The whole closure runs synchronously — no `await` allowed — which keeps the
-   * outer `upsertSuggestion` API sync-callable from existing tests and tools.
-   */
-  private runInTransaction<T>(operation: () => T): T {
-    const inTransaction = (this.db as unknown as { inTransaction?: boolean }).inTransaction;
-    if (inTransaction) {
-      const savepointName = `lcm_task_bridge_sp_${++TaskBridgeSuggestionStore.savepointId}`;
-      this.db.exec(`SAVEPOINT ${savepointName}`);
-      try {
-        const result = operation();
-        this.db.exec(`RELEASE SAVEPOINT ${savepointName}`);
-        return result;
-      } catch (error) {
-        this.db.exec(`ROLLBACK TO SAVEPOINT ${savepointName}`);
-        this.db.exec(`RELEASE SAVEPOINT ${savepointName}`);
-        throw error;
-      }
-    }
-    let transactionActive = false;
-    try {
-      this.db.exec("BEGIN IMMEDIATE");
-      transactionActive = true;
-      const result = operation();
-      this.db.exec("COMMIT");
-      transactionActive = false;
-      return result;
-    } catch (error) {
-      if (transactionActive) {
-        this.db.exec("ROLLBACK");
-      }
-      throw error;
-    }
-  }
-
+  /** Counter used to make per-row savepoint names unique within a process. */
   private static savepointId = 0;
 
   listSuggestions(input?: {
