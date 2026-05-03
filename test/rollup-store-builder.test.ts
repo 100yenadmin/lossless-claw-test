@@ -2741,4 +2741,73 @@ describe("LCM weekly and monthly rollups", () => {
       100
     );
   });
+
+  it("honors custom weeklyMaxTokens / monthlyMaxTokens caps", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "aggregate-cap-config",
+      sessionKey: "agent:main:aggregate-cap-config",
+      title: "Aggregate cap config",
+    });
+
+    const weekDays = [
+      "2026-04-27",
+      "2026-04-28",
+      "2026-04-29",
+      "2026-04-30",
+      "2026-05-01",
+      "2026-05-02",
+      "2026-05-03",
+    ];
+    const filler = "weekly aggregate content ".repeat(60);
+    for (const day of weekDays) {
+      await summaryStore.insertSummary({
+        summaryId: `sum_cap_${day}`,
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: `${filler} on ${day}`,
+        tokenCount: estimateTokens(filler),
+        latestAt: new Date(`${day}T10:00:00.000Z`),
+      });
+    }
+
+    // Default cap (20K) leaves all 7 days intact.
+    const defaultBuilder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    for (const day of weekDays) {
+      await defaultBuilder.buildDayRollup(conversation.conversationId, day);
+    }
+    await defaultBuilder.buildWeeklyRollup(
+      conversation.conversationId,
+      "2026-04-27"
+    );
+    const defaultWeek = rollupStore.getRollup(
+      conversation.conversationId,
+      "week",
+      "2026-04-27"
+    );
+    expect(defaultWeek?.content).not.toContain("daily rollups omitted");
+
+    // Tight custom cap forces earlier days to be omitted, proving the
+    // weeklyMaxTokens config is wired through (was previously a silent no-op).
+    const tightBuilder = new RollupBuilder(rollupStore, {
+      timezone: "UTC",
+      weeklyMaxTokens: 200,
+      monthlyMaxTokens: 200,
+    });
+    rollupStore.markStale(defaultWeek!.rollup_id);
+    await tightBuilder.buildWeeklyRollup(
+      conversation.conversationId,
+      "2026-04-27"
+    );
+    const tightWeek = rollupStore.getRollup(
+      conversation.conversationId,
+      "week",
+      "2026-04-27"
+    );
+    expect(tightWeek?.content).toContain("daily rollups omitted");
+    expect(estimateTokens(tightWeek!.content)).toBeLessThanOrEqual(
+      estimateTokens(defaultWeek!.content)
+    );
+  });
 });

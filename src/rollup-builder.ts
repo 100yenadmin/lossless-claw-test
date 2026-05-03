@@ -19,7 +19,8 @@ export { getLocalDateKey, getLocalDayBounds } from "./timezone-windows.js";
 
 const DEFAULT_DAILY_TARGET_TOKENS = 5_000;
 const DEFAULT_DAILY_MAX_TOKENS = 15_000;
-const DEFAULT_AGGREGATE_MAX_TOKENS = 20_000;
+const DEFAULT_WEEKLY_MAX_TOKENS = 20_000;
+const DEFAULT_MONTHLY_MAX_TOKENS = 20_000;
 const TIMELINE_SENTENCE_LIMIT = 3;
 const TIMELINE_MAX_CHARS = 500;
 const DAY_PERIOD_KIND = "day";
@@ -30,6 +31,8 @@ export interface RollupBuilderConfig {
   timezone: string;
   dailyTargetTokens?: number;
   dailyMaxTokens?: number;
+  weeklyMaxTokens?: number;
+  monthlyMaxTokens?: number;
 }
 
 export interface BuildResult {
@@ -77,6 +80,8 @@ type RollupDraft = {
 
 export class RollupBuilder {
   private readonly dailyMaxTokens: number;
+  private readonly weeklyMaxTokens: number;
+  private readonly monthlyMaxTokens: number;
 
   constructor(private store: RollupStore, private config: RollupBuilderConfig) {
     const dailyTargetTokens = normalizePositiveInt(
@@ -86,6 +91,14 @@ export class RollupBuilder {
     this.dailyMaxTokens = Math.max(
       dailyTargetTokens,
       normalizePositiveInt(config.dailyMaxTokens, DEFAULT_DAILY_MAX_TOKENS)
+    );
+    this.weeklyMaxTokens = normalizePositiveInt(
+      config.weeklyMaxTokens,
+      DEFAULT_WEEKLY_MAX_TOKENS
+    );
+    this.monthlyMaxTokens = normalizePositiveInt(
+      config.monthlyMaxTokens,
+      DEFAULT_MONTHLY_MAX_TOKENS
     );
   }
 
@@ -311,7 +324,10 @@ export class RollupBuilder {
       periodKind,
       periodKey,
       sourceRollups,
-      maxTokens: DEFAULT_AGGREGATE_MAX_TOKENS,
+      maxTokens:
+        periodKind === WEEK_PERIOD_KIND
+          ? this.weeklyMaxTokens
+          : this.monthlyMaxTokens,
     });
     const rollupId =
       existing?.rollup_id ?? buildRollupId(periodKind, periodKey);
