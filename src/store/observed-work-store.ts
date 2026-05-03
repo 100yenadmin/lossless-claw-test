@@ -427,11 +427,15 @@ export class ObservedWorkStore {
       args.push(query.conversationId);
     }
     if (query.since) {
-      where.push("julianday(last_seen_at) >= julianday(?)");
+      // Direct ISO 8601 comparison — sorts lexicographically and uses indexes
+      // on last_seen_at; julianday() wrappers would force a full scan.
+      where.push("last_seen_at >= ?");
       args.push(query.since);
     }
     if (query.before) {
-      where.push("julianday(first_seen_at) < julianday(?)");
+      // Direct ISO 8601 comparison — sortable lexicographically; avoids
+      // wrapping first_seen_at in julianday() which would defeat the index.
+      where.push("first_seen_at < ?");
       args.push(query.before);
     }
     if (query.statuses?.length) {
