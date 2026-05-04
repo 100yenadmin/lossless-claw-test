@@ -1,5 +1,6 @@
 import { Type } from "@sinclair/typebox";
 import type { LcmContextEngine } from "../engine.js";
+import type { RollupStore } from "../store/rollup-store.js";
 import {
   addDays,
   getUtcDateForZonedMidnight,
@@ -61,13 +62,14 @@ const LcmWorkDensitySchema = Type.Object({
 
 function resolvePeriodBounds(
   period: unknown,
-  timezone: string
+  timezone: string,
+  now: Date
 ): { label?: string; since?: string; before?: string } {
   if (typeof period !== "string" || period.trim().length === 0) {
     return {};
   }
   const normalized = period.trim().toLowerCase().replace(/\s+/g, " ");
-  const today = getZonedDayString(new Date(), timezone);
+  const today = getZonedDayString(now, timezone);
   if (normalized === "today") {
     return dayBounds("today", today, timezone);
   }
@@ -225,27 +227,77 @@ function applyOutputBudget(
     return details;
   }
   const next: Record<string, unknown> = { ...details };
+  // Pre-attach the accounting block so estimateJsonTokens() accounts for the
+  // real final shape of the payload (maxOutputTokens / itemsReturned /
+  // budgetTruncated / truncated / estimatedOutputTokens fields). Without this,
+  // the trim loop could stop just under budget while the *final* JSON ends up
+  // over budget once accounting is added afterwards.
+  const baseAccounting =
+    next.accounting != null && typeof next.accounting === "object" && !Array.isArray(next.accounting)
+      ? { ...(next.accounting as Record<string, unknown>) }
+      : {};
+  const accounting: Record<string, unknown> = {
+    ...baseAccounting,
+    maxOutputTokens: budget,
+    itemsReturned: countReturnedItems(next),
+    budgetTruncated: false,
+    truncated: Boolean(baseAccounting.truncated),
+    estimatedOutputTokens: 0,
+  };
+  next.accounting = accounting;
   let budgetTruncated = false;
   let guard = 0;
   while (estimateJsonTokens(next) > budget && guard < 10_000) {
     guard += 1;
-    if (trimOneSource(next) || trimOneItem(next)) {
-      budgetTruncated = true;
-      continue;
+    // Adaptive trimming: when the payload is far over budget, drop multiple
+    // sources/items per pass to avoid O(k·n) JSON.stringify hot-spots on
+    // worst-case inputs (large limit + includeSources). When close to budget,
+    // fall back to single-element trimming for precision.
+    const overBy = estimateJsonTokens(next) - budget;
+    const trimsPerPass = overBy > budget ? 8 : overBy > budget / 2 ? 4 : 1;
+    let trimmedThisPass = false;
+    for (let i = 0; i < trimsPerPass; i += 1) {
+      if (trimOneSource(next) || trimOneItem(next)) {
+        trimmedThisPass = true;
+        budgetTruncated = true;
+      } else {
+        break;
+      }
     }
-    break;
+    if (!trimmedThisPass) {
+      break;
+    }
+    accounting.itemsReturned = countReturnedItems(next);
   }
-  const accounting =
-    next.accounting != null && typeof next.accounting === "object" && !Array.isArray(next.accounting)
-      ? { ...(next.accounting as Record<string, unknown>) }
-      : {};
-  accounting.maxOutputTokens = budget;
-  accounting.itemsReturned = countReturnedItems(next);
   accounting.budgetTruncated = budgetTruncated;
   accounting.truncated = Boolean(accounting.truncated) || budgetTruncated;
-  next.accounting = accounting;
+  accounting.itemsReturned = countReturnedItems(next);
   accounting.estimatedOutputTokens = estimateJsonTokens(next);
   return next;
+}
+
+function validateFiniteNumber(
+  value: unknown,
+  key: string,
+  options: { min?: number; max?: number; integer?: boolean }
+): number | undefined {
+  if (value == null) {
+    return undefined;
+  }
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`${key} must be a finite number.`);
+  }
+  if (options.integer && !Number.isInteger(value)) {
+    // Allow callers to pass floats — we truncate rather than reject — but
+    // catch obvious mistakes like negative or non-numeric input above.
+  }
+  if (options.min != null && value < options.min) {
+    throw new Error(`${key} must be >= ${options.min}.`);
+  }
+  if (options.max != null && value > options.max) {
+    throw new Error(`${key} must be <= ${options.max}.`);
+  }
+  return value;
 }
 
 export function createLcmWorkDensityTool(input: {
@@ -254,6 +306,7 @@ export function createLcmWorkDensityTool(input: {
   getLcm?: () => Promise<LcmContextEngine>;
   sessionId?: string;
   sessionKey?: string;
+  rollupStore?: RollupStore;
 }): AnyAgentTool {
   return {
     name: "lcm_work_density",
@@ -266,6 +319,11 @@ export function createLcmWorkDensityTool(input: {
       if (!lcm) {
         throw new Error("LCM engine is unavailable.");
       }
+      // Capture wall-clock once at entry via the injected clock so every
+      // "now" observation inside this call uses the same Date instance and
+      // preset windows are deterministic under frozen-clock tests / replay
+      // (matches the lcm_recent pattern).
+      const callTime = input.deps.clock.now();
       const p = params as Record<string, unknown>;
       const scope = await resolveLcmConversationScope({
         lcm,
@@ -283,13 +341,36 @@ export function createLcmWorkDensityTool(input: {
             "lcm_work_density does not support allConversations=true yet. Provide a conversationId so observed-work reads stay bounded.",
         });
       }
+      // Resolve timezone from per-conversation rollup state first, falling
+      // back to the engine-wide default. Persisted state wins so a
+      // conversation recorded in America/Los_Angeles keeps its day boundaries
+      // even if the engine default later changes.
+      const rollupStoreForTz = input.rollupStore ?? lcm.getRollupStore?.();
+      const timezone =
+        (scope.conversationId != null && rollupStoreForTz?.db
+          ? rollupStoreForTz.getTimezone(scope.conversationId)
+          : null) ?? lcm.timezone;
       let since: string | undefined;
       let before: string | undefined;
       let statuses: ObservedWorkStatus[] | undefined;
       let kinds: ObservedWorkKind[] | undefined;
       let periodLabel: string | undefined;
+      let limit: number;
+      let detailLevel: number;
+      let minConfidence: number | undefined;
+      let maxOutputTokens: number | undefined;
       try {
-        const periodBounds = resolvePeriodBounds(p.period, lcm.timezone);
+        // Runtime validation. The TypeBox schema describes bounds but is not
+        // enforced at runtime, so callers can pass NaN/Infinity/out-of-range
+        // numbers that would otherwise reach SQL or produce surprising
+        // detailLevel/limit truncation.
+        const limitValue = validateFiniteNumber(p.limit, "limit", { min: 1, max: 50 });
+        limit = limitValue != null ? Math.max(1, Math.trunc(limitValue)) : 5;
+        const detailValue = validateFiniteNumber(p.detailLevel, "detailLevel", { min: 0, max: 2 });
+        detailLevel = detailValue != null ? Math.max(0, Math.min(2, Math.trunc(detailValue))) : 1;
+        minConfidence = validateFiniteNumber(p.minConfidence, "minConfidence", { min: 0, max: 1 });
+        maxOutputTokens = validateFiniteNumber(p.maxOutputTokens, "maxOutputTokens", { min: 256 });
+        const periodBounds = resolvePeriodBounds(p.period, timezone, callTime);
         periodLabel = periodBounds.label;
         since = parseIsoTimestampParam(p, "since")?.toISOString() ?? periodBounds.since;
         before = parseIsoTimestampParam(p, "before")?.toISOString() ?? periodBounds.before;
@@ -301,10 +382,7 @@ export function createLcmWorkDensityTool(input: {
       if (since && before && since >= before) {
         return jsonResult({ error: "since must be earlier than before." });
       }
-      const limit = typeof p.limit === "number" ? Math.trunc(p.limit) : 5;
-      const detailLevel = typeof p.detailLevel === "number" ? Math.trunc(p.detailLevel) : 1;
       const topic = typeof p.topic === "string" && p.topic.trim() ? p.topic.trim() : undefined;
-      const minConfidence = typeof p.minConfidence === "number" ? p.minConfidence : undefined;
       const store = lcm.getObservedWorkStore();
       const includeSources = p.includeSources === true;
       const result = store.getDensity({
@@ -324,7 +402,7 @@ export function createLcmWorkDensityTool(input: {
         : undefined;
       const details = applyOutputBudget({
         period: periodLabel,
-        window: since || before ? { since, before, timezone: lcm.timezone } : undefined,
+        window: since || before ? { since, before, timezone } : undefined,
         conversationScope: scope.allConversations ? "all" : scope.conversationId,
         density: result.density,
         ...(filterScopeNote ? { filterScope: filterScopeNote } : {}),
@@ -348,7 +426,7 @@ export function createLcmWorkDensityTool(input: {
           result.density.unfinished > 0
             ? ["Inspect source evidence for unfinished items before claiming certainty."]
             : [],
-      }, p.maxOutputTokens);
+      }, maxOutputTokens);
       return jsonResult(details);
     },
   };

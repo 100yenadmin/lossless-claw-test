@@ -185,7 +185,11 @@ export class ObservedWorkStore {
         fingerprint_version, updated_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
       ON CONFLICT(work_item_id) DO UPDATE SET
-        conversation_id = excluded.conversation_id,
+        -- conversation_id is intentionally NOT updated on conflict. Treating it
+        -- as immutable prevents an existing observed-work row (and its sources)
+        -- from being silently moved between conversations if a workItemId is
+        -- ever reused, which would corrupt history and leak evidence across
+        -- conversation boundaries.
         owner_id = excluded.owner_id,
         title = excluded.title,
         description = excluded.description,
