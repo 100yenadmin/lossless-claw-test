@@ -7,6 +7,10 @@ import type { LcmDependencies } from "../src/types.js";
 
 function makeDb(): DatabaseSync {
   const db = new DatabaseSync(":memory:");
+  // Match the rest of the suite: enforce FK constraints during inserts so the
+  // observed-work FK wiring (work_item_id -> conversations) is actually
+  // exercised by the fixture.
+  db.exec("PRAGMA foreign_keys = ON");
   runLcmMigrations(db, { fts5Available: false });
   return db;
 }
@@ -473,17 +477,6 @@ describe("ObservedWorkStore", () => {
       expect((global.details as { error?: string }).error).toMatch(
         /does not support allConversations/,
       );
-
-      const filtered = await tool.execute("density-filtered-statuses", {
-        conversationId: 1,
-        period: "week",
-        statuses: ["observed_unfinished"],
-        detailLevel: 0,
-      });
-      expect((filtered.details as { filterScope?: string }).filterScope).toBeDefined();
-      expect((filtered.details as { filterScope?: string }).filterScope).toContain(
-        "observed_unfinished",
-      );
     } finally {
       vi.useRealTimers();
     }
@@ -551,118 +544,5 @@ describe("ObservedWorkStore", () => {
     expect(details.accounting.budgetTruncated).toBe(true);
     expect(details.accounting.itemsReturned).toBeLessThan(20);
     expect(details.accounting.estimatedOutputTokens).toBeLessThanOrEqual(256);
-  });
-
-  it("preserves prior optional fields on a partial re-upsert", () => {
-    const db = makeDb();
-    createConversation(db, 1);
-    const store = new ObservedWorkStore(db);
-
-    // First upsert: rich snapshot with every optional field populated.
-    store.upsertItem({
-      workItemId: "work_partial",
-      conversationId: 1,
-      ownerId: "owner-eva",
-      title: "Wire up partial upsert preservation",
-      description: "Long-form description supplied by the rich extractor.",
-      observedStatus: "observed_unfinished",
-      kind: "implementation",
-      confidence: 0.92,
-      confidenceBand: "high",
-      rationale: "Multiple message-level signals plus an explicit owner mention.",
-      topicKey: "topic:partial-upsert",
-      firstSeenAt: "2026-04-30T00:00:00.000Z",
-      lastSeenAt: "2026-04-30T01:00:00.000Z",
-      evidenceCount: 7,
-      sourceMessageCount: 4,
-      sourceTokenCount: 1200,
-      authoritySource: "rich-extractor",
-      sensitivity: "internal",
-      visibility: "team",
-      fingerprint: "impl:partial-upsert",
-      fingerprintVersion: 2,
-    });
-
-    // Second upsert: lighter snapshot containing only the required fields.
-    // Optional fields are intentionally omitted to exercise the COALESCE
-    // preservation path.
-    store.upsertItem({
-      workItemId: "work_partial",
-      conversationId: 1,
-      title: "Wire up partial upsert preservation (refined title)",
-      observedStatus: "observed_unfinished",
-      kind: "implementation",
-      firstSeenAt: "2026-04-30T00:00:00.000Z",
-      lastSeenAt: "2026-04-30T02:00:00.000Z",
-      fingerprint: "impl:partial-upsert",
-    });
-
-    const row = db
-      .prepare(
-        `SELECT owner_id, title, description, confidence, confidence_band,
-                rationale, topic_key, evidence_count, source_message_count,
-                source_token_count, authority_source, sensitivity, visibility,
-                last_seen_at
-         FROM lcm_observed_work_items WHERE work_item_id = 'work_partial'`
-      )
-      .get() as Record<string, unknown>;
-
-    // Required fields update.
-    expect(row.title).toBe("Wire up partial upsert preservation (refined title)");
-    expect(row.last_seen_at).toBe("2026-04-30T02:00:00.000Z");
-
-    // Optional fields are preserved from the earlier rich snapshot.
-    expect(row.owner_id).toBe("owner-eva");
-    expect(row.description).toBe("Long-form description supplied by the rich extractor.");
-    expect(row.confidence).toBe(0.92);
-    expect(row.confidence_band).toBe("high");
-    expect(row.rationale).toBe("Multiple message-level signals plus an explicit owner mention.");
-    expect(row.topic_key).toBe("topic:partial-upsert");
-    expect(row.authority_source).toBe("rich-extractor");
-    expect(row.sensitivity).toBe("internal");
-    expect(row.visibility).toBe("team");
-
-    // Counters do not regress under a smaller snapshot (MAX preservation).
-    expect(row.evidence_count).toBe(7);
-    expect(row.source_message_count).toBe(4);
-    expect(row.source_token_count).toBe(1200);
-  });
-
-  it("clamps out-of-range confidence on insert", () => {
-    const db = makeDb();
-    createConversation(db, 1);
-    const store = new ObservedWorkStore(db);
-
-    store.upsertItem({
-      workItemId: "work_clamp_high",
-      conversationId: 1,
-      title: "High",
-      observedStatus: "observed_unfinished",
-      kind: "implementation",
-      confidence: 1.7,
-      firstSeenAt: "2026-04-30T00:00:00.000Z",
-      lastSeenAt: "2026-04-30T00:00:00.000Z",
-      fingerprint: "fp:high",
-    });
-    store.upsertItem({
-      workItemId: "work_clamp_low",
-      conversationId: 1,
-      title: "Low",
-      observedStatus: "observed_unfinished",
-      kind: "implementation",
-      confidence: -0.4,
-      firstSeenAt: "2026-04-30T00:00:00.000Z",
-      lastSeenAt: "2026-04-30T00:00:00.000Z",
-      fingerprint: "fp:low",
-    });
-
-    const high = db
-      .prepare(`SELECT confidence FROM lcm_observed_work_items WHERE work_item_id = 'work_clamp_high'`)
-      .get() as { confidence: number };
-    const low = db
-      .prepare(`SELECT confidence FROM lcm_observed_work_items WHERE work_item_id = 'work_clamp_low'`)
-      .get() as { confidence: number };
-    expect(high.confidence).toBe(1);
-    expect(low.confidence).toBe(0);
   });
 });

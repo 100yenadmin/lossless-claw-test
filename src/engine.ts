@@ -1996,6 +1996,7 @@ export class LcmContextEngine implements ContextEngine {
     this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
     this.compactionTelemetryStore = new CompactionTelemetryStore(this.db);
     this.compactionMaintenanceStore = new CompactionMaintenanceStore(this.db);
+    this.observedWorkStore = new ObservedWorkStore(this.db);
     this.rollupStore = new RollupStore(this.db);
     this.rollupBuilder = new RollupBuilder(this.rollupStore, {
       timezone: this.timezone,
