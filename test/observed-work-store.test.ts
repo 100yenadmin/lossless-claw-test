@@ -80,7 +80,7 @@ describe("ObservedWorkStore", () => {
       createdAt: "2026-04-28T05:00:00.000Z",
       content: "- Blocker: PR #540 still has unresolved review comments",
     });
-    expect(extractor.processConversation(7)).toMatchObject({
+    await expect(extractor.processConversation(7)).resolves.toMatchObject({
       summariesScanned: 1,
       workItemsUpserted: 1,
     });
@@ -93,7 +93,7 @@ describe("ObservedWorkStore", () => {
       createdAt: "2026-04-28T05:00:00.000Z",
       content: "- Blocker: PR #541 still has failing CI",
     });
-    expect(extractor.processConversation(7)).toMatchObject({
+    await expect(extractor.processConversation(7)).resolves.toMatchObject({
       summariesScanned: 1,
       workItemsUpserted: 1,
     });
@@ -129,13 +129,13 @@ describe("ObservedWorkStore", () => {
       createdAt: "2026-04-28T05:00:00.000Z",
       content: "- Blocker: PR #552 still has a failing extractor retry test",
     });
-    expect(extractor.processConversation(12)).toMatchObject({
+    await expect(extractor.processConversation(12)).resolves.toMatchObject({
       summariesScanned: 1,
       workItemsUpserted: 1,
     });
 
     db.prepare(`DELETE FROM lcm_observed_work_state WHERE conversation_id = ?`).run(12);
-    expect(extractor.processConversation(12)).toMatchObject({
+    await expect(extractor.processConversation(12)).resolves.toMatchObject({
       summariesScanned: 1,
       workItemsUpserted: 1,
     });
@@ -177,7 +177,7 @@ describe("ObservedWorkStore", () => {
     addSourceSpy.mockImplementationOnce(() => {
       throw new Error("simulated source write failure");
     });
-    expect(() => extractor.processConversation(13)).toThrow(/simulated source/);
+    await expect(extractor.processConversation(13)).rejects.toThrow(/simulated source/);
     addSourceSpy.mockRestore();
 
     expect(
@@ -188,7 +188,7 @@ describe("ObservedWorkStore", () => {
     ).toBe(0);
     expect(observedWork.getState(13)).toBeNull();
 
-    expect(extractor.processConversation(13)).toMatchObject({
+    await expect(extractor.processConversation(13)).resolves.toMatchObject({
       summariesScanned: 1,
       workItemsUpserted: 1,
     });
@@ -217,7 +217,7 @@ describe("ObservedWorkStore", () => {
       createdAt: "2026-04-28T05:00:00.000Z",
       content: "- Blocker: PR #550 needs review",
     });
-    expect(extractor.processConversation(11)).toMatchObject({
+    await expect(extractor.processConversation(11)).resolves.toMatchObject({
       summariesScanned: 1,
       workItemsUpserted: 1,
     });
@@ -236,7 +236,7 @@ describe("ObservedWorkStore", () => {
       createdAt: "2026-04-28T05:00:00.000Z",
       content: "- Blocker: PR #551 needs review",
     });
-    expect(extractor.processConversation(11)).toMatchObject({
+    await expect(extractor.processConversation(11)).resolves.toMatchObject({
       summariesScanned: 1,
       workItemsUpserted: 1,
     });
@@ -266,7 +266,7 @@ describe("ObservedWorkStore", () => {
       createdAt: "2026-04-28T05:00:00.000Z",
       content: "- Blocker: PR #560 needs review",
     });
-    expect(extractor.processConversation(16)).toMatchObject({
+    await expect(extractor.processConversation(16)).resolves.toMatchObject({
       summariesScanned: 1,
       workItemsUpserted: 1,
     });
@@ -287,7 +287,7 @@ describe("ObservedWorkStore", () => {
       createdAt: "2026-04-28T05:00:00.000Z",
       content: "- Blocker: PR #561 needs review",
     });
-    expect(extractor.processConversation(16)).toMatchObject({
+    await expect(extractor.processConversation(16)).resolves.toMatchObject({
       summariesScanned: 1,
       workItemsUpserted: 1,
     });
@@ -323,7 +323,7 @@ describe("ObservedWorkStore", () => {
       content,
     });
 
-    expect(extractor.processConversation(18, { limit: 1 })).toMatchObject({
+    await expect(extractor.processConversation(18, { limit: 1 })).resolves.toMatchObject({
       summariesScanned: 1,
       workItemsUpserted: 1100,
     });
@@ -359,7 +359,7 @@ describe("ObservedWorkStore", () => {
       content: "- Completed: PR #542 tests passed",
     });
 
-    expect(extractor.processConversation(9)).toMatchObject({
+    await expect(extractor.processConversation(9)).resolves.toMatchObject({
       summariesScanned: 2,
       workItemsUpserted: 2,
     });
@@ -400,7 +400,7 @@ describe("ObservedWorkStore", () => {
         "- Cortex config drift caused plugin validation failure",
       ].join("\n"),
     });
-    expect(extractor.processConversation(8)).toMatchObject({
+    await expect(extractor.processConversation(8)).resolves.toMatchObject({
       summariesScanned: 1,
       eventsUpserted: 3,
     });
@@ -411,7 +411,7 @@ describe("ObservedWorkStore", () => {
         query: "cortex config drift",
       })[0]?.eventKind
     ).toBe("operational_incident");
-    events.upsertObservation({
+    await events.upsertObservation({
       eventId: "evt_pr_normalized",
       conversationId: 8,
       eventKind: "primary",
@@ -437,7 +437,7 @@ describe("ObservedWorkStore", () => {
         query: "https://github.com/Martian-Engineering/lossless-claw/pull/123",
       })[0]?.eventId
     ).toBe("evt_pr_normalized");
-    expect(() =>
+    await expect(
       events.upsertObservation({
         eventId: "evt_missing_source",
         conversationId: 8,
@@ -449,7 +449,7 @@ describe("ObservedWorkStore", () => {
         sourceType: "summary",
         sourceId: " ",
       }),
-    ).toThrow(/source ID/);
+    ).rejects.toThrow(/source ID/);
 
     const lcm = {
       getEventObservationStore: () => events,
@@ -506,7 +506,7 @@ describe("ObservedWorkStore", () => {
       createdAt: "2026-04-28T05:00:00.000Z",
       content: "- Investigate PR #562 review behavior before calling it complete",
     });
-    expect(extractor.processConversation(17)).toMatchObject({
+    await expect(extractor.processConversation(17)).resolves.toMatchObject({
       summariesScanned: 1,
       workItemsUpserted: 1,
     });
@@ -523,6 +523,57 @@ describe("ObservedWorkStore", () => {
         evidenceKind: "created",
       }),
     ]);
+  });
+
+  it("treats negated completion cues as unfinished, not completed", async () => {
+    const db = makeDb();
+    createConversation(db, 22);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 22,
+      summaryId: "sum_neg_a",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- PR #777 not completed yet",
+    });
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 22,
+      summaryId: "sum_neg_b",
+      createdAt: "2026-04-28T05:01:00.000Z",
+      content: "- Never shipped the rollout for issue #888",
+    });
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 22,
+      summaryId: "sum_neg_c",
+      createdAt: "2026-04-28T05:02:00.000Z",
+      content: "- Cannot fix this regression on the auth path",
+    });
+    await expect(extractor.processConversation(22)).resolves.toMatchObject({
+      summariesScanned: 3,
+      workItemsUpserted: 3,
+    });
+
+    const density = observedWork.getDensity({
+      conversationId: 22,
+      statuses: ["observed_unfinished"],
+      limit: 10,
+    });
+    expect(density.density.unfinished).toBe(3);
+    // None of these lines should have minted observed_completed work items.
+    const completed = observedWork.getDensity({
+      conversationId: 22,
+      statuses: ["observed_completed"],
+      limit: 10,
+    });
+    expect(completed.density.completed).toBe(0);
   });
 
   it("reports completed, unfinished, and ambiguous work density", () => {
@@ -1072,11 +1123,11 @@ describe("ObservedWorkStore", () => {
     expect(omitted as number).toBeGreaterThan(0);
   });
 
-  it("canonicalizes event timestamps and rejects unparseable values", () => {
+  it("canonicalizes event timestamps and rejects unparseable values", async () => {
     const db = makeDb();
     createConversation(db, 71);
     const store = new EventObservationStore(db);
-    store.upsertObservation({
+    await store.upsertObservation({
       eventId: "ev_canon_a",
       conversationId: 71,
       eventKind: "primary",
@@ -1096,7 +1147,7 @@ describe("ObservedWorkStore", () => {
     expect(row.event_time).toBe("2026-04-28T05:00:00.000Z");
     expect(row.ingest_time).toBe("2026-04-28T05:00:01.000Z");
 
-    expect(() =>
+    await expect(
       store.upsertObservation({
         eventId: "ev_canon_bad",
         conversationId: 71,
@@ -1108,7 +1159,7 @@ describe("ObservedWorkStore", () => {
         sourceType: "summary",
         sourceId: "sum_canon_bad",
       }),
-    ).toThrow(/eventTime/);
+    ).rejects.toThrow(/eventTime/);
   });
 
   it("orders task-bridge suggestions deterministically when timestamps tie", async () => {

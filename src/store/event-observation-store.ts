@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { withDatabaseTransaction } from "../transaction-mutex.js";
 
 export type EventObservationKind =
   | "primary"
@@ -66,6 +67,8 @@ function placeholders(values: readonly unknown[]): string {
 function escapeLikePattern(value: string): string {
   return value.replace(/[\\%_]/g, (part) => `\\${part}`);
 }
+
+const MAX_EVENT_SOURCE_IDS = 50;
 
 function normalizeSourceIds(sourceIds: string[] | undefined, fallbackSourceId: string): string[] {
   return [
@@ -143,7 +146,7 @@ function rowToEvent(row: EventObservationRow, includeSources: boolean): EventObs
 export class EventObservationStore {
   constructor(private readonly db: DatabaseSync) {}
 
-  upsertObservation(input: EventObservationInput): void {
+  async upsertObservation(input: EventObservationInput): Promise<void> {
     if (!Number.isFinite(input.confidence ?? 0.5) || (input.confidence ?? 0.5) < 0 || (input.confidence ?? 0.5) > 1) {
       throw new Error("confidence must be between 0 and 1.");
     }
@@ -158,6 +161,11 @@ export class EventObservationStore {
       throw new Error("event source ID is required.");
     }
     const sourceIds = normalizeSourceIds(input.sourceIds, sourceId);
+    if (sourceIds.length > MAX_EVENT_SOURCE_IDS) {
+      throw new Error(
+        `sourceIds must not exceed ${MAX_EVENT_SOURCE_IDS} entries (received ${sourceIds.length}).`
+      );
+    }
     // Range filtering and ordering downstream use lexicographic comparisons on
     // `coalesce(event_time, ingest_time)`. Persist canonical ISO-8601 UTC so
     // a non-canonical caller can't sort outside its real window or evade
@@ -167,41 +175,49 @@ export class EventObservationStore {
     if (ingestTime == null) {
       throw new Error("ingestTime is required.");
     }
-    this.db.prepare(
-      `INSERT INTO lcm_event_observations (
-        event_id, conversation_id, event_kind, title, description, query_key,
-        event_time, ingest_time, confidence, rationale, source_type, source_id,
-        source_ids, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-      ON CONFLICT(event_id) DO UPDATE SET
-        conversation_id = excluded.conversation_id,
-        event_kind = excluded.event_kind,
-        title = excluded.title,
-        description = excluded.description,
-        query_key = excluded.query_key,
-        event_time = excluded.event_time,
-        ingest_time = excluded.ingest_time,
-        confidence = excluded.confidence,
-        rationale = excluded.rationale,
-        source_type = excluded.source_type,
-        source_id = excluded.source_id,
-        source_ids = excluded.source_ids,
-        updated_at = datetime('now')`,
-    ).run(
-      input.eventId,
-      input.conversationId,
-      input.eventKind,
-      input.title.trim(),
-      input.description?.trim() || null,
-      normalizeQueryKey(input.queryKey),
-      eventTime,
-      ingestTime,
-      input.confidence ?? 0.5,
-      input.rationale.trim(),
-      input.sourceType,
-      sourceId,
-      JSON.stringify(sourceIds),
-    );
+    // Route through `withDatabaseTransaction` so concurrent callers serialize
+    // on the per-DB async mutex (issue #260). When invoked from inside an
+    // outer transaction (e.g. ObservedWorkExtractor's processConversation),
+    // this function reuses the held lock and wraps the upsert in a savepoint
+    // — which is required because a raw `BEGIN IMMEDIATE` here would throw
+    // with "cannot start a transaction within a transaction".
+    await withDatabaseTransaction(this.db, "BEGIN IMMEDIATE", () => {
+      this.db.prepare(
+        `INSERT INTO lcm_event_observations (
+          event_id, conversation_id, event_kind, title, description, query_key,
+          event_time, ingest_time, confidence, rationale, source_type, source_id,
+          source_ids, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(event_id) DO UPDATE SET
+          conversation_id = excluded.conversation_id,
+          event_kind = excluded.event_kind,
+          title = excluded.title,
+          description = excluded.description,
+          query_key = excluded.query_key,
+          event_time = excluded.event_time,
+          ingest_time = excluded.ingest_time,
+          confidence = excluded.confidence,
+          rationale = excluded.rationale,
+          source_type = excluded.source_type,
+          source_id = excluded.source_id,
+          source_ids = excluded.source_ids,
+          updated_at = datetime('now')`,
+      ).run(
+        input.eventId,
+        input.conversationId,
+        input.eventKind,
+        input.title.trim(),
+        input.description?.trim() || null,
+        normalizeQueryKey(input.queryKey),
+        eventTime,
+        ingestTime,
+        input.confidence ?? 0.5,
+        input.rationale.trim(),
+        input.sourceType,
+        sourceId,
+        JSON.stringify(sourceIds),
+      );
+    });
   }
 
   listObservations(input?: {

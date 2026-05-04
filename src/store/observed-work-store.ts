@@ -1,4 +1,4 @@
-import type { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 
 export type ObservedWorkStatus =
   | "observed_completed"
@@ -240,30 +240,45 @@ export class ObservedWorkStore {
         fingerprint_version, updated_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
       ON CONFLICT(work_item_id) DO UPDATE SET
-        conversation_id = excluded.conversation_id,
-        owner_id = excluded.owner_id,
+        -- conversation_id is intentionally omitted from the update set: the
+        -- work_item_id fingerprint already encodes conversation_id, so a
+        -- conflicting reuse must keep the original conversation. Letting it
+        -- be overwritten allowed silent cross-conversation moves on collision
+        -- (matches PR #20 commit 71ba5c0 hardening).
+        -- COALESCE for optional/provenance fields preserves prior values when
+        -- partial reprocessing emits NULL. observed_status uses a regression
+        -- CASE so weaker cues (ambiguous/unfinished) cannot regress an item
+        -- that already reached a terminal state.
+        owner_id = COALESCE(excluded.owner_id, lcm_observed_work_items.owner_id),
         title = excluded.title,
-        description = excluded.description,
-        observed_status = excluded.observed_status,
+        description = COALESCE(excluded.description, lcm_observed_work_items.description),
+        observed_status = CASE
+          WHEN lcm_observed_work_items.observed_status IN ('observed_completed', 'decision_recorded', 'dismissed')
+            THEN lcm_observed_work_items.observed_status
+          ELSE excluded.observed_status
+        END,
         kind = excluded.kind,
         confidence = excluded.confidence,
         confidence_band = excluded.confidence_band,
-        rationale = excluded.rationale,
-        topic_key = excluded.topic_key,
+        rationale = COALESCE(excluded.rationale, lcm_observed_work_items.rationale),
+        topic_key = COALESCE(excluded.topic_key, lcm_observed_work_items.topic_key),
+        -- ISO-8601 Z timestamps sort lexicographically — direct comparisons
+        -- are index-friendly (composite idx on conversation_id, observed_status,
+        -- kind, last_seen_at DESC). julianday() wrappers would force a scan.
         first_seen_at = CASE
-          WHEN julianday(excluded.first_seen_at) < julianday(lcm_observed_work_items.first_seen_at)
+          WHEN excluded.first_seen_at < lcm_observed_work_items.first_seen_at
             THEN excluded.first_seen_at
           ELSE lcm_observed_work_items.first_seen_at
         END,
         last_seen_at = CASE
-          WHEN julianday(excluded.last_seen_at) > julianday(lcm_observed_work_items.last_seen_at)
+          WHEN excluded.last_seen_at > lcm_observed_work_items.last_seen_at
             THEN excluded.last_seen_at
           ELSE lcm_observed_work_items.last_seen_at
         END,
         completed_at = CASE
           WHEN lcm_observed_work_items.completed_at IS NULL THEN excluded.completed_at
           WHEN excluded.completed_at IS NULL THEN lcm_observed_work_items.completed_at
-          WHEN julianday(excluded.completed_at) < julianday(lcm_observed_work_items.completed_at)
+          WHEN excluded.completed_at < lcm_observed_work_items.completed_at
             THEN excluded.completed_at
           ELSE lcm_observed_work_items.completed_at
         END,
@@ -274,14 +289,16 @@ export class ObservedWorkStore {
             THEN excluded.completion_confidence
           ELSE lcm_observed_work_items.completion_confidence
         END,
-        evidence_count = excluded.evidence_count,
-        source_message_count = excluded.source_message_count,
-        source_token_count = excluded.source_token_count,
-        authority_source = excluded.authority_source,
-        sensitivity = excluded.sensitivity,
-        visibility = excluded.visibility,
+        -- MAX() for monotonically-growing counters: a partial reprocess emitting
+        -- a smaller count must not erase prior accumulation.
+        evidence_count = MAX(excluded.evidence_count, lcm_observed_work_items.evidence_count),
+        source_message_count = MAX(excluded.source_message_count, lcm_observed_work_items.source_message_count),
+        source_token_count = MAX(excluded.source_token_count, lcm_observed_work_items.source_token_count),
+        authority_source = COALESCE(excluded.authority_source, lcm_observed_work_items.authority_source),
+        sensitivity = COALESCE(excluded.sensitivity, lcm_observed_work_items.sensitivity),
+        visibility = COALESCE(excluded.visibility, lcm_observed_work_items.visibility),
         fingerprint = excluded.fingerprint,
-        fingerprint_version = excluded.fingerprint_version,
+        fingerprint_version = COALESCE(excluded.fingerprint_version, lcm_observed_work_items.fingerprint_version),
         updated_at = datetime('now')`,
     ).run(
       item.workItemId,
@@ -291,7 +308,10 @@ export class ObservedWorkStore {
       item.description ?? null,
       item.observedStatus,
       item.kind,
-      item.confidence ?? 0.5,
+      // Clamp confidence into [0, 1] — DB CHECK constraint would otherwise
+      // throw on out-of-range floats from buggy callers and corrupt the
+      // upsert savepoint mid-batch.
+      Math.min(1, Math.max(0, item.confidence ?? 0.5)),
       item.confidenceBand ?? "medium",
       item.rationale ?? null,
       item.topicKey ?? null,
@@ -475,7 +495,7 @@ export class ObservedWorkStore {
         WHERE src.work_item_id = lcm_observed_work_items.work_item_id
       )`,
     ];
-    const args: unknown[] = [];
+    const args: SQLInputValue[] = [];
     if (query.conversationId != null) {
       where.push("conversation_id = ?");
       args.push(query.conversationId);

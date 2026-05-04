@@ -1,4 +1,4 @@
-import type { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import { withDatabaseTransaction } from "../transaction-mutex.js";
 
 export type TaskBridgeSuggestionKind =
@@ -78,6 +78,9 @@ const TASK_TARGETING_KINDS = new Set<TaskBridgeSuggestionKind>([
   "add_task_evidence",
 ]);
 
+const MAX_SUGGESTION_SOURCE_IDS = 50;
+const SQLITE_BIND_CHUNK_SIZE = 500;
+
 function normalizeSourceIds(sourceIds: string[]): string[] {
   return [
     ...new Set(
@@ -86,6 +89,17 @@ function normalizeSourceIds(sourceIds: string[]): string[] {
         .filter((sourceId) => sourceId.length > 0)
     ),
   ];
+}
+
+function chunk<T>(values: T[], size: number): T[][] {
+  if (size <= 0 || values.length <= size) {
+    return values.length === 0 ? [] : [values];
+  }
+  const chunks: T[][] = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
 }
 
 function rowToSuggestion(row: TaskBridgeSuggestionRow): TaskBridgeSuggestion {
@@ -133,16 +147,26 @@ export class TaskBridgeSuggestionStore {
     workItemId: string,
     sourceIds: string[]
   ): void {
-    const placeholders = sourceIds.map(() => "?").join(", ");
-    const rows = this.db
-      .prepare(
-        `SELECT DISTINCT source_id
-         FROM lcm_observed_work_sources
-         WHERE work_item_id = ?
-           AND source_id IN (${placeholders})`
-      )
-      .all(workItemId, ...sourceIds) as Array<{ source_id: string }>;
-    const found = new Set(rows.map((row) => row.source_id));
+    if (sourceIds.length === 0) {
+      return;
+    }
+    // Chunk the IN(...) lookup so dense evidence sets can't exceed the
+    // SQLite bind-variable limit (mirrors ObservedWorkExtractor.loadExistingItems).
+    const found = new Set<string>();
+    for (const batch of chunk(sourceIds, SQLITE_BIND_CHUNK_SIZE)) {
+      const placeholders = batch.map(() => "?").join(", ");
+      const rows = this.db
+        .prepare(
+          `SELECT DISTINCT source_id
+           FROM lcm_observed_work_sources
+           WHERE work_item_id = ?
+             AND source_id IN (${placeholders})`
+        )
+        .all(workItemId, ...batch) as Array<{ source_id: string }>;
+      for (const row of rows) {
+        found.add(row.source_id);
+      }
+    }
     const missing = sourceIds.filter((sourceId) => !found.has(sourceId));
     if (missing.length > 0) {
       throw new Error(
@@ -181,6 +205,11 @@ export class TaskBridgeSuggestionStore {
     const sourceIds = normalizeSourceIds(input.sourceIds);
     if (sourceIds.length === 0) {
       throw new Error("at least one source ID is required.");
+    }
+    if (sourceIds.length > MAX_SUGGESTION_SOURCE_IDS) {
+      throw new Error(
+        `sourceIds must not exceed ${MAX_SUGGESTION_SOURCE_IDS} entries (received ${sourceIds.length}).`
+      );
     }
     // Wrap the read-then-write (status check + INSERT … ON CONFLICT DO UPDATE)
     // in a single transaction. Without it, two concurrent upserts can both
@@ -260,7 +289,7 @@ export class TaskBridgeSuggestionStore {
     limit?: number;
   }): TaskBridgeSuggestion[] {
     const where: string[] = [];
-    const args: unknown[] = [];
+    const args: SQLInputValue[] = [];
     if (input?.status) {
       where.push("status = ?");
       args.push(input.status);

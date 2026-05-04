@@ -1332,6 +1332,20 @@ export function runLcmMigrations(
         `CREATE INDEX IF NOT EXISTS lcm_observed_work_sources_source_idx
            ON lcm_observed_work_sources(source_type, source_id)`,
       );
+      // Hot-path index for getDensity({conversationId, since}): a composite on
+      // (conversation_id, observed_status, last_seen_at DESC) avoids a status
+      // scan when callers omit `kind` (a common dashboard query).
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_status_seen_idx
+           ON lcm_observed_work_items(conversation_id, observed_status, last_seen_at DESC)`,
+      );
+      // Hot-path index for getDensity({conversationId, before}): the `before`
+      // predicate filters on first_seen_at which the existing seen-DESC index
+      // can't satisfy — direct ASC scan beats the alternative.
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_first_seen_idx
+           ON lcm_observed_work_items(conversation_id, first_seen_at)`,
+      );
     });
 
     runMigrationStep("ensureTaskBridgeSuggestionTables", log, () => {

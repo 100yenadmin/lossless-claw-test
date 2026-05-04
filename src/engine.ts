@@ -7202,7 +7202,7 @@ export class LcmContextEngine implements ContextEngine {
       // lcm_event_search) reflect newly-persisted summaries. Failures here are
       // logged and swallowed: extraction is best-effort and must never block the
       // compaction round-trip.
-      this.runObservedWorkExtraction(params.conversationId);
+      await this.runObservedWorkExtraction(params.conversationId);
     }
 
     const tokensBefore = observedTokens ?? storedTokensBefore;
@@ -8040,9 +8040,9 @@ export class LcmContextEngine implements ContextEngine {
    * leaf summaries. Best-effort — errors are logged and swallowed so a flaky
    * extraction pass never aborts a compaction round.
    */
-  private runObservedWorkExtraction(conversationId: number): void {
+  private async runObservedWorkExtraction(conversationId: number): Promise<void> {
     try {
-      this.observedWorkExtractor.processConversation(conversationId);
+      await this.observedWorkExtractor.processConversation(conversationId);
     } catch (error) {
       this.deps.log.warn(
         `[lcm] observed-work extraction failed for conversation ${conversationId}: ${error instanceof Error ? error.message : String(error)}`,

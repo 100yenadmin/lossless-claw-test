@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
+import { withDatabaseTransaction } from "./transaction-mutex.js";
 import type {
   ObservedWorkKind,
   ObservedWorkItemSnapshot,
@@ -66,10 +67,17 @@ type PendingEventObservation = {
   event: EventCandidate;
 };
 
-const COMPLETED_RE = /\b(completed|done|fixed|implemented|merged|shipped|landed|passed|green|resolved|closed)\b/i;
+const COMPLETED_RE = /\b(completed|done|fixed|implemented|merged|shipped|landed|passed|green|resolved|closed|deployed|released|built|integrated)\b/i;
 const UNFINISHED_RE = /\b(todo|follow[- ]?up|needs?|remaining|blocked|blocker|failing|failed|pending|unresolved|changes requested|not done|regression|risk)\b/i;
 const DECISION_RE = /\b(decision|decided|agreed|settled|approved|chose)\b/i;
 const AMBIGUOUS_RE = /\b(unclear|ambiguous|maybe|suspect|investigate|verify|question|unknown|possibly)\b/i;
+// Detects a negation token immediately preceding a completion verb (with optional
+// adverb/auxiliary in between, e.g. "not yet completed", "have not merged").
+// Without this, COMPLETED_RE matches "PR not completed yet" and classifyWork
+// would record observed_completed for the OPPOSITE meaning.
+const NEGATED_COMPLETION_RE = /\b(not|never|no\s+longer|hasn't|haven't|hadn't|isn't|aren't|wasn't|weren't|doesn't|don't|didn't|cannot|can't|won't|wouldn't|shouldn't|couldn't|stopped|aborted|abandoned|cancelled|canceled)\b(?:\s+(?:yet|been|have|has|had|ever|able\s+to|going\s+to|managed\s+to|quite|fully|really|just))*\s+(completed|complete|done|fixed|fix|implemented|implement|merged|merge|shipped|ship|landed|land|passed|pass|resolved|resolve|closed|close|deployed|deploy|released|release|built|build|integrated|integrate)\b/i;
+// Same pattern for decisions: "not yet decided", "haven't agreed".
+const NEGATED_DECISION_RE = /\b(not|never|no\s+longer|hasn't|haven't|hadn't|isn't|aren't|wasn't|weren't|doesn't|don't|didn't|cannot|can't|won't|wouldn't|shouldn't|couldn't)\b(?:\s+(?:yet|been|have|has|had|ever))*\s+(decided|agreed|settled|approved|chose)\b/i;
 const EVENT_RE = /\b(first occurrence|original event|started|created|opened|reported|incident|restart|deploy|error|failed|merged|shipped|decision|retell|recalled|cortex|memory injection|imported|backfill|historical|echo)\b/i;
 
 function hashId(prefix: string, value: string): string {
@@ -99,13 +107,22 @@ function truncate(value: string, maxLength: number): string {
 }
 
 function slug(value: string): string {
-  return normalizeSpace(value)
+  const normalized = normalizeSpace(value);
+  if (normalized.length === 0) {
+    return "";
+  }
+  const tokens = normalized
     .toLowerCase()
     .replace(/[^a-z0-9#/\- ]+/g, "")
     .split(/\s+/)
-    .filter((part) => part.length > 2 && !["the", "and", "for", "with", "from", "that"].includes(part))
-    .slice(0, 6)
-    .join("-");
+    .filter((part) => part.length > 2 && !["the", "and", "for", "with", "from", "that"].includes(part));
+  const tokenSlug = tokens.slice(0, 6).join("-");
+  // Suffix a short content hash so two lines that produce the same token-slug
+  // (e.g. "todo it me at" and "todo or no by" both reduce to "todo") still
+  // yield distinct fingerprints. Using a HEX hash keeps fingerprints stable
+  // across runs while preventing the silent overwrite of distinct work items.
+  const contentHash = createHash("sha256").update(normalized.toLowerCase()).digest("hex").slice(0, 8);
+  return tokenSlug.length > 0 ? `${tokenSlug}-${contentHash}` : contentHash;
 }
 
 function topicKeyFor(line: string, kind: ObservedWorkKind): string {
@@ -151,9 +168,14 @@ function classifyKind(line: string, status: ObservedWorkStatus): ObservedWorkKin
 }
 
 function classifyWork(line: string): WorkCandidate | null {
-  const hasCompleted = COMPLETED_RE.test(line);
-  const hasUnfinished = UNFINISHED_RE.test(line);
-  const hasDecision = DECISION_RE.test(line);
+  const negatedCompletion = NEGATED_COMPLETION_RE.test(line);
+  const negatedDecision = NEGATED_DECISION_RE.test(line);
+  // A completion verb preceded by a negator (e.g. "PR not completed yet",
+  // "never shipped") inverts the polarity: the line documents UNFINISHED work,
+  // not completed work. Likewise for decisions.
+  const hasCompleted = COMPLETED_RE.test(line) && !negatedCompletion;
+  const hasUnfinished = UNFINISHED_RE.test(line) || negatedCompletion;
+  const hasDecision = DECISION_RE.test(line) && !negatedDecision;
   const hasAmbiguous = AMBIGUOUS_RE.test(line);
   if (!hasCompleted && !hasUnfinished && !hasDecision && !hasAmbiguous) {
     return null;
@@ -200,6 +222,12 @@ function classifyEvent(line: string): EventCandidate | null {
   if (!EVENT_RE.test(line)) {
     return null;
   }
+  // Negation guard: "deploy not started", "never shipped", "didn't fail" should
+  // not fabricate a primary/incident event. Only the explicit retelling/memory
+  // cues survive negation (a negated retelling is still a retelling event).
+  if (NEGATED_COMPLETION_RE.test(line)) {
+    return null;
+  }
   let eventKind: EventObservationKind = "primary";
   if (/\b(retell|retold|recalled|mentioned again)\b/i.test(line)) eventKind = "retelling";
   else if (/\b(memory injection|injected memory)\b/i.test(line)) eventKind = "memory_injection";
@@ -244,10 +272,10 @@ export class ObservedWorkExtractor {
     private readonly eventObservationStore?: EventObservationStore,
   ) {}
 
-  processConversation(
+  async processConversation(
     conversationId: number,
     options?: { limit?: number },
-  ): ObservedWorkExtractionResult {
+  ): Promise<ObservedWorkExtractionResult> {
     const state = this.observedWorkStore.getState(conversationId);
     const limit = Math.max(1, Math.min(options?.limit ?? 200, 1000));
     const rows = this.listUnprocessedLeafSummaries(conversationId, state, limit);
@@ -315,9 +343,14 @@ export class ObservedWorkExtractor {
     for (const pendingRow of pendingRows) {
       let rowWorkItemsUpserted = 0;
       let rowEventsUpserted = 0;
-      this.withSummarySavepoint(pendingRow.row.summary_rowid, () => {
+      // Wrap the per-summary savepoint in `withDatabaseTransaction` so a
+      // nested `eventObservationStore.upsertObservation` (which also routes
+      // through `withDatabaseTransaction`) reuses the held lock and isolates
+      // its work via a savepoint instead of attempting a fresh BEGIN
+      // (which would throw "cannot start a transaction within a transaction").
+      await withDatabaseTransaction(this.db, "BEGIN IMMEDIATE", async () => {
         for (const entry of pendingRow.events) {
-          this.eventObservationStore?.upsertObservation({
+          await this.eventObservationStore?.upsertObservation({
             eventId: entry.eventId,
             conversationId,
             eventKind: entry.event.eventKind,
@@ -382,7 +415,7 @@ export class ObservedWorkExtractor {
             sourceMessageCount: entry.row.source_message_count,
             sourceTokenCount: entry.row.source_message_token_count || entry.row.token_count,
             fingerprint: entry.fingerprint,
-            fingerprintVersion: 2,
+            fingerprintVersion: 3,
           });
           // Same-source replay (extractor retry on the same summary) is
           // idempotent — if any evidence row already exists for this
@@ -525,17 +558,4 @@ export class ObservedWorkExtractor {
     return row?.summary_rowid;
   }
 
-  private withSummarySavepoint<T>(summaryRowid: number, fn: () => T): T {
-    const savepoint = `lcm_observed_work_summary_${Math.max(0, Math.trunc(summaryRowid))}`;
-    this.db.exec(`SAVEPOINT ${savepoint}`);
-    try {
-      const result = fn();
-      this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
-      return result;
-    } catch (error) {
-      this.db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
-      this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
-      throw error;
-    }
-  }
 }
