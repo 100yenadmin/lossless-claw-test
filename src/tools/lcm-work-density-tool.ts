@@ -4,6 +4,7 @@ import {
   addDays,
   getUtcDateForZonedMidnight,
   getZonedDayString,
+  startOfWeekDayString,
 } from "../timezone-windows.js";
 import type { LcmDependencies } from "../types.js";
 import type {
@@ -49,8 +50,16 @@ const LcmWorkDensitySchema = Type.Object({
   since: Type.Optional(Type.String({ description: "Only include observed items last seen at or after this ISO timestamp." })),
   before: Type.Optional(Type.String({ description: "Only include observed items first seen before this ISO timestamp." })),
   topic: Type.Optional(Type.String({ description: "Exact topic_key filter." })),
-  statuses: Type.Optional(Type.Array(Type.String({ enum: [...STATUS_VALUES] }), { description: "Observed statuses to include." })),
-  kinds: Type.Optional(Type.Array(Type.String({ enum: [...KIND_VALUES] }), { description: "Observed work kinds to include." })),
+  statuses: Type.Optional(
+    Type.Array(Type.Union(STATUS_VALUES.map((value) => Type.Literal(value))), {
+      description: "Observed statuses to include.",
+    })
+  ),
+  kinds: Type.Optional(
+    Type.Array(Type.Union(KIND_VALUES.map((value) => Type.Literal(value))), {
+      description: "Observed work kinds to include.",
+    })
+  ),
   includeSources: Type.Optional(Type.Boolean({ description: "Include observed-work source IDs. Defaults to false." })),
   detailLevel: Type.Optional(Type.Number({ description: "0 = compact counts only; values above 0 include the bounded top item sections. Default 1.", minimum: 0, maximum: 2 })),
   maxOutputTokens: Type.Optional(Type.Number({ description: "Approximate response budget; rich item/source sections are trimmed to stay within it when possible.", minimum: 256 })),
@@ -123,13 +132,8 @@ function dayBounds(
   };
 }
 
-function startOfWeekDayString(dayString: string): string {
-  const [year, month, day] = dayString.split("-").map((part) => Number(part));
-  const date = new Date(Date.UTC(year, month - 1, day, 0, 0, 0, 0));
-  const weekday = date.getUTCDay();
-  const mondayOffset = weekday === 0 ? -6 : 1 - weekday;
-  return addDays(dayString, mondayOffset);
-}
+// startOfWeekDayString lives in src/timezone-windows.ts and is imported above
+// to keep week-boundary behavior aligned with lcm_recent.
 
 function nextMonthStartDay(dayString: string): string {
   const year = Number(dayString.slice(0, 4));
@@ -137,6 +141,44 @@ function nextMonthStartDay(dayString: string): string {
   return month === 12
     ? `${year + 1}-01-01`
     : `${year}-${String(month + 1).padStart(2, "0")}-01`;
+}
+
+function parseBoundedInteger(
+  value: unknown,
+  key: string,
+  min: number,
+  max: number,
+  fallback: number
+): number {
+  if (value == null) {
+    return fallback;
+  }
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`${key} must be a finite number between ${min} and ${max}.`);
+  }
+  const truncated = Math.trunc(value);
+  if (truncated !== value || truncated < min || truncated > max) {
+    throw new Error(`${key} must be an integer between ${min} and ${max}.`);
+  }
+  return truncated;
+}
+
+function parseBoundedNumber(
+  value: unknown,
+  key: string,
+  min: number,
+  max: number
+): number | undefined {
+  if (value == null) {
+    return undefined;
+  }
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`${key} must be a finite number between ${min} and ${max}.`);
+  }
+  if (value < min || value > max) {
+    throw new Error(`${key} must be between ${min} and ${max}.`);
+  }
+  return value;
 }
 
 function arrayParam<T extends string>(value: unknown, allowed: readonly T[], key: string): T[] | undefined {
@@ -233,26 +275,50 @@ function applyOutputBudget(
     return details;
   }
   const next: Record<string, unknown> = { ...details };
+  // Pre-populate the accounting fields we add post-trim so the trim loop
+  // accounts for their token cost. Otherwise the final payload (with
+  // maxOutputTokens/itemsReturned/budgetTruncated/estimatedOutputTokens
+  // appended) can exceed the requested budget.
+  const baseAccounting =
+    next.accounting != null && typeof next.accounting === "object" && !Array.isArray(next.accounting)
+      ? { ...(next.accounting as Record<string, unknown>) }
+      : {};
+  let accounting: Record<string, unknown> = {
+    ...baseAccounting,
+    maxOutputTokens: budget,
+    itemsReturned: countReturnedItems(next),
+    budgetTruncated: false,
+    truncated: Boolean(baseAccounting.truncated),
+    estimatedOutputTokens: 0,
+  };
+  next.accounting = accounting;
   let budgetTruncated = false;
   let guard = 0;
   while (estimateJsonTokens(next) > budget && guard < 10_000) {
     guard += 1;
     if (trimOneSource(next) || trimOneItem(next)) {
       budgetTruncated = true;
+      // Refresh the in-place accounting so trim-loop estimates stay honest.
+      accounting = {
+        ...accounting,
+        itemsReturned: countReturnedItems(next),
+        budgetTruncated: true,
+        truncated: true,
+      };
+      next.accounting = accounting;
       continue;
     }
     break;
   }
-  const accounting =
-    next.accounting != null && typeof next.accounting === "object" && !Array.isArray(next.accounting)
-      ? { ...(next.accounting as Record<string, unknown>) }
-      : {};
-  accounting.maxOutputTokens = budget;
-  accounting.itemsReturned = countReturnedItems(next);
-  accounting.budgetTruncated = budgetTruncated;
-  accounting.truncated = Boolean(accounting.truncated) || budgetTruncated;
+  accounting = {
+    ...accounting,
+    itemsReturned: countReturnedItems(next),
+    budgetTruncated,
+    truncated: Boolean(accounting.truncated) || budgetTruncated,
+  };
   next.accounting = accounting;
   accounting.estimatedOutputTokens = estimateJsonTokens(next);
+  next.accounting = accounting;
   return next;
 }
 
@@ -309,10 +375,17 @@ export function createLcmWorkDensityTool(input: {
       if (since && before && since >= before) {
         return jsonResult({ error: "since must be earlier than before." });
       }
-      const limit = typeof p.limit === "number" ? Math.trunc(p.limit) : 5;
-      const detailLevel = typeof p.detailLevel === "number" ? Math.trunc(p.detailLevel) : 1;
+      let limit: number;
+      let detailLevel: number;
+      let minConfidence: number | undefined;
+      try {
+        limit = parseBoundedInteger(p.limit, "limit", 1, 50, 5);
+        detailLevel = parseBoundedInteger(p.detailLevel, "detailLevel", 0, 2, 1);
+        minConfidence = parseBoundedNumber(p.minConfidence, "minConfidence", 0, 1);
+      } catch (error) {
+        return jsonResult({ error: error instanceof Error ? error.message : "Invalid lcm_work_density parameters." });
+      }
       const topic = typeof p.topic === "string" && p.topic.trim() ? p.topic.trim() : undefined;
-      const minConfidence = typeof p.minConfidence === "number" ? p.minConfidence : undefined;
       const store = lcm.getObservedWorkStore();
       const includeSources = p.includeSources === true;
       const result = store.getDensity({

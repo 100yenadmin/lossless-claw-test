@@ -241,29 +241,42 @@ export class ObservedWorkStore {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
       ON CONFLICT(work_item_id) DO UPDATE SET
         conversation_id = excluded.conversation_id,
-        owner_id = excluded.owner_id,
+        -- Preserve previously-stored optional/provenance fields when the
+        -- incoming row omits them (otherwise partial reprocessing erases data).
+        owner_id = COALESCE(excluded.owner_id, lcm_observed_work_items.owner_id),
         title = excluded.title,
-        description = excluded.description,
-        observed_status = excluded.observed_status,
+        description = COALESCE(excluded.description, lcm_observed_work_items.description),
+        -- observed_status conservatively transitions: once an item is marked
+        -- observed_completed, decision_recorded, or dismissed, weaker cues
+        -- (ambiguous/unfinished) must not regress it. Higher-tier states or
+        -- explicit dismissed override anything below.
+        observed_status = CASE
+          WHEN lcm_observed_work_items.observed_status = 'dismissed' THEN excluded.observed_status
+          WHEN excluded.observed_status = 'dismissed' THEN excluded.observed_status
+          WHEN lcm_observed_work_items.observed_status IN ('observed_completed', 'decision_recorded')
+            AND excluded.observed_status IN ('observed_unfinished', 'observed_ambiguous')
+            THEN lcm_observed_work_items.observed_status
+          ELSE excluded.observed_status
+        END,
         kind = excluded.kind,
         confidence = excluded.confidence,
         confidence_band = excluded.confidence_band,
-        rationale = excluded.rationale,
-        topic_key = excluded.topic_key,
+        rationale = COALESCE(excluded.rationale, lcm_observed_work_items.rationale),
+        topic_key = COALESCE(excluded.topic_key, lcm_observed_work_items.topic_key),
         first_seen_at = CASE
-          WHEN julianday(excluded.first_seen_at) < julianday(lcm_observed_work_items.first_seen_at)
+          WHEN excluded.first_seen_at < lcm_observed_work_items.first_seen_at
             THEN excluded.first_seen_at
           ELSE lcm_observed_work_items.first_seen_at
         END,
         last_seen_at = CASE
-          WHEN julianday(excluded.last_seen_at) > julianday(lcm_observed_work_items.last_seen_at)
+          WHEN excluded.last_seen_at > lcm_observed_work_items.last_seen_at
             THEN excluded.last_seen_at
           ELSE lcm_observed_work_items.last_seen_at
         END,
         completed_at = CASE
           WHEN lcm_observed_work_items.completed_at IS NULL THEN excluded.completed_at
           WHEN excluded.completed_at IS NULL THEN lcm_observed_work_items.completed_at
-          WHEN julianday(excluded.completed_at) < julianday(lcm_observed_work_items.completed_at)
+          WHEN excluded.completed_at < lcm_observed_work_items.completed_at
             THEN excluded.completed_at
           ELSE lcm_observed_work_items.completed_at
         END,
@@ -274,14 +287,14 @@ export class ObservedWorkStore {
             THEN excluded.completion_confidence
           ELSE lcm_observed_work_items.completion_confidence
         END,
-        evidence_count = excluded.evidence_count,
-        source_message_count = excluded.source_message_count,
-        source_token_count = excluded.source_token_count,
-        authority_source = excluded.authority_source,
-        sensitivity = excluded.sensitivity,
-        visibility = excluded.visibility,
+        evidence_count = COALESCE(excluded.evidence_count, lcm_observed_work_items.evidence_count),
+        source_message_count = COALESCE(excluded.source_message_count, lcm_observed_work_items.source_message_count),
+        source_token_count = COALESCE(excluded.source_token_count, lcm_observed_work_items.source_token_count),
+        authority_source = COALESCE(excluded.authority_source, lcm_observed_work_items.authority_source),
+        sensitivity = COALESCE(excluded.sensitivity, lcm_observed_work_items.sensitivity),
+        visibility = COALESCE(excluded.visibility, lcm_observed_work_items.visibility),
         fingerprint = excluded.fingerprint,
-        fingerprint_version = excluded.fingerprint_version,
+        fingerprint_version = COALESCE(excluded.fingerprint_version, lcm_observed_work_items.fingerprint_version),
         updated_at = datetime('now')`,
     ).run(
       item.workItemId,
@@ -299,6 +312,9 @@ export class ObservedWorkStore {
       item.lastSeenAt,
       item.completedAt ?? null,
       item.completionConfidence ?? null,
+      // For NOT-NULL count/provenance columns, fall back to the schema
+      // defaults on initial INSERT; the ON CONFLICT update preserves any
+      // previously-stored larger/non-default value via COALESCE.
       item.evidenceCount ?? 0,
       item.sourceMessageCount ?? 0,
       item.sourceTokenCount ?? 0,

@@ -1829,7 +1829,7 @@ const MAX_ROLLUP_MAINTENANCE_DAYS_BACK = 30;
 
 function computeRollupMaintenanceDaysBack(
   lastRollupCheckAt: string | null | undefined,
-  now = new Date(),
+  now: Date,
 ): number {
   if (!lastRollupCheckAt) {
     return MAX_ROLLUP_MAINTENANCE_DAYS_BACK;

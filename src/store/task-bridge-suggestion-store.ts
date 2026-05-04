@@ -77,6 +77,9 @@ const TASK_TARGETING_KINDS = new Set<TaskBridgeSuggestionKind>([
   "add_task_evidence",
 ]);
 
+const MAX_SUGGESTION_SOURCE_IDS = 50;
+const SQLITE_BIND_CHUNK_SIZE = 500;
+
 function normalizeSourceIds(sourceIds: string[]): string[] {
   return [
     ...new Set(
@@ -85,6 +88,25 @@ function normalizeSourceIds(sourceIds: string[]): string[] {
         .filter((sourceId) => sourceId.length > 0)
     ),
   ];
+}
+
+function chunk<T>(values: T[], size: number): T[][] {
+  if (size <= 0 || values.length <= size) {
+    return values.length === 0 ? [] : [values];
+  }
+  const chunks: T[][] = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function normalizeOptionalId(value: string | undefined): string | undefined {
+  if (value == null) {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
 }
 
 function rowToSuggestion(row: TaskBridgeSuggestionRow): TaskBridgeSuggestion {
@@ -132,16 +154,26 @@ export class TaskBridgeSuggestionStore {
     workItemId: string,
     sourceIds: string[]
   ): void {
-    const placeholders = sourceIds.map(() => "?").join(", ");
-    const rows = this.db
-      .prepare(
-        `SELECT DISTINCT source_id
-         FROM lcm_observed_work_sources
-         WHERE work_item_id = ?
-           AND source_id IN (${placeholders})`
-      )
-      .all(workItemId, ...sourceIds) as Array<{ source_id: string }>;
-    const found = new Set(rows.map((row) => row.source_id));
+    if (sourceIds.length === 0) {
+      return;
+    }
+    // Chunk the IN(...) lookup so dense evidence sets can't exceed the
+    // SQLite bind-variable limit (mirrors ObservedWorkExtractor.loadExistingItems).
+    const found = new Set<string>();
+    for (const batch of chunk(sourceIds, SQLITE_BIND_CHUNK_SIZE)) {
+      const placeholders = batch.map(() => "?").join(", ");
+      const rows = this.db
+        .prepare(
+          `SELECT DISTINCT source_id
+           FROM lcm_observed_work_sources
+           WHERE work_item_id = ?
+             AND source_id IN (${placeholders})`
+        )
+        .all(workItemId, ...batch) as Array<{ source_id: string }>;
+      for (const row of rows) {
+        found.add(row.source_id);
+      }
+    }
     const missing = sourceIds.filter((sourceId) => !found.has(sourceId));
     if (missing.length > 0) {
       throw new Error(
@@ -182,6 +214,11 @@ export class TaskBridgeSuggestionStore {
     const sourceIds = normalizeSourceIds(input.sourceIds);
     if (sourceIds.length === 0) {
       throw new Error("at least one source ID is required.");
+    }
+    if (sourceIds.length > MAX_SUGGESTION_SOURCE_IDS) {
+      throw new Error(
+        `sourceIds must not exceed ${MAX_SUGGESTION_SOURCE_IDS} entries (received ${sourceIds.length}).`
+      );
     }
     this.assertSourceIdsBelongToWorkItem(workItemId, sourceIds);
     this.db.prepare(
@@ -250,13 +287,17 @@ export class TaskBridgeSuggestionStore {
       where.push("suggestion_kind = ?");
       args.push(input.suggestionKind);
     }
-    if (input?.workItemId) {
+    // Trim filter IDs so callers passing whitespace-padded IDs still match the
+    // (trimmed) values that upsertSuggestion writes.
+    const filterWorkItemId = normalizeOptionalId(input?.workItemId);
+    if (filterWorkItemId) {
       where.push("work_item_id = ?");
-      args.push(input.workItemId);
+      args.push(filterWorkItemId);
     }
-    if (input?.taskId) {
+    const filterTaskId = normalizeOptionalId(input?.taskId);
+    if (filterTaskId) {
       where.push("task_id = ?");
-      args.push(input.taskId);
+      args.push(filterTaskId);
     }
     const limit = Math.max(1, Math.min(input?.limit ?? 20, 100));
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
@@ -266,7 +307,7 @@ export class TaskBridgeSuggestionStore {
               created_at, updated_at
        FROM lcm_task_bridge_suggestions
        ${whereSql}
-       ORDER BY created_at DESC
+       ORDER BY updated_at DESC, created_at DESC
        LIMIT ?`,
     ).all(...args, limit) as TaskBridgeSuggestionRow[];
     return rows.map(rowToSuggestion);
@@ -280,6 +321,13 @@ export class TaskBridgeSuggestionStore {
     if (!REVIEW_STATUSES.has(input.status)) {
       throw new Error("review status must be accepted, rejected, dismissed, or expired.");
     }
+    // Trim suggestionId/reviewedBy so callers passing whitespace-padded values
+    // still match the (trimmed) IDs that upsertSuggestion writes.
+    const suggestionId = normalizeOptionalId(input.suggestionId);
+    if (!suggestionId) {
+      throw new Error("suggestionId is required.");
+    }
+    const reviewedBy = normalizeOptionalId(input.reviewedBy);
     const result = this.db.prepare(
       `UPDATE lcm_task_bridge_suggestions
        SET status = ?,
@@ -287,7 +335,7 @@ export class TaskBridgeSuggestionStore {
            reviewed_at = datetime('now'),
            updated_at = datetime('now')
        WHERE suggestion_id = ? AND status = 'pending'`,
-    ).run(input.status, input.reviewedBy ?? null, input.suggestionId);
+    ).run(input.status, reviewedBy ?? null, suggestionId);
     return result.changes > 0;
   }
 }

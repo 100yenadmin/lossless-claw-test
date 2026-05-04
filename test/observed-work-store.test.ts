@@ -9,6 +9,9 @@ import type { LcmDependencies } from "../src/types.js";
 
 function makeDb(): DatabaseSync {
   const db = new DatabaseSync(":memory:");
+  // Match production (src/db/connection.ts) so FK constraints actually surface
+  // in tests (otherwise sources/items REFERENCES are silently skipped).
+  db.exec("PRAGMA foreign_keys = ON;");
   runLcmMigrations(db, { fts5Available: false });
   return db;
 }
@@ -729,9 +732,15 @@ describe("ObservedWorkStore", () => {
         getConversationBySessionId: async () => null,
       }),
     };
+    // Use a deterministic stub clock that lets us assert the tool actually
+    // routed period-bound resolution through deps.clock.now() rather than a
+    // direct `new Date()` (which would be invisible to vi.setSystemTime tweaks
+    // in unrelated code paths).
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const clockNow = vi.fn(() => now);
     const deps = {
       resolveSessionIdFromSessionKey: async () => undefined,
-      clock: { now: () => new Date() },
+      clock: { now: clockNow },
     } as unknown as LcmDependencies;
     const tool = createLcmWorkDensityTool({
       deps,
@@ -739,9 +748,6 @@ describe("ObservedWorkStore", () => {
       sessionId: "density-session",
     });
 
-    const now = new Date("2026-04-28T12:00:00.000Z");
-    vi.useFakeTimers();
-    vi.setSystemTime(now);
     try {
       const hidden = await tool.execute("density-hidden", {
         conversationId: 1,
@@ -799,8 +805,12 @@ describe("ObservedWorkStore", () => {
       expect((global.details as { error?: string }).error).toMatch(
         /does not support allConversations/,
       );
+      // Each period/since-resolving call should have asked the injected clock
+      // for the current time. If the tool ever regressed back to `new Date()`
+      // this assertion catches it (vi.setSystemTime would not).
+      expect(clockNow).toHaveBeenCalled();
     } finally {
-      vi.useRealTimers();
+      // No fake timers in use; left intentionally as a no-op for safety.
     }
   });
 

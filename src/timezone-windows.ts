@@ -25,6 +25,20 @@ export function addDays(dayString: string, delta: number): string {
   ).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`;
 }
 
+/**
+ * Return the Monday of the ISO week containing `dayString` (YYYY-MM-DD).
+ * Shared helper used by lcm_recent and lcm_work_density to keep week-boundary
+ * behavior in lockstep across tools.
+ */
+export function startOfWeekDayString(dayString: string): string {
+  assertValidPlainDate(dayString);
+  const [year, month, day] = dayString.split("-").map((part) => Number(part));
+  const date = new Date(Date.UTC(year, month - 1, day, 0, 0, 0, 0));
+  const weekday = date.getUTCDay();
+  const mondayOffset = weekday === 0 ? -6 : 1 - weekday;
+  return addDays(dayString, mondayOffset);
+}
+
 export function getLocalDateKey(date: Date, timezone: string): string {
   return getZonedDayString(date, timezone);
 }

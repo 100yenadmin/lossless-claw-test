@@ -82,7 +82,7 @@ CREATE TABLE lcm_observed_work_items (
   title TEXT NOT NULL,
   description TEXT,
   observed_status TEXT NOT NULL, -- observed_completed | observed_unfinished | observed_ambiguous | decision_recorded | dismissed
-  kind TEXT NOT NULL, -- implementation | review | blocker | decision | question | follow_up | test | deploy | research
+  kind TEXT NOT NULL, -- implementation | review | blocker | decision | question | follow_up | test | deploy | research | other
   confidence REAL NOT NULL DEFAULT 0.5,
   confidence_band TEXT NOT NULL DEFAULT 'medium',
   rationale TEXT,
@@ -109,7 +109,7 @@ Normalize provenance:
 ```sql
 CREATE TABLE lcm_observed_work_sources (
   work_item_id TEXT NOT NULL,
-  source_type TEXT NOT NULL, -- summary | rollup
+  source_type TEXT NOT NULL, -- summary | rollup | message
   source_id TEXT NOT NULL,
   ordinal INTEGER NOT NULL,
   evidence_kind TEXT NOT NULL, -- created | reinforced | possible_completion | completed | contradicted | dismissed
@@ -137,10 +137,12 @@ Recommended tool: `lcm_work_density`.
 ```ts
 lcm_work_density({
   conversationId?,
-  period?: "today" | "yesterday" | "7d" | "30d" | "date:YYYY-MM-DD" | string,
+  period?: "today" | "yesterday" | "7d" | "30d" | "week" | "month" | "date:YYYY-MM-DD",
+  since?: string, // explicit ISO timestamp; wins over period
+  before?: string, // explicit ISO timestamp; wins over period
   topic?,
-  statuses?: ["observed_completed", "observed_unfinished", "observed_ambiguous", "decision_recorded", "dismissed"],
-  kinds?: string[],
+  statuses?: Array<"observed_completed" | "observed_unfinished" | "observed_ambiguous" | "decision_recorded" | "dismissed">,
+  kinds?: Array<"implementation" | "review" | "blocker" | "decision" | "question" | "follow_up" | "test" | "deploy" | "research" | "other">,
   includeSources?: boolean,
   detailLevel?: 0 | 1 | 2,
   maxOutputTokens?,
@@ -154,26 +156,28 @@ lcm_work_density({
 ```json
 {
   "period": "yesterday",
+  "window": { "since": "2026-04-26T00:00:00.000Z", "before": "2026-04-27T00:00:00.000Z", "timezone": "UTC" },
+  "conversationScope": 12,
   "density": {
     "totalObserved": 18,
     "completed": 11,
     "unfinished": 5,
     "ambiguous": 2,
-    "dismissed": 0
+    "dismissed": 0,
+    "decisionRecorded": 1
   },
   "topUnfinished": [],
   "completedHighlights": [],
   "ambiguous": [],
+  "decisions": [],
+  "dismissedItems": [],
   "accounting": {
-    "outputTokens": 6000,
-    "sourceSummaryTokens": 42000,
-    "sourceMessageTokens": 180000,
     "itemsIncluded": 18,
     "itemsOmitted": 0,
     "truncated": false
   },
-  "confidence": "medium-high",
-  "disclaimer": "Observed from LCM summaries; not authoritative task state.",
+  "confidence": "observed-unrefined",
+  "disclaimer": "Observed from LCM evidence; not authoritative task state.",
   "recommendedDives": []
 }
 ```
