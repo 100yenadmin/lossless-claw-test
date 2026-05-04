@@ -1219,6 +1219,12 @@ export function runLcmMigrations(
     });
 
     runMigrationStep("ensureObservedWorkTables", log, () => {
+      // Issue each CREATE TABLE in its own db.exec() so a failure on one
+      // statement throws instead of silently aborting the rest. Node's
+      // sqlite multi-statement exec swallows partial failures and leaves
+      // the schema half-installed — see the file header note plus PR #482
+      // / issue #569. The same one-statement-per-exec pattern is used
+      // throughout this file.
       db.exec(`
         CREATE TABLE IF NOT EXISTS lcm_observed_work_items (
           work_item_id TEXT PRIMARY KEY,
@@ -1263,8 +1269,9 @@ export function runLcmMigrations(
           fingerprint_version INTEGER NOT NULL DEFAULT 1,
           created_at TEXT NOT NULL DEFAULT (datetime('now')),
           updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-
+        )
+      `);
+      db.exec(`
         CREATE TABLE IF NOT EXISTS lcm_observed_work_sources (
           work_item_id TEXT NOT NULL REFERENCES lcm_observed_work_items(work_item_id) ON DELETE CASCADE,
           source_type TEXT NOT NULL CHECK (source_type IN ('summary', 'rollup', 'message')),
@@ -1280,8 +1287,9 @@ export function runLcmMigrations(
           )),
           created_at TEXT NOT NULL DEFAULT (datetime('now')),
           PRIMARY KEY (work_item_id, source_type, source_id, evidence_kind)
-        );
-
+        )
+      `);
+      db.exec(`
         CREATE TABLE IF NOT EXISTS lcm_observed_work_state (
           conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
           last_processed_summary_created_at TEXT,
@@ -1289,7 +1297,7 @@ export function runLcmMigrations(
           last_processed_summary_rowid INTEGER,
           pending_rebuild INTEGER NOT NULL DEFAULT 0,
           updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
+        )
       `);
     });
 
@@ -1303,22 +1311,27 @@ export function runLcmMigrations(
     });
 
     runMigrationStep("ensureObservedWorkIndexes", log, () => {
-      db.exec(`
-        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_status_kind_seen_idx
-          ON lcm_observed_work_items(conversation_id, observed_status, kind, last_seen_at DESC);
-
-        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_owner_status_kind_seen_idx
-          ON lcm_observed_work_items(owner_id, observed_status, kind, last_seen_at DESC);
-
-        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_topic_status_seen_idx
-          ON lcm_observed_work_items(topic_key, observed_status, last_seen_at DESC);
-
-        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_fingerprint_idx
-          ON lcm_observed_work_items(fingerprint);
-
-        CREATE INDEX IF NOT EXISTS lcm_observed_work_sources_source_idx
-          ON lcm_observed_work_sources(source_type, source_id);
-      `);
+      // One CREATE INDEX per exec() — see ensureObservedWorkTables note.
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_status_kind_seen_idx
+           ON lcm_observed_work_items(conversation_id, observed_status, kind, last_seen_at DESC)`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS lcm_observed_work_items_owner_status_kind_seen_idx
+           ON lcm_observed_work_items(owner_id, observed_status, kind, last_seen_at DESC)`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS lcm_observed_work_items_topic_status_seen_idx
+           ON lcm_observed_work_items(topic_key, observed_status, last_seen_at DESC)`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS lcm_observed_work_items_fingerprint_idx
+           ON lcm_observed_work_items(fingerprint)`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS lcm_observed_work_sources_source_idx
+           ON lcm_observed_work_sources(source_type, source_id)`,
+      );
     });
 
     runMigrationStep("ensureTaskBridgeSuggestionTables", log, () => {
@@ -1354,16 +1367,19 @@ export function runLcmMigrations(
     });
 
     runMigrationStep("ensureTaskBridgeSuggestionIndexes", log, () => {
-      db.exec(`
-        CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_status_kind_idx
-          ON lcm_task_bridge_suggestions(status, suggestion_kind, created_at DESC);
-
-        CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_work_item_idx
-          ON lcm_task_bridge_suggestions(work_item_id, status);
-
-        CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_task_idx
-          ON lcm_task_bridge_suggestions(task_id, status);
-      `);
+      // One CREATE INDEX per exec() — see ensureObservedWorkTables note.
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_status_kind_idx
+           ON lcm_task_bridge_suggestions(status, suggestion_kind, created_at DESC)`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_work_item_idx
+           ON lcm_task_bridge_suggestions(work_item_id, status)`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_task_idx
+           ON lcm_task_bridge_suggestions(task_id, status)`,
+      );
     });
 
     runMigrationStep("ensureEventObservationTables", log, () => {
@@ -1397,19 +1413,23 @@ export function runLcmMigrations(
     });
 
     runMigrationStep("ensureEventObservationIndexes", log, () => {
-      db.exec(`
-        CREATE INDEX IF NOT EXISTS lcm_event_observations_conversation_kind_time_idx
-          ON lcm_event_observations(conversation_id, event_kind, event_time DESC);
-
-        CREATE INDEX IF NOT EXISTS lcm_event_observations_query_time_idx
-          ON lcm_event_observations(query_key, event_time DESC);
-
-        CREATE INDEX IF NOT EXISTS lcm_event_observations_conversation_observed_time_idx
-          ON lcm_event_observations(conversation_id, coalesce(event_time, ingest_time) DESC);
-
-        CREATE INDEX IF NOT EXISTS lcm_event_observations_source_idx
-          ON lcm_event_observations(source_type, source_id);
-      `);
+      // One CREATE INDEX per exec() — see ensureObservedWorkTables note.
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS lcm_event_observations_conversation_kind_time_idx
+           ON lcm_event_observations(conversation_id, event_kind, event_time DESC)`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS lcm_event_observations_query_time_idx
+           ON lcm_event_observations(query_key, event_time DESC)`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS lcm_event_observations_conversation_observed_time_idx
+           ON lcm_event_observations(conversation_id, coalesce(event_time, ingest_time) DESC)`,
+      );
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS lcm_event_observations_source_idx
+           ON lcm_event_observations(source_type, source_id)`,
+      );
     });
 
     const detectedFeatures = options?.fts5Available === false ? null : getLcmDbFeatures(db);

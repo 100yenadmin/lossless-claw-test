@@ -61,13 +61,14 @@ const LcmWorkDensitySchema = Type.Object({
 
 function resolvePeriodBounds(
   period: unknown,
-  timezone: string
+  timezone: string,
+  now: Date
 ): { label?: string; since?: string; before?: string } {
   if (typeof period !== "string" || period.trim().length === 0) {
     return {};
   }
   const normalized = period.trim().toLowerCase().replace(/\s+/g, " ");
-  const today = getZonedDayString(new Date(), timezone);
+  const today = getZonedDayString(now, timezone);
   if (normalized === "today") {
     return dayBounds("today", today, timezone);
   }
@@ -157,8 +158,13 @@ const DETAIL_ARRAY_KEYS = [
   "topUnfinished",
 ] as const;
 
+// Mirror the serialization used by `jsonResult()` (pretty-printed with 2-space
+// indent) so the estimate matches the bytes actually returned to the caller.
+// Using minified `JSON.stringify` here would understate size by ~30–50% on
+// nested payloads and let trimming exit while the real response is still over
+// budget.
 function estimateJsonTokens(value: unknown): number {
-  return Math.ceil(JSON.stringify(value).length / 4);
+  return Math.ceil(JSON.stringify(value, null, 2).length / 4);
 }
 
 function itemArray(details: Record<string, unknown>, key: string): unknown[] | undefined {
@@ -224,27 +230,53 @@ function applyOutputBudget(
   if (!budget) {
     return details;
   }
+  // Seed the accounting block BEFORE the trim loop so its bytes participate
+  // in the size estimate. Otherwise we trim until `next` fits, then add
+  // `maxOutputTokens` / `itemsReturned` / `truncated` / `estimatedOutputTokens`
+  // afterward and the response can land back over budget.
   const next: Record<string, unknown> = { ...details };
+  const baseAccounting =
+    next.accounting != null && typeof next.accounting === "object" && !Array.isArray(next.accounting)
+      ? { ...(next.accounting as Record<string, unknown>) }
+      : {};
+  const itemsOmittedBaseline =
+    typeof baseAccounting.itemsOmitted === "number" ? baseAccounting.itemsOmitted : 0;
+  const accounting: Record<string, unknown> = {
+    ...baseAccounting,
+    maxOutputTokens: budget,
+    itemsReturned: countReturnedItems(next),
+    itemsOmitted: itemsOmittedBaseline,
+    budgetTruncated: false,
+    truncated: Boolean(baseAccounting.truncated),
+    // Placeholder; recomputed at the very end so the value reflects the
+    // serialized payload that actually goes out.
+    estimatedOutputTokens: 0,
+  };
+  next.accounting = accounting;
+
   let budgetTruncated = false;
   let guard = 0;
   while (estimateJsonTokens(next) > budget && guard < 10_000) {
     guard += 1;
+    const beforeItems = countReturnedItems(next);
     if (trimOneSource(next) || trimOneItem(next)) {
       budgetTruncated = true;
+      const afterItems = countReturnedItems(next);
+      // Whole items dropped by trimOneItem must be reflected in itemsOmitted;
+      // otherwise callers see "0 omitted" while most rows are gone.
+      accounting.itemsOmitted = (accounting.itemsOmitted as number) + (beforeItems - afterItems);
+      accounting.itemsReturned = afterItems;
+      accounting.budgetTruncated = true;
+      accounting.truncated = true;
       continue;
     }
     break;
   }
-  const accounting =
-    next.accounting != null && typeof next.accounting === "object" && !Array.isArray(next.accounting)
-      ? { ...(next.accounting as Record<string, unknown>) }
-      : {};
-  accounting.maxOutputTokens = budget;
-  accounting.itemsReturned = countReturnedItems(next);
-  accounting.budgetTruncated = budgetTruncated;
-  accounting.truncated = Boolean(accounting.truncated) || budgetTruncated;
-  next.accounting = accounting;
   accounting.estimatedOutputTokens = estimateJsonTokens(next);
+  if (budgetTruncated) {
+    accounting.budgetTruncated = true;
+    accounting.truncated = true;
+  }
   return next;
 }
 
@@ -289,7 +321,7 @@ export function createLcmWorkDensityTool(input: {
       let kinds: ObservedWorkKind[] | undefined;
       let periodLabel: string | undefined;
       try {
-        const periodBounds = resolvePeriodBounds(p.period, lcm.timezone);
+        const periodBounds = resolvePeriodBounds(p.period, lcm.timezone, input.deps.clock.now());
         periodLabel = periodBounds.label;
         since = parseIsoTimestampParam(p, "since")?.toISOString() ?? periodBounds.since;
         before = parseIsoTimestampParam(p, "before")?.toISOString() ?? periodBounds.before;

@@ -217,19 +217,21 @@ PR16 should implement Option B as the default path:
 
 ---
 
-## Implementation scaffold added in this draft
+## Implementation in this branch
 
-This draft now includes minimal code scaffolding so reviewers can evaluate the proposed shape in-repo instead of reading the architecture in isolation.
+This branch now includes the persistence/read-model, the deterministic extractor, the read-only tool, and supporting test coverage.
 
 Added files:
 
-- `src/store/observed-work-store.ts`
-- `src/tools/lcm-work-density-tool.ts`
-- `test/observed-work-store.test.ts`
+- `src/store/observed-work-store.ts` — persistence + read model
+- `src/store/event-observation-store.ts` — sibling event observation store used by the extractor
+- `src/observed-work-extractor.ts` — deterministic regex/heuristic extractor that fingerprints work items on `(conversation, kind, topic_key)` and writes per-source evidence rows
+- `src/tools/lcm-work-density-tool.ts` — read-only `lcm_work_density` tool
+- `test/observed-work-store.test.ts` — store + extractor + tool coverage
 
-The scaffold intentionally keeps extraction out of scope. It defines the persistence/read-model and the read-only tool contract first. Extraction can be added in a follow-up once maintain-time watermarks and classifier quality are reviewed.
+The extractor runs after each successful leaf-compaction pass (`LcmContextEngine.runObservedWorkExtraction`) on a best-effort basis: failures are logged and swallowed so a flaky extraction pass never aborts a compaction round.
 
-### Current scaffold behavior
+### Current behavior
 
 - Creates observed-work tables idempotently during migration.
 - Stores observed work items, source links, and per-conversation processing state.
@@ -257,9 +259,8 @@ The scaffold intentionally keeps extraction out of scope. It defines the persist
 
 ### Explicitly not implemented yet
 
-- automatic extraction from summaries
-- LLM classification
-- live current-day refresh
-- OpenClaw task bridge writes
+- LLM classification (extraction is regex/heuristic only)
+- live current-day refresh outside compaction passes
+- OpenClaw task bridge writes (suggestions only — see option C)
 - Cortex commitments/open-loop sync
 - cross-conversation default retrieval

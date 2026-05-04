@@ -326,7 +326,14 @@ export class ObservedWorkStore {
     ).run(input.workItemId, input.sourceType, input.sourceId, input.ordinal, input.evidenceKind);
   }
 
-  hasSource(input: {
+  /**
+   * Return true if any row exists for the given (workItem, source) pair,
+   * regardless of evidenceKind. Use this to detect a same-source replay
+   * (e.g. extractor retry on the same summary) so callers can skip
+   * incrementing evidence counts. Intentionally looser than `hasSource`
+   * — `addSource` permits multiple evidenceKind rows per source.
+   */
+  hasSourceFromAnyEvidence(input: {
     workItemId: string;
     sourceType: "summary" | "rollup" | "message";
     sourceId: string;
@@ -342,6 +349,36 @@ export class ObservedWorkStore {
     return row != null;
   }
 
+  hasSource(input: {
+    workItemId: string;
+    sourceType: "summary" | "rollup" | "message";
+    sourceId: string;
+    evidenceKind:
+      | "created"
+      | "reinforced"
+      | "possible_completion"
+      | "completed"
+      | "contradicted"
+      | "dismissed";
+  }): boolean {
+    // Match the (work_item_id, source_type, source_id, evidence_kind) primary
+    // key of `lcm_observed_work_sources` — addSource() permits multiple rows
+    // for the same source when evidenceKind differs (e.g. "created" later
+    // promoted to "completed"), so a duplicate-guard that ignored evidence_kind
+    // would silently drop later completed/contradicted evidence from the same
+    // source.
+    const row = this.db.prepare(
+      `SELECT 1 AS found
+       FROM lcm_observed_work_sources
+       WHERE work_item_id = ?
+         AND source_type = ?
+         AND source_id = ?
+         AND evidence_kind = ?
+       LIMIT 1`,
+    ).get(input.workItemId, input.sourceType, input.sourceId, input.evidenceKind);
+    return row != null;
+  }
+
   upsertState(input: {
     conversationId: number;
     lastProcessedSummaryCreatedAt?: string;
@@ -349,6 +386,23 @@ export class ObservedWorkStore {
     lastProcessedSummaryRowid?: number;
     pendingRebuild?: boolean;
   }): void {
+    // The processed-summary cursor is one logical checkpoint composed of
+    // (createdAt, id, rowid). Persisting any subset risks a mixed cursor
+    // referencing two different summaries, which silently breaks incremental
+    // resume — the next pass would skip rows belonging to the partially-
+    // updated summary or replay rows from the older one. Fail fast unless
+    // all three are supplied together (or none, when only `pendingRebuild`
+    // is being toggled).
+    const cursorFieldsProvided = [
+      input.lastProcessedSummaryCreatedAt,
+      input.lastProcessedSummaryId,
+      input.lastProcessedSummaryRowid,
+    ].filter((value) => value != null).length;
+    if (cursorFieldsProvided !== 0 && cursorFieldsProvided !== 3) {
+      throw new Error(
+        "lastProcessedSummaryCreatedAt, lastProcessedSummaryId, and lastProcessedSummaryRowid must all be provided together or all omitted.",
+      );
+    }
     const pendingRebuild =
       input.pendingRebuild == null ? null : input.pendingRebuild ? 1 : 0;
     this.db.prepare(

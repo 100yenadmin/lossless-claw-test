@@ -77,6 +77,17 @@ function normalizeSourceIds(sourceIds: string[] | undefined, fallbackSourceId: s
   ];
 }
 
+function canonicalizeIsoTimestamp(value: string | undefined, field: string): string | null {
+  if (value == null) {
+    return null;
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error(`${field} must be a valid ISO-8601 timestamp.`);
+  }
+  return parsed.toISOString();
+}
+
 function normalizeQueryKey(value: string | undefined): string | null {
   const normalized = value?.trim().toLowerCase().replace(/\s+/g, " ");
   if (!normalized) {
@@ -147,6 +158,15 @@ export class EventObservationStore {
       throw new Error("event source ID is required.");
     }
     const sourceIds = normalizeSourceIds(input.sourceIds, sourceId);
+    // Range filtering and ordering downstream use lexicographic comparisons on
+    // `coalesce(event_time, ingest_time)`. Persist canonical ISO-8601 UTC so
+    // a non-canonical caller can't sort outside its real window or evade
+    // since/before filters; reject unparseable timestamps loudly.
+    const eventTime = canonicalizeIsoTimestamp(input.eventTime, "eventTime");
+    const ingestTime = canonicalizeIsoTimestamp(input.ingestTime, "ingestTime");
+    if (ingestTime == null) {
+      throw new Error("ingestTime is required.");
+    }
     this.db.prepare(
       `INSERT INTO lcm_event_observations (
         event_id, conversation_id, event_kind, title, description, query_key,
@@ -174,8 +194,8 @@ export class EventObservationStore {
       input.title.trim(),
       input.description?.trim() || null,
       normalizeQueryKey(input.queryKey),
-      input.eventTime ?? null,
-      input.ingestTime,
+      eventTime,
+      ingestTime,
       input.confidence ?? 0.5,
       input.rationale.trim(),
       input.sourceType,

@@ -207,7 +207,14 @@ export class TaskBridgeSuggestionStore {
           END,
           task_id = CASE
             WHEN lcm_task_bridge_suggestions.status = 'pending'
-              THEN COALESCE(excluded.task_id, lcm_task_bridge_suggestions.task_id)
+              -- Refreshed kind drives task_id: link/mark/add suggestions get
+              -- excluded.task_id (which is required and validated above for
+              -- task-targeting kinds), create_task gets NULL (it intentionally
+              -- targets no task). COALESCE-ing the old value would leave a
+              -- stale task association on a pending row whose kind no longer
+              -- targets that task — listSuggestions({ taskId }) would then
+              -- return suggestions that don't actually concern that task.
+              THEN excluded.task_id
             ELSE lcm_task_bridge_suggestions.task_id
           END,
           suggestion_kind = CASE
@@ -272,13 +279,18 @@ export class TaskBridgeSuggestionStore {
     }
     const limit = Math.max(1, Math.min(input?.limit ?? 20, 100));
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    // SQLite `datetime('now')` is whole-second precision, so suggestions
+    // refreshed in the same scan tick share `updated_at` and `created_at`.
+    // Without a deterministic tiebreaker their relative order in the result
+    // depends on storage layout — append `suggestion_id ASC` so the ordering
+    // is stable and tests can rely on it.
     const rows = this.db.prepare(
       `SELECT suggestion_id, work_item_id, task_id, suggestion_kind, status,
               confidence, rationale, source_ids, created_by, reviewed_by, reviewed_at,
               created_at, updated_at
        FROM lcm_task_bridge_suggestions
        ${whereSql}
-       ORDER BY updated_at DESC, created_at DESC
+       ORDER BY updated_at DESC, created_at DESC, suggestion_id ASC
        LIMIT ?`,
     ).all(...args, limit) as TaskBridgeSuggestionRow[];
     return rows.map(rowToSuggestion);

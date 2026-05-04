@@ -269,7 +269,15 @@ export class ObservedWorkExtractor {
       for (const line of extractLines(row.content)) {
         const work = classifyWork(line);
         if (work) {
-          const fingerprint = `${conversationId}:${work.kind}:${work.topicKey}:${slug(work.title)}`;
+          // Fingerprint on (conversation, kind, topicKey) only. Earlier drafts
+          // also folded `slug(work.title)` into the key, but that fragmented
+          // the same underlying item whenever later summaries rephrased it
+          // (e.g. two summaries about the same PR with different wording
+          // would mint two work_item_ids and inflate density counts). The
+          // topicKey already carries the discriminating signal — PR number,
+          // file path, or a stable line slug as fallback — so identical
+          // (conversation, kind, topicKey) tuples should reinforce one row.
+          const fingerprint = `${conversationId}:${work.kind}:${work.topicKey}`;
           const workItemId = hashId("ow", fingerprint);
           entries.push({
             row,
@@ -327,10 +335,26 @@ export class ObservedWorkExtractor {
         }
         for (const entry of pendingRow.entries) {
           const existing = existingByWorkItemId.get(entry.workItemId);
-          const sourceAlreadyRecorded = this.observedWorkStore.hasSource({
+          const evidenceKind = evidenceKindFor(existing, entry.work);
+          // For same-source replay detection (extractor retry on the same
+          // summary) we want a loose match — any prior evidence row for
+          // (workItem, summary) means we already counted this source and
+          // must not increment evidenceCount even if `evidenceKindFor`
+          // would promote "created" → "reinforced" the second time.
+          const sourceAlreadyRecorded = this.observedWorkStore.hasSourceFromAnyEvidence({
             workItemId: entry.workItemId,
             sourceType: "summary",
             sourceId: entry.row.summary_id,
+          });
+          // The strict (workItem, source, evidenceKind) check decides whether
+          // we should write an additional evidence row for a NEW evidenceKind
+          // on the same source — e.g. a later summary completes a previously
+          // "created" item from the same source row.
+          const exactEvidenceAlreadyRecorded = this.observedWorkStore.hasSource({
+            workItemId: entry.workItemId,
+            sourceType: "summary",
+            sourceId: entry.row.summary_id,
+            evidenceKind,
           });
           const evidenceCount =
             (existing?.evidenceCount ?? 0) + (sourceAlreadyRecorded ? 0 : 1);
@@ -360,13 +384,19 @@ export class ObservedWorkExtractor {
             fingerprint: entry.fingerprint,
             fingerprintVersion: 2,
           });
-          if (!sourceAlreadyRecorded) {
+          // Same-source replay (extractor retry on the same summary) is
+          // idempotent — if any evidence row already exists for this
+          // (workItem, source), skip the write even when evidenceKindFor()
+          // would have promoted "created" to "reinforced". Two evidence
+          // rows for the same source would over-state how much independent
+          // evidence we have for this item.
+          if (!sourceAlreadyRecorded && !exactEvidenceAlreadyRecorded) {
             this.observedWorkStore.addSource({
               workItemId: entry.workItemId,
               sourceType: "summary",
               sourceId: entry.row.summary_id,
               ordinal: entry.ordinal,
-              evidenceKind: evidenceKindFor(existing, entry.work),
+              evidenceKind,
             });
           }
           existingByWorkItemId.set(entry.workItemId, {

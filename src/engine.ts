@@ -70,6 +70,7 @@ import {
   type MessagePartRecord,
   type MessagePartType,
 } from "./store/conversation-store.js";
+import { ObservedWorkExtractor } from "./observed-work-extractor.js";
 import { EventObservationStore } from "./store/event-observation-store.js";
 import { ObservedWorkStore } from "./store/observed-work-store.js";
 import { RollupStore } from "./store/rollup-store.js";
@@ -1873,6 +1874,7 @@ export class LcmContextEngine implements ContextEngine {
   private compactionMaintenanceStore: CompactionMaintenanceStore;
   private eventObservationStore: EventObservationStore;
   private observedWorkStore: ObservedWorkStore;
+  private observedWorkExtractor: ObservedWorkExtractor;
   private rollupStore: RollupStore;
   private rollupBuilder: RollupBuilder;
   private assembler: ContextAssembler;
@@ -2001,6 +2003,11 @@ export class LcmContextEngine implements ContextEngine {
     this.compactionMaintenanceStore = new CompactionMaintenanceStore(this.db);
     this.eventObservationStore = new EventObservationStore(this.db);
     this.observedWorkStore = new ObservedWorkStore(this.db);
+    this.observedWorkExtractor = new ObservedWorkExtractor(
+      this.db,
+      this.observedWorkStore,
+      this.eventObservationStore,
+    );
     this.rollupStore = new RollupStore(this.db);
     this.rollupBuilder = new RollupBuilder(this.rollupStore, {
       timezone: this.timezone,
@@ -7190,6 +7197,12 @@ export class LcmContextEngine implements ContextEngine {
         activityBand: params.activityBand,
       });
       this.clearStableOrphanStrippingOrdinal(params.conversationId);
+      // Run observed-work + event-observation extraction immediately after
+      // each successful leaf-compaction pass so the read tools (lcm_work_density,
+      // lcm_event_search) reflect newly-persisted summaries. Failures here are
+      // logged and swallowed: extraction is best-effort and must never block the
+      // compaction round-trip.
+      this.runObservedWorkExtraction(params.conversationId);
     }
 
     const tokensBefore = observedTokens ?? storedTokensBefore;
@@ -8020,6 +8033,25 @@ export class LcmContextEngine implements ContextEngine {
 
   getObservedWorkStore(): ObservedWorkStore {
     return this.observedWorkStore;
+  }
+
+  /**
+   * Run observed-work + event-observation extraction over any newly-persisted
+   * leaf summaries. Best-effort — errors are logged and swallowed so a flaky
+   * extraction pass never aborts a compaction round.
+   */
+  private runObservedWorkExtraction(conversationId: number): void {
+    try {
+      this.observedWorkExtractor.processConversation(conversationId);
+    } catch (error) {
+      this.deps.log.warn(
+        `[lcm] observed-work extraction failed for conversation ${conversationId}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  getObservedWorkExtractor(): ObservedWorkExtractor {
+    return this.observedWorkExtractor;
   }
 
   getEventObservationStore(): EventObservationStore {

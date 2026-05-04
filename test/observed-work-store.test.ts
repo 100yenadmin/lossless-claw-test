@@ -223,6 +223,7 @@ describe("ObservedWorkStore", () => {
     });
     observedWork.upsertState({
       conversationId: 11,
+      lastProcessedSummaryCreatedAt: "2026-04-28T05:00:00.000Z",
       lastProcessedSummaryId: "sum_cursor_anchor",
       lastProcessedSummaryRowid: 9999,
     });
@@ -823,6 +824,7 @@ describe("ObservedWorkStore", () => {
       conversationId: 42,
       lastProcessedSummaryCreatedAt: "2026-04-28T02:00:00.000Z",
       lastProcessedSummaryId: "sum_123",
+      lastProcessedSummaryRowid: 1,
       pendingRebuild: true,
     });
     const row = db
@@ -831,15 +833,45 @@ describe("ObservedWorkStore", () => {
     expect(row.last_processed_summary_id).toBe("sum_123");
     expect(row.pending_rebuild).toBe(1);
 
+    // All three cursor fields advance together — this is the only legal way
+    // to update a checkpoint. Partial updates are rejected by upsertState.
     store.upsertState({
       conversationId: 42,
+      lastProcessedSummaryCreatedAt: "2026-04-28T02:30:00.000Z",
       lastProcessedSummaryId: "sum_456",
+      lastProcessedSummaryRowid: 2,
     });
     const updated = db
       .prepare(`SELECT * FROM lcm_observed_work_state WHERE conversation_id = ?`)
       .get(42) as { last_processed_summary_id: string; pending_rebuild: number };
     expect(updated.last_processed_summary_id).toBe("sum_456");
     expect(updated.pending_rebuild).toBe(1);
+  });
+
+  it("rejects partial processed-summary cursor updates", () => {
+    const db = makeDb();
+    createConversation(db, 99);
+    const store = new ObservedWorkStore(db);
+    expect(() =>
+      store.upsertState({
+        conversationId: 99,
+        lastProcessedSummaryId: "sum_only_id",
+      }),
+    ).toThrow(/must all be provided together/);
+    expect(() =>
+      store.upsertState({
+        conversationId: 99,
+        lastProcessedSummaryId: "sum_id",
+        lastProcessedSummaryRowid: 5,
+        // missing lastProcessedSummaryCreatedAt
+      }),
+    ).toThrow(/must all be provided together/);
+    // Toggling pendingRebuild alone is still legal — no cursor fields supplied.
+    store.upsertState({ conversationId: 99, pendingRebuild: true });
+    const row = db
+      .prepare(`SELECT pending_rebuild FROM lcm_observed_work_state WHERE conversation_id = ?`)
+      .get(99) as { pending_rebuild: number };
+    expect(row.pending_rebuild).toBe(1);
   });
 
   it("serves lcm_work_density with deterministic period filtering and source redaction", async () => {
@@ -889,8 +921,13 @@ describe("ObservedWorkStore", () => {
         getConversationBySessionId: async () => null,
       }),
     };
+    const now = new Date("2026-04-28T12:00:00.000Z");
     const deps = {
       resolveSessionIdFromSessionKey: async () => undefined,
+      // Inject the deterministic clock the tool now reads through —
+      // resolvePeriodBounds("today"/"week"/...) routes wall-clock reads
+      // through deps.clock.now() so tests stay frozen.
+      clock: { now: () => now },
     } as unknown as LcmDependencies;
     const tool = createLcmWorkDensityTool({
       deps,
@@ -898,7 +935,6 @@ describe("ObservedWorkStore", () => {
       sessionId: "density-session",
     });
 
-    const now = new Date("2026-04-28T12:00:00.000Z");
     vi.useFakeTimers();
     vi.setSystemTime(now);
     try {
@@ -1000,6 +1036,10 @@ describe("ObservedWorkStore", () => {
     };
     const deps = {
       resolveSessionIdFromSessionKey: async () => undefined,
+      // The tool reads wall-clock through deps.clock.now() — supply a frozen
+      // clock even though this test doesn't pass a `period` (defensive: tool
+      // resolves the clock once per execute() regardless).
+      clock: { now: () => new Date("2026-04-28T12:00:00.000Z") },
     } as unknown as LcmDependencies;
     const tool = createLcmWorkDensityTool({
       deps,
@@ -1024,5 +1064,108 @@ describe("ObservedWorkStore", () => {
     expect(details.accounting.budgetTruncated).toBe(true);
     expect(details.accounting.itemsReturned).toBeLessThan(20);
     expect(details.accounting.estimatedOutputTokens).toBeLessThanOrEqual(256);
+    // Whole items dropped by trimOneItem must be reflected in itemsOmitted —
+    // callers must not be told "0 omitted" when most rows were forced out by
+    // the budget. accounting is widened to include itemsOmitted at runtime.
+    const omitted = (details.accounting as Record<string, unknown>).itemsOmitted;
+    expect(typeof omitted).toBe("number");
+    expect(omitted as number).toBeGreaterThan(0);
+  });
+
+  it("canonicalizes event timestamps and rejects unparseable values", () => {
+    const db = makeDb();
+    createConversation(db, 71);
+    const store = new EventObservationStore(db);
+    store.upsertObservation({
+      eventId: "ev_canon_a",
+      conversationId: 71,
+      eventKind: "primary",
+      title: "Canonical event",
+      // Non-canonical (no fractional seconds, no Z suffix expected by lex sort).
+      eventTime: "2026-04-28T05:00:00+00:00",
+      ingestTime: "2026-04-28T05:00:01+00:00",
+      rationale: "canonical",
+      sourceType: "summary",
+      sourceId: "sum_canon_a",
+    });
+    const row = db
+      .prepare(
+        `SELECT event_time, ingest_time FROM lcm_event_observations WHERE event_id = ?`,
+      )
+      .get("ev_canon_a") as { event_time: string; ingest_time: string };
+    expect(row.event_time).toBe("2026-04-28T05:00:00.000Z");
+    expect(row.ingest_time).toBe("2026-04-28T05:00:01.000Z");
+
+    expect(() =>
+      store.upsertObservation({
+        eventId: "ev_canon_bad",
+        conversationId: 71,
+        eventKind: "primary",
+        title: "Bad event",
+        eventTime: "not a date",
+        ingestTime: "2026-04-28T05:00:01.000Z",
+        rationale: "bad",
+        sourceType: "summary",
+        sourceId: "sum_canon_bad",
+      }),
+    ).toThrow(/eventTime/);
+  });
+
+  it("orders task-bridge suggestions deterministically when timestamps tie", async () => {
+    const { TaskBridgeSuggestionStore } = await import(
+      "../src/store/task-bridge-suggestion-store.js"
+    );
+    const db = makeDb();
+    createConversation(db, 73);
+    const observedWork = new ObservedWorkStore(db);
+    for (const id of ["work_tie_a", "work_tie_b", "work_tie_c"]) {
+      observedWork.upsertItem({
+        workItemId: id,
+        conversationId: 73,
+        firstSeenAt: "2026-04-28T01:00:00.000Z",
+        lastSeenAt: "2026-04-28T01:00:00.000Z",
+        title: `Tie item ${id}`,
+        observedStatus: "observed_unfinished",
+        kind: "follow_up",
+        fingerprint: `tie:${id}`,
+      });
+      observedWork.addSource({
+        workItemId: id,
+        sourceType: "summary",
+        sourceId: `sum_tie_${id}`,
+        ordinal: 0,
+        evidenceKind: "created",
+      });
+    }
+    const store = new TaskBridgeSuggestionStore(db);
+    // datetime('now') has whole-second precision, so all three writes share
+    // updated_at + created_at. listSuggestions must still return them in a
+    // deterministic order — append `suggestion_id ASC` as a tiebreaker.
+    await store.upsertSuggestion({
+      suggestionId: "sug_b",
+      workItemId: "work_tie_b",
+      suggestionKind: "create_task",
+      confidence: 0.7,
+      rationale: "b",
+      sourceIds: ["sum_tie_work_tie_b"],
+    });
+    await store.upsertSuggestion({
+      suggestionId: "sug_a",
+      workItemId: "work_tie_a",
+      suggestionKind: "create_task",
+      confidence: 0.7,
+      rationale: "a",
+      sourceIds: ["sum_tie_work_tie_a"],
+    });
+    await store.upsertSuggestion({
+      suggestionId: "sug_c",
+      workItemId: "work_tie_c",
+      suggestionKind: "create_task",
+      confidence: 0.7,
+      rationale: "c",
+      sourceIds: ["sum_tie_work_tie_c"],
+    });
+    const list = store.listSuggestions({ status: "pending" });
+    expect(list.map((row) => row.suggestionId)).toEqual(["sug_a", "sug_b", "sug_c"]);
   });
 });
