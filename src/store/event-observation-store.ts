@@ -206,8 +206,12 @@ export class EventObservationStore {
     const query = normalizeQueryKey(input?.query);
     if (query) {
       const likeQuery = `%${escapeLikePattern(query)}%`;
+      // query_key is already normalized to lowercase on write (see normalizeQueryKey
+      // call in upsertObservation), so we compare directly to keep
+      // lcm_event_observations_query_time_idx usable. title/description are not
+      // pre-lowercased and still need lower() for case-insensitive LIKE.
       where.push(
-        "(lower(coalesce(query_key, '')) = ? OR lower(title) LIKE ? ESCAPE '\\' OR lower(coalesce(description, '')) LIKE ? ESCAPE '\\')"
+        "(query_key = ? OR lower(title) LIKE ? ESCAPE '\\' OR lower(coalesce(description, '')) LIKE ? ESCAPE '\\')"
       );
       args.push(query, likeQuery, likeQuery);
     }
@@ -219,7 +223,11 @@ export class EventObservationStore {
       where.push("julianday(coalesce(event_time, ingest_time)) < julianday(?)");
       args.push(input.before);
     }
-    const limit = Math.max(1, Math.min(input?.limit ?? 20, 100));
+    const rawLimit = input?.limit;
+    const limit =
+      typeof rawLimit === "number" && Number.isFinite(rawLimit)
+        ? Math.max(1, Math.min(Math.trunc(rawLimit), 100))
+        : 20;
     const order = input?.first ? "ASC" : "DESC";
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db.prepare(

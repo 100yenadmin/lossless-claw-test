@@ -258,7 +258,11 @@ export class TaskBridgeSuggestionStore {
       where.push("task_id = ?");
       args.push(input.taskId);
     }
-    const limit = Math.max(1, Math.min(input?.limit ?? 20, 100));
+    const rawLimit = input?.limit;
+    const limit =
+      typeof rawLimit === "number" && Number.isFinite(rawLimit)
+        ? Math.max(1, Math.min(Math.trunc(rawLimit), 100))
+        : 20;
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db.prepare(
       `SELECT suggestion_id, work_item_id, task_id, suggestion_kind, status,

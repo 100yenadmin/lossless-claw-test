@@ -61,13 +61,14 @@ const LcmWorkDensitySchema = Type.Object({
 
 function resolvePeriodBounds(
   period: unknown,
-  timezone: string
+  timezone: string,
+  now: Date
 ): { label?: string; since?: string; before?: string } {
   if (typeof period !== "string" || period.trim().length === 0) {
     return {};
   }
   const normalized = period.trim().toLowerCase().replace(/\s+/g, " ");
-  const today = getZonedDayString(new Date(), timezone);
+  const today = getZonedDayString(now, timezone);
   if (normalized === "today") {
     return dayBounds("today", today, timezone);
   }
@@ -224,7 +225,28 @@ function applyOutputBudget(
   if (!budget) {
     return details;
   }
-  const next: Record<string, unknown> = { ...details };
+  // Initialize the accounting fields BEFORE we trim against the budget so that
+  // their byte cost is included in the budget check. Otherwise we trim against
+  // a smaller-than-final payload and the returned JSON can exceed
+  // maxOutputTokens (and the stored estimatedOutputTokens underestimates).
+  const baseAccounting =
+    details.accounting != null && typeof details.accounting === "object" && !Array.isArray(details.accounting)
+      ? { ...(details.accounting as Record<string, unknown>) }
+      : {};
+  const next: Record<string, unknown> = {
+    ...details,
+    accounting: {
+      ...baseAccounting,
+      maxOutputTokens: budget,
+      itemsReturned: countReturnedItems(details),
+      budgetTruncated: false,
+      truncated: Boolean(baseAccounting.truncated),
+      // Reserve room for the final estimatedOutputTokens digits; we overwrite
+      // below once the payload is final. Pre-seeding keeps the budget check
+      // honest because JSON.stringify already accounts for this key.
+      estimatedOutputTokens: 0,
+    },
+  };
   let budgetTruncated = false;
   let guard = 0;
   while (estimateJsonTokens(next) > budget && guard < 10_000) {
@@ -235,15 +257,11 @@ function applyOutputBudget(
     }
     break;
   }
-  const accounting =
-    next.accounting != null && typeof next.accounting === "object" && !Array.isArray(next.accounting)
-      ? { ...(next.accounting as Record<string, unknown>) }
-      : {};
-  accounting.maxOutputTokens = budget;
+  const accounting = next.accounting as Record<string, unknown>;
   accounting.itemsReturned = countReturnedItems(next);
   accounting.budgetTruncated = budgetTruncated;
   accounting.truncated = Boolean(accounting.truncated) || budgetTruncated;
-  next.accounting = accounting;
+  // Final estimate reflects the trimmed payload AND every accounting field.
   accounting.estimatedOutputTokens = estimateJsonTokens(next);
   return next;
 }
@@ -288,8 +306,11 @@ export function createLcmWorkDensityTool(input: {
       let statuses: ObservedWorkStatus[] | undefined;
       let kinds: ObservedWorkKind[] | undefined;
       let periodLabel: string | undefined;
+      // Capture wall-clock once via deps.clock.now() so period resolution stays
+      // consistent within this call (and lets tests inject a frozen clock).
+      const callTime = input.deps.clock.now();
       try {
-        const periodBounds = resolvePeriodBounds(p.period, lcm.timezone);
+        const periodBounds = resolvePeriodBounds(p.period, lcm.timezone, callTime);
         periodLabel = periodBounds.label;
         since = parseIsoTimestampParam(p, "since")?.toISOString() ?? periodBounds.since;
         before = parseIsoTimestampParam(p, "before")?.toISOString() ?? periodBounds.before;
@@ -301,10 +322,25 @@ export function createLcmWorkDensityTool(input: {
       if (since && before && since >= before) {
         return jsonResult({ error: "since must be earlier than before." });
       }
-      const limit = typeof p.limit === "number" ? Math.trunc(p.limit) : 5;
-      const detailLevel = typeof p.detailLevel === "number" ? Math.trunc(p.detailLevel) : 1;
+      const limit =
+        typeof p.limit === "number" && Number.isFinite(p.limit)
+          ? Math.max(1, Math.min(Math.trunc(p.limit), 50))
+          : 5;
+      const detailLevel =
+        typeof p.detailLevel === "number" && Number.isFinite(p.detailLevel)
+          ? Math.max(0, Math.min(Math.trunc(p.detailLevel), 2))
+          : 1;
       const topic = typeof p.topic === "string" && p.topic.trim() ? p.topic.trim() : undefined;
-      const minConfidence = typeof p.minConfidence === "number" ? p.minConfidence : undefined;
+      let minConfidence: number | undefined;
+      if (p.minConfidence != null) {
+        if (typeof p.minConfidence !== "number" || !Number.isFinite(p.minConfidence)) {
+          return jsonResult({ error: "minConfidence must be a finite number between 0 and 1." });
+        }
+        if (p.minConfidence < 0 || p.minConfidence > 1) {
+          return jsonResult({ error: "minConfidence must be between 0 and 1." });
+        }
+        minConfidence = p.minConfidence;
+      }
       const store = lcm.getObservedWorkStore();
       const includeSources = p.includeSources === true;
       const result = store.getDensity({

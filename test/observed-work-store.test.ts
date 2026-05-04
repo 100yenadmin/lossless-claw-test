@@ -454,6 +454,7 @@ describe("ObservedWorkStore", () => {
     };
     const deps = {
       resolveSessionIdFromSessionKey: async () => undefined,
+      clock: { now: () => new Date() },
     } as unknown as LcmDependencies;
     const tool = createLcmEventSearchTool({
       deps,
@@ -922,6 +923,7 @@ describe("ObservedWorkStore", () => {
     };
     const deps = {
       resolveSessionIdFromSessionKey: async () => undefined,
+      clock: { now: () => new Date() },
     } as unknown as LcmDependencies;
     const tool = createLcmWorkDensityTool({
       deps,
@@ -1031,6 +1033,7 @@ describe("ObservedWorkStore", () => {
     };
     const deps = {
       resolveSessionIdFromSessionKey: async () => undefined,
+      clock: { now: () => new Date() },
     } as unknown as LcmDependencies;
     const tool = createLcmWorkDensityTool({
       deps,
@@ -1055,5 +1058,83 @@ describe("ObservedWorkStore", () => {
     expect(details.accounting.budgetTruncated).toBe(true);
     expect(details.accounting.itemsReturned).toBeLessThan(20);
     expect(details.accounting.estimatedOutputTokens).toBeLessThanOrEqual(256);
+  });
+
+  it("compares query_key directly so the lcm_event_observations_query_time_idx is usable", async () => {
+    const db = makeDb();
+    createConversation(db, 80);
+    const events = new EventObservationStore(db);
+    events.upsertObservation({
+      eventId: "evt_idx",
+      conversationId: 80,
+      eventKind: "primary",
+      title: "PR #777 merged",
+      queryKey: "pr-777",
+      eventTime: "2026-05-01T00:00:00.000Z",
+      ingestTime: "2026-05-01T00:00:00.000Z",
+      confidence: 0.9,
+      rationale: "indexable read path",
+      sourceType: "summary",
+      sourceId: "sum_idx",
+    });
+    // We can't EXPLAIN QUERY PLAN through node:sqlite trivially without the
+    // raw SELECT, so instead we confirm there is no `lower(coalesce(query_key`
+    // wrapper anywhere in the read path's prepared statement. Snapshot of the
+    // emitted SQL via the source file:
+    // (regression guard for the upstream PR #540 review comment.)
+    const fs = await import("node:fs");
+    const sourceText = fs.readFileSync(
+      new URL("../src/store/event-observation-store.ts", import.meta.url),
+      "utf8"
+    );
+    expect(sourceText).not.toContain("lower(coalesce(query_key");
+    expect(
+      events.listObservations({ conversationId: 80, query: "pr-777" })[0]?.eventId
+    ).toBe("evt_idx");
+  });
+
+  it("clamps non-finite limits in getDensity instead of binding NaN to LIMIT ?", () => {
+    const db = makeDb();
+    createConversation(db, 60);
+    const observedWork = new ObservedWorkStore(db);
+    // Calls with NaN/Infinity must not throw; should fall back to default.
+    const r1 = observedWork.getDensity({
+      conversationId: 60,
+      limit: Number.NaN,
+    });
+    const r2 = observedWork.getDensity({
+      conversationId: 60,
+      limit: Number.POSITIVE_INFINITY,
+    });
+    expect(r1.density.totalObserved).toBe(0);
+    expect(r2.density.totalObserved).toBe(0);
+  });
+
+  it("preloads source keys so extraction stays at O(workItemIds) point queries even on dense rows", async () => {
+    const db = makeDb();
+    createConversation(db, 70);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+
+    const lines: string[] = [];
+    for (let i = 0; i < 20; i += 1) {
+      lines.push(`- TODO: dense observed line ${i}`);
+    }
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 70,
+      summaryId: "sum_dense_preload",
+      createdAt: "2026-04-30T05:00:00.000Z",
+      content: lines.join("\n"),
+    });
+
+    // Spy on hasSource to confirm the extractor no longer issues per-line
+    // point queries (existingSourceKeys preload covers the membership check).
+    const hasSourceSpy = vi.spyOn(observedWork, "hasSource");
+    extractor.processConversation(70);
+    expect(hasSourceSpy).not.toHaveBeenCalled();
+    hasSourceSpy.mockRestore();
   });
 });

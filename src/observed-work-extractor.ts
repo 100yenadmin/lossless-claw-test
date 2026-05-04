@@ -249,7 +249,11 @@ export class ObservedWorkExtractor {
     options?: { limit?: number },
   ): ObservedWorkExtractionResult {
     const state = this.observedWorkStore.getState(conversationId);
-    const limit = Math.max(1, Math.min(options?.limit ?? 200, 1000));
+    const rawLimit = options?.limit;
+    const limit =
+      typeof rawLimit === "number" && Number.isFinite(rawLimit)
+        ? Math.max(1, Math.min(Math.trunc(rawLimit), 1000))
+        : 200;
     const rows = this.listUnprocessedLeafSummaries(conversationId, state, limit);
     let workItemsUpserted = 0;
     let eventsUpserted = 0;
@@ -296,7 +300,14 @@ export class ObservedWorkExtractor {
       pendingRows.push({ row, entries, events });
     }
 
-    const existingByWorkItemId = this.loadExistingItems([...workItemIds]);
+    const workItemIdList = [...workItemIds];
+    const existingByWorkItemId = this.loadExistingItems(workItemIdList);
+    // Preload existing source keys in one (chunked) query to avoid an N+1
+    // hasSource() point-query pattern when dense summaries push hundreds of
+    // observed lines into the same maintenance pass.
+    const existingSourceKeys = this.observedWorkStore.loadExistingSourceKeys(workItemIdList);
+    const sourceKey = (workItemId: string, sourceType: "summary", sourceId: string): string =>
+      [workItemId, sourceType, sourceId].join("|");
     const evidenceKindFor = (
       existing: ObservedWorkItemSnapshot | undefined,
       work: WorkCandidate,
@@ -333,11 +344,8 @@ export class ObservedWorkExtractor {
         }
         for (const entry of pendingRow.entries) {
           const existing = existingByWorkItemId.get(entry.workItemId);
-          const sourceAlreadyRecorded = this.observedWorkStore.hasSource({
-            workItemId: entry.workItemId,
-            sourceType: "summary",
-            sourceId: entry.row.summary_id,
-          });
+          const cacheKey = sourceKey(entry.workItemId, "summary", entry.row.summary_id);
+          const sourceAlreadyRecorded = existingSourceKeys.has(cacheKey);
           const evidenceCount =
             (existing?.evidenceCount ?? 0) + (sourceAlreadyRecorded ? 0 : 1);
           const confidence = Math.min(
@@ -374,6 +382,9 @@ export class ObservedWorkExtractor {
               ordinal: entry.ordinal,
               evidenceKind: evidenceKindFor(existing, entry.work),
             });
+            // Keep the in-memory cache in sync so subsequent entries in this
+            // same maintenance pass observe the freshly-recorded source.
+            existingSourceKeys.add(cacheKey);
           }
           existingByWorkItemId.set(entry.workItemId, {
             workItemId: entry.workItemId,

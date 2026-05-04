@@ -104,6 +104,10 @@ export function createLcmEventSearchTool(input: {
         return jsonResult({ error: "since must be earlier than before." });
       }
       const query = typeof p.query === "string" && p.query.trim() ? p.query.trim() : undefined;
+      const limit =
+        typeof p.limit === "number" && Number.isFinite(p.limit)
+          ? Math.max(1, Math.min(Math.trunc(p.limit), 100))
+          : 20;
       const observations = lcm.getEventObservationStore().listObservations({
         conversationId: scope.conversationId,
         eventKinds,
@@ -112,7 +116,7 @@ export function createLcmEventSearchTool(input: {
         before,
         first: p.first === true,
         includeSources: p.includeSources === true,
-        limit: typeof p.limit === "number" ? Math.trunc(p.limit) : 20,
+        limit,
       });
       return jsonResult({
         conversationScope: scope.allConversations ? "all" : scope.conversationId,

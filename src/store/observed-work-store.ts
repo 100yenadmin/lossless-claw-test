@@ -342,6 +342,33 @@ export class ObservedWorkStore {
     return row != null;
   }
 
+  /**
+   * Batch-load existing source rows for a set of work items. Returns a Set of
+   * keys "{workItemId}|{sourceType}|{sourceId}" the caller can probe
+   * instead of issuing per-row hasSource() point queries (used by the extractor
+   * to avoid an N+1 pattern in dense maintenance passes).
+   */
+  loadExistingSourceKeys(
+    workItemIds: readonly string[]
+  ): Set<string> {
+    const keys = new Set<string>();
+    if (workItemIds.length === 0) {
+      return keys;
+    }
+    for (let offset = 0; offset < workItemIds.length; offset += 500) {
+      const chunk = workItemIds.slice(offset, offset + 500);
+      const rows = this.db.prepare(
+        `SELECT work_item_id, source_type, source_id
+         FROM lcm_observed_work_sources
+         WHERE work_item_id IN (${chunk.map(() => "?").join(", ")})`,
+      ).all(...chunk) as Array<{ work_item_id: string; source_type: string; source_id: string }>;
+      for (const row of rows) {
+        keys.add(`${row.work_item_id}|${row.source_type}|${row.source_id}`);
+      }
+    }
+    return keys;
+  }
+
   upsertState(input: {
     conversationId: number;
     lastProcessedSummaryCreatedAt?: string;
@@ -451,7 +478,11 @@ export class ObservedWorkStore {
       args.push(query.minConfidence);
     }
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
-    const limit = Math.max(1, Math.min(query.limit ?? 10, 50));
+    const rawLimit = query.limit;
+    const limit =
+      typeof rawLimit === "number" && Number.isFinite(rawLimit)
+        ? Math.max(1, Math.min(Math.trunc(rawLimit), 50))
+        : 10;
     const ambiguousLimit = limit;
     const counts = this.db.prepare(
       `SELECT
