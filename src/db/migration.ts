@@ -1194,6 +1194,23 @@ export function runLcmMigrations(
         )
         WHERE kind = 'leaf';
 
+        -- Cross-conversation summary fallback path (lcm-recent without
+        -- conversation filter) needs a single-column expression index on the
+        -- effective time so SQLite can use it for ORDER BY DESC LIMIT N. The
+        -- composite *_conv_idx above is keyed by conversation_id first, so it
+        -- can't serve a global ORDER BY without a full sort. Issue #46.
+        -- NOTE: lcm-recent-tool.ts orders fallback rows by
+        --   ORDER BY julianday(coalesce(latest_at, earliest_at, created_at)) DESC
+        -- (latest_at first), NOT (earliest_at first). The expression here MUST
+        -- match the ORDER BY exactly for SQLite to use the index. CodeRabbit
+        -- flagged the previous mismatch on PR #59 (issue #46).
+        CREATE INDEX IF NOT EXISTS summaries_leaf_effective_time_only_idx
+        ON summaries (
+          julianday(coalesce(latest_at, earliest_at, created_at)) DESC,
+          summary_id ASC
+        )
+        WHERE kind = 'leaf';
+
         CREATE INDEX IF NOT EXISTS messages_conversation_created_at_idx
         ON messages (conversation_id, created_at);
 
@@ -1452,6 +1469,12 @@ export function runLcmMigrations(
 
         CREATE INDEX IF NOT EXISTS lcm_event_observations_source_idx
           ON lcm_event_observations(source_type, source_id);
+
+        -- Episode rebuild orders observations by coalesce(event_time,
+        -- ingest_time) which is an unindexed expression — without this index
+        -- a rebuild over a busy conversation triggers a full sort. Issue #50.
+        CREATE INDEX IF NOT EXISTS lcm_event_observations_effective_time_idx
+          ON lcm_event_observations(julianday(coalesce(event_time, ingest_time)));
       `);
     });
 

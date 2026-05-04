@@ -1,5 +1,5 @@
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
-import { placeholders } from "../db/sql-utils.js";
+import { clampListLimit, placeholders } from "../db/sql-utils.js";
 
 export type ObservedWorkStatus =
   | "observed_completed"
@@ -318,7 +318,7 @@ export class ObservedWorkStore {
     topicKey: string;
     limit?: number;
   }): ObservedWorkItemSnapshot[] {
-    const limit = Math.max(1, Math.min(input.limit ?? 10, 50));
+    const limit = clampListLimit(input.limit, 10, 50);
     const rows = this.db.prepare(
       `SELECT work_item_id, conversation_id, observed_status, kind, title, topic_key, rationale,
               confidence, first_seen_at, last_seen_at, evidence_count
@@ -744,7 +744,7 @@ export class ObservedWorkStore {
       args.push(query.minConfidence);
     }
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
-    const limit = Math.max(1, Math.min(query.limit ?? 10, 50));
+    const limit = clampListLimit(query.limit, 10, 50);
     const ambiguousLimit = limit;
     const counts = this.db.prepare(
       `SELECT
@@ -841,10 +841,10 @@ export class ObservedWorkStore {
     staleAfterDays: number | undefined,
     nowIso: string | undefined,
   ): ObservedWorkRow[] {
-    if (staleAfterDays == null || limit <= 0) {
+    if (!Number.isFinite(staleAfterDays) || staleAfterDays == null || limit <= 0) {
       return [];
     }
-    const days = Math.max(1, Math.min(Math.trunc(staleAfterDays), 365));
+    const days = clampListLimit(staleAfterDays, 1, 365);
     // Prefer the caller-supplied ISO clock so deterministic replay /
     // frozen-clock tests get stable cutoffs (`deps.clock.now()` flows in
     // through ObservedWorkDensityQuery.now). Fall back to wall clock for

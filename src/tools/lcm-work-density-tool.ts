@@ -186,7 +186,17 @@ function countReturnedItems(details: Record<string, unknown>): number {
   return DETAIL_ARRAY_KEYS.reduce((count, key) => count + (itemArray(details, key)?.length ?? 0), 0);
 }
 
-function trimOneSource(details: Record<string, unknown>): boolean {
+// Approximate per-item byte cost of a single trimmed value when serialized
+// with JSON.stringify(value, null, 2). Used for incremental size accounting
+// (issue #44/#48) to avoid an O(N) full re-stringify per trim iteration.
+function approxStringifiedSize(value: unknown): number {
+  return JSON.stringify(value, null, 2).length;
+}
+
+// Returns the approximate number of characters removed from the
+// pretty-printed serialization of `details` after dropping the last source
+// of one item, or 0 if no source could be trimmed.
+function trimOneSource(details: Record<string, unknown>): number {
   for (const key of DETAIL_ARRAY_KEYS) {
     const items = itemArray(details, key);
     if (!items) {
@@ -202,6 +212,7 @@ function trimOneSource(details: Record<string, unknown>): boolean {
       if (!Array.isArray(sources) || sources.length === 0) {
         continue;
       }
+      const droppedSource = sources[sources.length - 1];
       const nextItem = { ...itemRecord };
       const nextSources = sources.slice(0, -1);
       if (nextSources.length > 0) {
@@ -212,21 +223,28 @@ function trimOneSource(details: Record<string, unknown>): boolean {
       const nextItems = items.slice();
       nextItems[index] = nextItem;
       details[key] = nextItems;
-      return true;
+      // Approximate: size of the dropped element plus separators / indentation.
+      // The exact byte delta depends on whether `sources` is now empty (removes
+      // the key entirely), but for budget tracking an over-estimate is safe —
+      // periodic resync corrects drift.
+      return approxStringifiedSize(droppedSource) + 4;
     }
   }
-  return false;
+  return 0;
 }
 
-function trimOneItem(details: Record<string, unknown>): boolean {
+// Returns the approximate number of characters removed after dropping the
+// last item from one of the detail arrays, or 0 if no item could be trimmed.
+function trimOneItem(details: Record<string, unknown>): number {
   for (const key of DETAIL_ARRAY_KEYS) {
     const items = itemArray(details, key);
     if (items && items.length > 0) {
+      const dropped = items[items.length - 1];
       details[key] = items.slice(0, -1);
-      return true;
+      return approxStringifiedSize(dropped) + 4;
     }
   }
-  return false;
+  return 0;
 }
 
 function applyOutputBudget(
@@ -266,11 +284,22 @@ function applyOutputBudget(
 
   let budgetTruncated = false;
   let guard = 0;
-  while (estimateJsonTokens(next) > budget && guard < 10_000) {
+  // Incremental size accounting (issue #44/#48): the previous loop called
+  // JSON.stringify on the whole `next` payload every iteration, giving O(N²)
+  // behaviour when many items had to be trimmed. Track the running size and
+  // subtract per-item deltas instead, resyncing periodically against the real
+  // serialization to bound drift from approximation error.
+  const RESYNC_INTERVAL = 64;
+  let runningChars = JSON.stringify(next, null, 2).length;
+  while (Math.ceil(runningChars / 4) > budget && guard < 10_000) {
     guard += 1;
     const beforeItems = countReturnedItems(next);
-    if (trimOneSource(next) || trimOneItem(next)) {
+    const sourceDelta = trimOneSource(next);
+    const itemDelta = sourceDelta > 0 ? 0 : trimOneItem(next);
+    const delta = sourceDelta + itemDelta;
+    if (delta > 0) {
       budgetTruncated = true;
+      runningChars = Math.max(0, runningChars - delta);
       const afterItems = countReturnedItems(next);
       // Whole items dropped by trimOneItem must be reflected in itemsOmitted;
       // otherwise callers see "0 omitted" while most rows are gone.
@@ -278,6 +307,12 @@ function applyOutputBudget(
       accounting.itemsReturned = afterItems;
       accounting.budgetTruncated = true;
       accounting.truncated = true;
+      // Periodic resync against the real serialization to correct drift —
+      // approxStringifiedSize ignores enclosing separators and indentation
+      // changes, so the running total can diverge over many iterations.
+      if (guard % RESYNC_INTERVAL === 0) {
+        runningChars = JSON.stringify(next, null, 2).length;
+      }
       continue;
     }
     break;
@@ -343,10 +378,12 @@ export function createLcmWorkDensityTool(input: {
       if (since && before && since >= before) {
         return jsonResult({ error: "since must be earlier than before." });
       }
-      const limit = typeof p.limit === "number" ? Math.trunc(p.limit) : 5;
-      const detailLevel = typeof p.detailLevel === "number" ? Math.trunc(p.detailLevel) : 1;
+      // NaN/Infinity must not slip through `typeof === "number"` (issue #56,
+      // #57). Math.trunc(NaN)===NaN and Math.min/max with NaN propagate to SQL.
+      const limit = Number.isFinite(p.limit as number) ? Math.trunc(p.limit as number) : 5;
+      const detailLevel = Number.isFinite(p.detailLevel as number) ? Math.trunc(p.detailLevel as number) : 1;
       const topic = typeof p.topic === "string" && p.topic.trim() ? p.topic.trim() : undefined;
-      const minConfidence = typeof p.minConfidence === "number" ? p.minConfidence : undefined;
+      const minConfidence = Number.isFinite(p.minConfidence as number) ? (p.minConfidence as number) : undefined;
       const store = lcm.getObservedWorkStore();
       const includeSources = p.includeSources === true;
       const result = store.getDensity({
