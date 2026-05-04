@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
+import { clampListLimit } from "./db/sql-utils.js";
 import { withDatabaseTransaction } from "./transaction-mutex.js";
 import type {
   ObservedWorkKind,
@@ -277,7 +278,7 @@ export class ObservedWorkExtractor {
     options?: { limit?: number },
   ): Promise<ObservedWorkExtractionResult> {
     const state = this.observedWorkStore.getState(conversationId);
-    const limit = Math.max(1, Math.min(options?.limit ?? 200, 1000));
+    const limit = clampListLimit(options?.limit, 200, 1000);
     const rows = this.listUnprocessedLeafSummaries(conversationId, state, limit);
     let workItemsUpserted = 0;
     let eventsUpserted = 0;

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { escapeLikePattern, placeholders } from "../db/sql-utils.js";
 import { withDatabaseTransaction } from "../transaction-mutex.js";
+import { clampListLimit } from "../db/sql-utils.js";
 
 export type EventObservationKind =
   | "primary"
@@ -224,16 +225,6 @@ function sourcesFromIds(
     out.push({ sourceType, sourceId });
   }
   return out;
-}
-
-// Coerce a caller-supplied limit into a finite positive integer in [1, 100].
-// Guards against NaN/Infinity/non-number inputs so the value bound to a SQL
-// `LIMIT ?` placeholder is never NaN (which throws at bind time on node:sqlite).
-function clampListLimit(value: unknown, fallback: number): number {
-  const numeric = typeof value === "number" && Number.isFinite(value)
-    ? Math.trunc(value)
-    : fallback;
-  return Math.max(1, Math.min(numeric, 100));
 }
 
 function compareIso(a: string, b: string, pick: "min" | "max"): string {
@@ -691,7 +682,7 @@ export class EventObservationStore {
       where.push("coalesce(event_time, ingest_time) < ?");
       args.push(input.before);
     }
-    const limit = Math.max(1, Math.min(input?.limit ?? 20, 100));
+    const limit = clampListLimit(input?.limit, 20, 100);
     const order = input?.first ? "ASC" : "DESC";
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db.prepare(
@@ -742,7 +733,7 @@ export class EventObservationStore {
       where.push("first_event_time < ?");
       args.push(input.before);
     }
-    const limit = clampListLimit(input?.limit, 20);
+    const limit = clampListLimit(input?.limit, 20, 100);
     const order = input?.first ? "ASC" : "DESC";
     const orderColumn = input?.first ? "first_event_time" : "last_event_time";
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
