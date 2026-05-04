@@ -2203,6 +2203,118 @@ describe("LCM sub-day window retrieval", () => {
     expect((result.details as { usedFallback?: boolean }).usedFallback).toBe(false);
   });
 
+  // MAJOR-1 (audit/round1-2): the freshness gate must OR `pending_rebuild`
+  // across the WHOLE conversation family. Previously, `lcm_recent` consulted
+  // `getState(conversationId)` for the rooted conversation only, so an
+  // auto-rotated session where the archived sibling had a pending rebuild
+  // covering yesterday — but the active conversation was clean — would still
+  // serve the sibling's stale rollup via cross-conversation aggregation.
+  // Now we OR pending_rebuild + pendingDayKey across all family ids.
+  it("OR's pending_rebuild flags across family conversations (MAJOR-1)", async () => {
+    const now = new Date("2026-04-29T12:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const { conversationStore, rollupStore } = createStores();
+      const sharedSessionKey = "agent:main:family-pending-or";
+
+      // Sibling (archived after auto-rotate): pending rebuild covering yesterday.
+      // Create + archive BEFORE the active one so the UNIQUE(active=1, session_key)
+      // index permits the second insert.
+      const sibling = await conversationStore.createConversation({
+        sessionId: "family-pending-or-sibling",
+        sessionKey: sharedSessionKey,
+        title: "Family pending sibling",
+      });
+      await conversationStore.archiveConversation(sibling.conversationId);
+      // Active conversation (post auto-rotate): clean state.
+      const active = await conversationStore.createConversation({
+        sessionId: "family-pending-or-active",
+        sessionKey: sharedSessionKey,
+        title: "Family pending active",
+      });
+
+      // Sibling has a stored rollup for yesterday. Without family-wide gating,
+      // the cross-conversation lookup would return this rollup as ready and
+      // serve it — even though sibling's own pending_rebuild flag means its
+      // underlying data is dirty.
+      rollupStore.upsertRollup({
+        rollup_id: "rollup_family_pending_sibling",
+        conversation_id: sibling.conversationId,
+        period_kind: "day",
+        period_key: "2026-04-28",
+        period_start: "2026-04-28T00:00:00.000Z",
+        period_end: "2026-04-29T00:00:00.000Z",
+        timezone: "UTC",
+        content: "STALE SIBLING ROLLUP — MUST BE BYPASSED",
+        token_count: 10,
+        source_summary_ids: JSON.stringify([]),
+        source_message_count: 0,
+        source_token_count: 0,
+        status: "ready",
+        coverage_start: null,
+        coverage_end: null,
+        summarizer_model: null,
+        source_fingerprint: null,
+      });
+      rollupStore.upsertState(sibling.conversationId, {
+        timezone: "UTC",
+        last_message_at: "2026-04-28T15:00:00.000Z",
+        pending_rebuild: 1,
+      });
+      // Active conversation has no rollup state at all — clean.
+
+      const lcm = {
+        timezone: "UTC",
+        getRollupStore: () => rollupStore,
+        getConversationStore: () => ({
+          getConversationBySessionId: async () => ({
+            conversationId: active.conversationId,
+            sessionId: "family-pending-or-active",
+            sessionKey: sharedSessionKey,
+            title: null,
+            bootstrappedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          }),
+          getConversationBySessionKey: async () => ({
+            conversationId: active.conversationId,
+            sessionId: "family-pending-or-active",
+            sessionKey: sharedSessionKey,
+            title: null,
+            bootstrappedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          }),
+          listConversationsBySessionKey: async () => [
+            { conversationId: active.conversationId },
+            { conversationId: sibling.conversationId },
+          ],
+        }),
+      };
+      const tool = createLcmRecentTool({
+        deps: makeRecentDeps(),
+        lcm: lcm as never,
+        sessionId: "family-pending-or-active",
+        sessionKey: sharedSessionKey,
+      });
+
+      const result = await tool.execute("call-family-pending-or", {
+        period: "yesterday",
+        includeSources: true,
+      });
+      const text = (result.content[0] as { text: string }).text;
+      // The stale sibling rollup must NOT be served — the family-wide
+      // pending_rebuild gate should bypass it and fall through to the
+      // fallback path (which has nothing real, but the gate is the point).
+      expect(text).not.toContain("STALE SIBLING ROLLUP");
+      expect(text).toContain("Rollup rebuild is pending for 2026-04-28");
+      expect((result.details as { usedFallback?: boolean }).usedFallback).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   // C1 (audit/round1): the "any source items?" probe must not count tool/system
   // /internal-marker rows. Otherwise a window with ONLY harness scaffolding looks
   // like it has fresh evidence and bypasses an otherwise-valid stored rollup.

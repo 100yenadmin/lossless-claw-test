@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { clampListLimit, escapeLikePattern, placeholders } from "../db/sql-utils.js";
+import { appendConversationScopeConstraint } from "./conversation-scope.js";
 import { withDatabaseTransaction } from "../transaction-mutex.js";
 
 export type EventObservationKind =
@@ -638,6 +639,13 @@ export class EventObservationStore {
 
   listObservations(input?: {
     conversationId?: number;
+    /**
+     * Optional set of conversation IDs to scope the query across (session
+     * family). When supplied with at least one element, takes precedence over
+     * `conversationId`. Used by family-aware retrieval (PR #338 + v0.9.4) so
+     * event search spans /new and /reset boundaries.
+     */
+    conversationIds?: number[];
     eventKinds?: EventObservationKind[];
     query?: string;
     since?: string;
@@ -648,10 +656,13 @@ export class EventObservationStore {
   }): EventObservation[] {
     const where: string[] = [];
     const args: Array<string | number> = [];
-    if (input?.conversationId != null) {
-      where.push("conversation_id = ?");
-      args.push(input.conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "conversation_id",
+      conversationId: input?.conversationId,
+      conversationIds: input?.conversationIds,
+    });
     if (input?.eventKinds?.length) {
       where.push(`event_kind IN (${placeholders(input.eventKinds)})`);
       args.push(...input.eventKinds);
@@ -698,6 +709,11 @@ export class EventObservationStore {
 
   listEpisodes(input?: {
     conversationId?: number;
+    /**
+     * Optional session-family conversation IDs (PR #338 + v0.9.4 family
+     * extension). Same semantics as listObservations.
+     */
+    conversationIds?: number[];
     eventKinds?: EventObservationKind[];
     query?: string;
     since?: string;
@@ -708,10 +724,13 @@ export class EventObservationStore {
   }): EventEpisode[] {
     const where: string[] = [];
     const args: Array<string | number> = [];
-    if (input?.conversationId != null) {
-      where.push("conversation_id = ?");
-      args.push(input.conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "conversation_id",
+      conversationId: input?.conversationId,
+      conversationIds: input?.conversationIds,
+    });
     if (input?.eventKinds?.length) {
       where.push(`episode_kind IN (${placeholders(input.eventKinds)})`);
       args.push(...input.eventKinds);

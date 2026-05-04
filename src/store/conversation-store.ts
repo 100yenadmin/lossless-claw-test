@@ -362,12 +362,25 @@ export class ConversationStore {
   }
 
   /**
-   * Return ALL conversations (active + archived) for a given session_key,
-   * ordered by created_at descending. Used by cross-conversation aggregation
-   * (eg. lcm_recent's "boundary crossing" reads, /lossless rebuild-rollups).
+   * Return conversations (active + archived) for a given session_key, ordered
+   * freshest-first by `(active DESC, created_at DESC, conversation_id DESC)`.
+   * Used by cross-conversation aggregation (eg. lcm_recent's "boundary
+   * crossing" reads, /lossless rebuild-rollups).
    *
    * The whole point of LCM is being able to span /new and /reset boundaries
    * for the same agent.
+   *
+   * MAJOR-4 (audit/round1-2): capped at the 256 most-recent siblings to
+   * defend against IN-list overflow (sqlite default SQLITE_MAX_VARIABLE_NUMBER
+   * is 999) when a session_key accumulates 1000+ archived rotations. 256 is
+   * generous — typical families have <10 segments. Older siblings beyond the
+   * cap are silently dropped from cross-conversation aggregation; rollup
+   * rebuild will still see them via per-conversation paths.
+   *
+   * The `(active DESC, created_at DESC, conversation_id DESC)` ordering also
+   * matches PR #338's `getConversationFamilyIds` (active-first), so the
+   * user-visible "session family rooted at X (N segments)" string is stable
+   * regardless of which lookup path is taken. (MAJOR-2 audit/round1-2.)
    */
   async listConversationsBySessionKey(
     sessionKey: string,
@@ -377,7 +390,8 @@ export class ConversationStore {
         `SELECT conversation_id, session_id, session_key, active, archived_at, title, bootstrapped_at, created_at, updated_at
        FROM conversations
        WHERE session_key = ?
-       ORDER BY created_at DESC, conversation_id DESC`,
+       ORDER BY active DESC, created_at DESC, conversation_id DESC
+       LIMIT 256`,
       )
       .all(sessionKey) as unknown as ConversationRow[];
 

@@ -3,6 +3,7 @@ import type { LcmDependencies } from "../types.js";
 
 export type LcmConversationScope = {
   conversationId?: number;
+  conversationIds?: number[];
   allConversations: boolean;
   /**
    * All conversation IDs under the same session_key as the resolved
@@ -110,6 +111,7 @@ export async function resolveLcmConversationScope(input: {
   if (explicitConversationId != null) {
     return {
       conversationId: explicitConversationId,
+      conversationIds: [explicitConversationId],
       allConversations: false,
       relatedConversationIds: [],
     };
@@ -118,6 +120,7 @@ export async function resolveLcmConversationScope(input: {
   if (params.allConversations === true) {
     return {
       conversationId: undefined,
+      conversationIds: undefined,
       allConversations: true,
       relatedConversationIds: [],
     };
@@ -128,11 +131,17 @@ export async function resolveLcmConversationScope(input: {
     const bySessionKey =
       await lcm.getConversationStore().getConversationBySessionKey(normalizedSessionKey);
     if (bySessionKey) {
-      const related = await collectRelatedConversationIds(lcm, normalizedSessionKey);
+      const familyIds = await collectFamilyConversationIds({
+        lcm,
+        conversationId: bySessionKey.conversationId,
+        sessionKey: normalizedSessionKey,
+      });
+      const effectiveFamily = familyIds.length > 0 ? familyIds : [bySessionKey.conversationId];
       return {
         conversationId: bySessionKey.conversationId,
+        conversationIds: effectiveFamily,
         allConversations: false,
-        relatedConversationIds: related,
+        relatedConversationIds: effectiveFamily,
       };
     }
   }
@@ -144,6 +153,7 @@ export async function resolveLcmConversationScope(input: {
   if (!normalizedSessionId && !input.sessionKey?.trim()) {
     return {
       conversationId: undefined,
+      conversationIds: undefined,
       allConversations: false,
       relatedConversationIds: [],
     };
@@ -157,6 +167,7 @@ export async function resolveLcmConversationScope(input: {
   if (!conversation) {
     return {
       conversationId: undefined,
+      conversationIds: undefined,
       allConversations: false,
       relatedConversationIds: [],
     };
@@ -170,29 +181,49 @@ export async function resolveLcmConversationScope(input: {
   // conversation lifecycle events.
   const resolvedSessionKey =
     normalizedSessionKey ?? conversation.sessionKey?.trim() ?? undefined;
-  const related = resolvedSessionKey
-    ? await collectRelatedConversationIds(lcm, resolvedSessionKey)
-    : [conversation.conversationId];
+  const familyIds = await collectFamilyConversationIds({
+    lcm,
+    conversationId: conversation.conversationId,
+    sessionId: normalizedSessionId,
+    sessionKey: resolvedSessionKey,
+  });
+  const effectiveFamily = familyIds.length > 0 ? familyIds : [conversation.conversationId];
   return {
     conversationId: conversation.conversationId,
+    conversationIds: effectiveFamily,
     allConversations: false,
-    relatedConversationIds: related,
+    relatedConversationIds: effectiveFamily,
   };
 }
 
 /**
- * Get all conversation IDs under a given session_key (active + archived),
- * ordered newest-first by created_at. Empty array if listing isn't supported
- * by the store implementation.
+ * Resolve the full conversation family (active + archived siblings sharing a
+ * stable session identity). Standardized on
+ * `listConversationsBySessionKey` (capped at 256 most-recent siblings,
+ * ordered `(active DESC, created_at DESC, conversation_id DESC)`).
+ *
+ * MINOR (audit/round1-2): previously preferred a `getConversationFamilyIds`
+ * optional path which was never implemented on the real store, only stubbed
+ * in tests. Two paths with different orderings produced an unstable
+ * "session family rooted at X (N segments)" string (MAJOR-2). We now route
+ * everything through the single capped+ordered path; tests stub
+ * `listConversationsBySessionKey` instead.
+ *
+ * Returns an empty array when no `sessionKey` is available or the store does
+ * not implement `listConversationsBySessionKey` — callers must fall back to
+ * the singleton `[conversationId]` themselves.
  */
-async function collectRelatedConversationIds(
-  lcm: LcmContextEngine,
-  sessionKey: string,
-): Promise<number[]> {
-  const store = lcm.getConversationStore() as ConversationScopeStore;
-  if (typeof store.listConversationsBySessionKey !== "function") {
-    return [];
+async function collectFamilyConversationIds(input: {
+  lcm: LcmContextEngine;
+  conversationId?: number;
+  sessionId?: string;
+  sessionKey?: string;
+}): Promise<number[]> {
+  const store = input.lcm.getConversationStore() as ConversationScopeStore;
+  const sessionKey = input.sessionKey?.trim();
+  if (sessionKey && typeof store.listConversationsBySessionKey === "function") {
+    const records = await store.listConversationsBySessionKey(sessionKey);
+    return records.map((record) => record.conversationId);
   }
-  const records = await store.listConversationsBySessionKey(sessionKey);
-  return records.map((record) => record.conversationId);
+  return [];
 }
