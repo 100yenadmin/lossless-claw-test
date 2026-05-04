@@ -1,4 +1,4 @@
-import type { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 
 export type ObservedWorkStatus =
   | "observed_completed"
@@ -240,7 +240,11 @@ export class ObservedWorkStore {
         fingerprint_version, updated_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
       ON CONFLICT(work_item_id) DO UPDATE SET
-        conversation_id = excluded.conversation_id,
+        -- conversation_id is intentionally omitted from the update set: the
+        -- work_item_id fingerprint already encodes conversation_id, so a
+        -- conflicting reuse must keep the original conversation. Letting it
+        -- be overwritten allowed silent cross-conversation moves on collision
+        -- (matches PR #20 commit 71ba5c0 hardening).
         -- Preserve previously-stored optional/provenance fields when the
         -- incoming row omits them (otherwise partial reprocessing erases data).
         owner_id = COALESCE(excluded.owner_id, lcm_observed_work_items.owner_id),
@@ -431,7 +435,7 @@ export class ObservedWorkStore {
 
   getDensity(query: ObservedWorkDensityQuery): ObservedWorkDensityResult {
     const where: string[] = [];
-    const args: unknown[] = [];
+    const args: SQLInputValue[] = [];
     if (query.conversationId != null) {
       where.push("conversation_id = ?");
       args.push(query.conversationId);

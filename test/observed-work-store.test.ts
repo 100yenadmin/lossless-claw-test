@@ -877,4 +877,132 @@ describe("ObservedWorkStore", () => {
     expect(details.accounting.itemsReturned).toBeLessThan(20);
     expect(details.accounting.estimatedOutputTokens).toBeLessThanOrEqual(256);
   });
+
+  it("treats negated completion verbs as observed_unfinished", async () => {
+    const db = makeDb();
+    createConversation(db, 901);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+
+    const cases: Array<{ summaryId: string; content: string }> = [
+      { summaryId: "sum_neg_1", content: "- PR #1234 not completed yet" },
+      { summaryId: "sum_neg_2", content: "- Never shipped the auth fix" },
+      { summaryId: "sum_neg_3", content: "- Cannot fix this without more context" },
+      { summaryId: "sum_neg_4", content: "- Hadn't merged the rebase before review" },
+      { summaryId: "sum_neg_5", content: "- We have not yet deployed the patch" },
+    ];
+    let createdAtSeq = Date.parse("2026-04-30T10:00:00.000Z");
+    for (const c of cases) {
+      await insertLeafSummary({
+        db,
+        summaryStore,
+        conversationId: 901,
+        summaryId: c.summaryId,
+        createdAt: new Date(createdAtSeq).toISOString(),
+        content: c.content,
+      });
+      createdAtSeq += 60_000;
+    }
+    extractor.processConversation(901);
+
+    const density = observedWork.getDensity({
+      conversationId: 901,
+      limit: 50,
+    });
+    expect(density.density.unfinished).toBe(cases.length);
+    expect(density.density.completed).toBe(0);
+  });
+
+  it("classifies positive completion phrases as observed_completed (control)", async () => {
+    const db = makeDb();
+    createConversation(db, 902);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 902,
+      summaryId: "sum_positive_1",
+      createdAt: "2026-04-30T11:00:00.000Z",
+      content: "- Successfully completed the rebase and shipped to main",
+    });
+    extractor.processConversation(902);
+    const density = observedWork.getDensity({ conversationId: 902, limit: 10 });
+    expect(density.density.completed).toBe(1);
+    expect(density.density.unfinished).toBe(0);
+  });
+
+  it("does not collide work_item_ids for distinct stopword-only lines", async () => {
+    const db = makeDb();
+    createConversation(db, 903);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+
+    // Two distinct lines that BOTH carry a classification cue (todo) but whose
+    // surrounding tokens are all <=2 chars or stopwords. Pre-fix, slug() of the
+    // title yielded "todo" alone for both lines AND topicKey degraded to the
+    // kind ("follow_up"), so the fingerprints `${conv}:${kind}:${topicKey}:${slug}`
+    // were identical and the second silently overwrote the first. The hash
+    // fallback in slug() guarantees distinct work_item_ids for distinct content.
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 903,
+      summaryId: "sum_short_a",
+      createdAt: "2026-04-30T12:00:00.000Z",
+      content: "- todo it me at",
+    });
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 903,
+      summaryId: "sum_short_b",
+      createdAt: "2026-04-30T12:01:00.000Z",
+      content: "- todo or no by",
+    });
+    extractor.processConversation(903);
+
+    const ids = (db
+      .prepare(
+        `SELECT work_item_id FROM lcm_observed_work_items WHERE conversation_id = ?`,
+      )
+      .all(903) as Array<{ work_item_id: string }>).map((r) => r.work_item_id);
+    // Each line classified as observed_unfinished (todo cue). Distinct lines
+    // must produce distinct ids — otherwise the second silently overwrote the
+    // first.
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("does not let upsertItem move a work_item_id between conversations", () => {
+    const db = makeDb();
+    createConversation(db, 910);
+    createConversation(db, 911);
+    const observedWork = new ObservedWorkStore(db);
+    const baseInput = {
+      workItemId: "ow_collision_test",
+      title: "TODO: investigate flake",
+      observedStatus: "observed_unfinished" as const,
+      kind: "follow_up" as const,
+      confidence: 0.7,
+      confidenceBand: "medium" as const,
+      firstSeenAt: "2026-04-30T13:00:00.000Z",
+      lastSeenAt: "2026-04-30T13:00:00.000Z",
+      fingerprint: "910:follow_up:topic:slug",
+    };
+    observedWork.upsertItem({ ...baseInput, conversationId: 910 });
+    // A reused work_item_id arriving with a different conversation_id must
+    // NOT silently move the row — conversation_id is part of the fingerprint
+    // and is intentionally immutable on conflict.
+    observedWork.upsertItem({ ...baseInput, conversationId: 911 });
+    const row = db
+      .prepare(
+        `SELECT conversation_id FROM lcm_observed_work_items WHERE work_item_id = ?`,
+      )
+      .get("ow_collision_test") as { conversation_id: number };
+    expect(row.conversation_id).toBe(910);
+  });
 });

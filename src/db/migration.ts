@@ -1307,6 +1307,17 @@ export function runLcmMigrations(
         CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_status_kind_seen_idx
           ON lcm_observed_work_items(conversation_id, observed_status, kind, last_seen_at DESC);
 
+        -- Density queries without a kind filter are the default hot path; the
+        -- conversation/status/kind/last_seen index above forces a TEMP B-TREE
+        -- re-sort on those calls. This narrower index serves them directly.
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_status_seen_idx
+          ON lcm_observed_work_items(conversation_id, observed_status, last_seen_at DESC);
+
+        -- Supports the before predicate julianday(first_seen_at) less-than ?
+        -- which the last_seen_at indexes above cannot serve.
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_first_seen_idx
+          ON lcm_observed_work_items(conversation_id, first_seen_at);
+
         CREATE INDEX IF NOT EXISTS lcm_observed_work_items_owner_status_kind_seen_idx
           ON lcm_observed_work_items(owner_id, observed_status, kind, last_seen_at DESC);
 

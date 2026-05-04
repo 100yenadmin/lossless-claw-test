@@ -45,9 +45,15 @@ type PendingObservedWork = {
   workItemId: string;
 };
 
-const COMPLETED_RE = /\b(completed|done|fixed|implemented|merged|shipped|landed|passed|green|resolved|closed)\b/i;
+const COMPLETED_RE = /\b(completed|done|fixed|implemented|merged|shipped|landed|passed|green|resolved|closed|deployed|released|built|integrated)\b/i;
 const UNFINISHED_RE = /\b(todo|follow[- ]?up|needs?|remaining|blocked|blocker|failing|failed|pending|unresolved|changes requested|not done|regression|risk)\b/i;
+// Detects a negation token immediately preceding a completion verb (with optional
+// adverb/auxiliary in between, e.g. "not yet completed", "have not merged").
+// Without this, COMPLETED_RE matches "PR not completed yet" and classifyWork
+// would record observed_completed for the OPPOSITE meaning.
+const NEGATED_COMPLETION_RE = /\b(not|never|no\s+longer|hasn't|haven't|hadn't|isn't|aren't|wasn't|weren't|doesn't|don't|didn't|cannot|can't|won't|wouldn't|shouldn't|couldn't|stopped|aborted|abandoned|cancelled|canceled)\b(?:\s+(?:yet|been|have|has|had|ever|able\s+to|going\s+to|managed\s+to|quite|fully|really|just))*\s+(completed|complete|done|fixed|fix|implemented|implement|merged|merge|shipped|ship|landed|land|passed|pass|resolved|resolve|closed|close|deployed|deploy|released|release|built|build|integrated|integrate)\b/i;
 const DECISION_RE = /\b(decision|decided|agreed|settled|approved|chose)\b/i;
+const NEGATED_DECISION_RE = /\b(not|never|no\s+longer|hasn't|haven't|hadn't|isn't|aren't|wasn't|weren't|doesn't|don't|didn't|cannot|can't|won't|wouldn't|shouldn't|couldn't)\b(?:\s+(?:yet|been|have|has|had|ever))*\s+(decided|agreed|settled|approved|chose)\b/i;
 const AMBIGUOUS_RE = /\b(unclear|ambiguous|maybe|suspect|investigate|verify|question|unknown|possibly)\b/i;
 
 function hashId(prefix: string, value: string): string {
@@ -77,13 +83,22 @@ function truncate(value: string, maxLength: number): string {
 }
 
 function slug(value: string): string {
-  return normalizeSpace(value)
+  const normalized = normalizeSpace(value);
+  if (normalized.length === 0) {
+    return "";
+  }
+  const tokens = normalized
     .toLowerCase()
     .replace(/[^a-z0-9#/\- ]+/g, "")
     .split(/\s+/)
-    .filter((part) => part.length > 2 && !["the", "and", "for", "with", "from", "that"].includes(part))
-    .slice(0, 6)
-    .join("-");
+    .filter((part) => part.length > 2 && !["the", "and", "for", "with", "from", "that"].includes(part));
+  const tokenSlug = tokens.slice(0, 6).join("-");
+  // Suffix a short content hash so two lines that produce the same token-slug
+  // (e.g. "todo it me at" and "todo or no by" both reduce to "todo") still
+  // yield distinct fingerprints. Using a HEX hash keeps fingerprints stable
+  // across runs while preventing the silent overwrite of distinct work items.
+  const contentHash = createHash("sha256").update(normalized.toLowerCase()).digest("hex").slice(0, 8);
+  return tokenSlug.length > 0 ? `${tokenSlug}-${contentHash}` : contentHash;
 }
 
 function topicKeyFor(line: string, kind: ObservedWorkKind): string {
@@ -129,9 +144,14 @@ function classifyKind(line: string, status: ObservedWorkStatus): ObservedWorkKin
 }
 
 function classifyWork(line: string): WorkCandidate | null {
-  const hasCompleted = COMPLETED_RE.test(line);
-  const hasUnfinished = UNFINISHED_RE.test(line);
-  const hasDecision = DECISION_RE.test(line);
+  const negatedCompletion = NEGATED_COMPLETION_RE.test(line);
+  const negatedDecision = NEGATED_DECISION_RE.test(line);
+  // A completion verb preceded by a negator (e.g. "PR not completed yet",
+  // "never shipped") inverts the polarity: the line documents UNFINISHED work,
+  // not completed work. Likewise for decisions.
+  const hasCompleted = COMPLETED_RE.test(line) && !negatedCompletion;
+  const hasUnfinished = UNFINISHED_RE.test(line) || negatedCompletion;
+  const hasDecision = DECISION_RE.test(line) && !negatedDecision;
   const hasAmbiguous = AMBIGUOUS_RE.test(line);
   if (!hasCompleted && !hasUnfinished && !hasDecision && !hasAmbiguous) {
     return null;
@@ -275,7 +295,7 @@ export class ObservedWorkExtractor {
             sourceMessageCount: entry.row.source_message_count,
             sourceTokenCount: entry.row.source_message_token_count || entry.row.token_count,
             fingerprint: entry.fingerprint,
-            fingerprintVersion: 2,
+            fingerprintVersion: 3,
           });
           if (!sourceAlreadyRecorded) {
             this.observedWorkStore.addSource({
