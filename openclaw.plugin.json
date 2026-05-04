@@ -8,12 +8,14 @@
     "tools": [
       "lcm_grep",
       "lcm_describe",
+      "lcm_event_search",
       "lcm_expand",
       "lcm_expand_query",
       "lcm_recent",
       "lcm_rollup_debug",
-      "lcm_work_density",
-      "lcm_event_search"
+      "lcm_task_suggestion_review",
+      "lcm_task_suggestions",
+      "lcm_work_density"
     ]
   },
   "uiHints": {
@@ -227,7 +229,11 @@
     },
     "observedWorkMaintenanceEnabled": {
       "label": "Observed Work Maintenance",
-      "help": "Allow maintain() to run observed-work and event extraction over LCM summaries; disabled by default"
+      "help": "When enabled, maintain() runs observed-work and event extraction over summaries; required to register lcm_work_density and lcm_event_search."
+    },
+    "taskBridgeToolsEnabled": {
+      "label": "Task Bridge Suggestion Tools",
+      "help": "Register opt-in inert LCM task suggestion tools; they write only to the LCM suggestion ledger and never mutate external tasks"
     },
     "proactiveThresholdCompactionMode": {
       "label": "Proactive Threshold Compaction Mode",
@@ -447,6 +453,9 @@
       "rollupMonthlyMaxTokens": {
         "type": "integer",
         "minimum": 1
+      },
+      "taskBridgeToolsEnabled": {
+        "type": "boolean"
       },
       "observedWorkMaintenanceEnabled": {
         "type": "boolean"

@@ -75,6 +75,7 @@ import { EventObservationStore } from "./store/event-observation-store.js";
 import { ObservedWorkStore } from "./store/observed-work-store.js";
 import { RollupStore } from "./store/rollup-store.js";
 import { SummaryStore } from "./store/summary-store.js";
+import { TaskBridgeSuggestionStore } from "./store/task-bridge-suggestion-store.js";
 import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError } from "./summarize.js";
 import type { LcmDependencies } from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
@@ -1874,6 +1875,7 @@ export class LcmContextEngine implements ContextEngine {
   private eventObservationStore: EventObservationStore;
   private observedWorkStore: ObservedWorkStore;
   private observedWorkExtractor: ObservedWorkExtractor;
+  private taskBridgeSuggestionStore: TaskBridgeSuggestionStore;
   private rollupStore: RollupStore;
   private rollupBuilder: RollupBuilder;
   private assembler: ContextAssembler;
@@ -2007,6 +2009,7 @@ export class LcmContextEngine implements ContextEngine {
       this.observedWorkStore,
       this.eventObservationStore,
     );
+    this.taskBridgeSuggestionStore = new TaskBridgeSuggestionStore(this.db);
     this.rollupStore = new RollupStore(this.db);
     this.rollupBuilder = new RollupBuilder(this.rollupStore, {
       timezone: this.timezone,
@@ -8069,6 +8072,10 @@ export class LcmContextEngine implements ContextEngine {
 
   getEventObservationStore(): EventObservationStore {
     return this.eventObservationStore;
+  }
+
+  getTaskBridgeSuggestionStore(): TaskBridgeSuggestionStore {
+    return this.taskBridgeSuggestionStore;
   }
 
   getRollupStore(): RollupStore {

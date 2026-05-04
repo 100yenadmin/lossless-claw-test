@@ -131,6 +131,8 @@ export type LcmConfig = {
   rollupMonthlyMaxTokens: number;
   /** When true, maintain() may run observed-work and event extraction over summaries. */
   observedWorkMaintenanceEnabled: boolean;
+  /** When true, register suggestion-ledger task bridge tools. External task writes remain forbidden. */
+  taskBridgeToolsEnabled: boolean;
   /** Controls whether proactive threshold compaction runs inline or is deferred. */
   proactiveThresholdCompactionMode: ProactiveThresholdCompactionMode;
   /** Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. */
@@ -511,6 +513,10 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_OBSERVED_WORK_MAINTENANCE_ENABLED !== undefined
           ? env.LCM_OBSERVED_WORK_MAINTENANCE_ENABLED === "true"
           : toBool(pc.observedWorkMaintenanceEnabled) ?? false,
+      taskBridgeToolsEnabled:
+        env.LCM_TASK_BRIDGE_TOOLS_ENABLED !== undefined
+          ? env.LCM_TASK_BRIDGE_TOOLS_ENABLED === "true"
+          : toBool(pc.taskBridgeToolsEnabled) ?? false,
       proactiveThresholdCompactionMode,
       maxAssemblyTokenBudget:
         parseFiniteInt(env.LCM_MAX_ASSEMBLY_TOKEN_BUDGET)

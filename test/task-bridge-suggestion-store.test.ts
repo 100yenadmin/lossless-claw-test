@@ -3,6 +3,11 @@ import { DatabaseSync } from "node:sqlite";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { ObservedWorkStore } from "../src/store/observed-work-store.js";
 import { TaskBridgeSuggestionStore } from "../src/store/task-bridge-suggestion-store.js";
+import {
+  createLcmTaskSuggestionReviewTool,
+  createLcmTaskSuggestionsTool,
+} from "../src/tools/lcm-task-suggestions-tool.js";
+import type { LcmDependencies } from "../src/types.js";
 
 function makeDb(): DatabaseSync {
   const db = new DatabaseSync(":memory:");
@@ -43,7 +48,9 @@ function addObservedSources(
 function createObservedWorkItem(
   db: DatabaseSync,
   workItemId: string,
-  sourceIds: string[] = ["sum_default"]
+  sourceIds?: string[],
+  kind: "follow_up" | "blocker" | "question" = "follow_up",
+  observedStatus: "observed_unfinished" | "observed_ambiguous" | "observed_completed" = "observed_unfinished"
 ): void {
   createConversation(db, 1);
   const observedWork = new ObservedWorkStore(db);
@@ -53,12 +60,12 @@ function createObservedWorkItem(
     firstSeenAt: "2026-04-28T00:00:00.000Z",
     lastSeenAt: "2026-04-28T01:00:00.000Z",
     title: `Observed work ${workItemId}`,
-    observedStatus: "observed_unfinished",
-    kind: "follow_up",
+    observedStatus,
+    kind,
     confidence: 0.86,
     fingerprint: `observed:${workItemId}`,
   });
-  addObservedSources(db, workItemId, sourceIds);
+  addObservedSources(db, workItemId, sourceIds ?? [`sum_${workItemId}`]);
 }
 
 describe("TaskBridgeSuggestionStore", () => {
@@ -328,41 +335,330 @@ describe("TaskBridgeSuggestionStore", () => {
     ).toBe(false);
   });
 
-  it("clears task_id when a refresh changes a pending suggestion to a non-task-targeting kind", async () => {
+  it("previews, records, and reviews suggestions without external task writes", async () => {
     const db = makeDb();
-    createObservedWorkItem(db, "work_clear_task_id", ["sum_clear_1"]);
-    const store = new TaskBridgeSuggestionStore(db);
-
-    // First write — task-targeting kind, task_id required.
-    await store.upsertSuggestion({
-      suggestionId: "sug_change_kind",
-      workItemId: "work_clear_task_id",
-      taskId: "task_orig",
-      suggestionKind: "link_task",
-      confidence: 0.8,
-      rationale: "link to task",
-      sourceIds: ["sum_clear_1"],
+    createObservedWorkItem(db, "work_tool");
+    const observedWork = new ObservedWorkStore(db);
+    const taskBridge = new TaskBridgeSuggestionStore(db);
+    const lcm = {
+      getObservedWorkStore: () => observedWork,
+      getTaskBridgeSuggestionStore: () => taskBridge,
+      getConversationStore: () => ({
+        getConversationBySessionKey: async () => null,
+        getConversationBySessionId: async () => null,
+      }),
+    };
+    const deps = {
+      resolveSessionIdFromSessionKey: async () => undefined,
+    } as unknown as LcmDependencies;
+    const suggestionsTool = createLcmTaskSuggestionsTool({
+      deps,
+      lcm: lcm as never,
+      sessionId: "task-suggestion-session",
     });
-    const beforeRows = store.listSuggestions({ workItemId: "work_clear_task_id" });
-    expect(beforeRows[0]?.taskId).toBe("task_orig");
 
-    // Refresh as create_task — must clear task_id, not COALESCE the old value.
-    // Otherwise listSuggestions({ taskId: "task_orig" }) would still surface
-    // this row even though the refreshed kind no longer targets that task.
-    await store.upsertSuggestion({
-      suggestionId: "sug_change_kind",
-      workItemId: "work_clear_task_id",
-      suggestionKind: "create_task",
-      confidence: 0.85,
-      rationale: "now a create-task suggestion",
-      sourceIds: ["sum_clear_1"],
+    const preview = await suggestionsTool.execute("suggest-preview", {
+      conversationId: 1,
     });
-    const afterRows = store.listSuggestions({ workItemId: "work_clear_task_id" });
-    expect(afterRows[0]?.suggestionKind).toBe("create_task");
-    expect(afterRows[0]?.taskId).toBeUndefined();
+    expect(JSON.stringify(preview.details)).toContain("create_task");
+    expect(JSON.stringify(preview.details)).not.toContain("sum_work_tool");
+    expect(taskBridge.listSuggestions()).toHaveLength(0);
 
-    // Listing by the original taskId no longer returns this suggestion.
-    const byOldTask = store.listSuggestions({ taskId: "task_orig" });
-    expect(byOldTask.find((row) => row.suggestionId === "sug_change_kind")).toBeUndefined();
+    const allConversations = await suggestionsTool.execute("suggest-all", {
+      allConversations: true,
+    });
+    expect((allConversations.details as { error?: string }).error).toMatch(
+      /does not support allConversations/,
+    );
+    const invalidSince = await suggestionsTool.execute("suggest-invalid-since", {
+      conversationId: 1,
+      since: "2026-04-28",
+    });
+    expect((invalidSince.details as { error?: string }).error).toMatch(
+      /ISO timestamp with timezone/
+    );
+
+    const recorded = await suggestionsTool.execute("suggest-record", {
+      conversationId: 1,
+      mode: "record",
+      includeSources: true,
+    });
+    expect(JSON.stringify(recorded.details)).toContain("sum_work_tool");
+    const pending = taskBridge.listSuggestions({ status: "pending" });
+    expect(pending).toHaveLength(1);
+    expect(db.prepare(`SELECT name FROM sqlite_master WHERE name = 'tasks'`).get()).toBeUndefined();
+
+    const reviewTool = createLcmTaskSuggestionReviewTool({ lcm: lcm as never });
+    const reviewed = await reviewTool.execute("suggest-review", {
+      suggestionId: pending[0]!.suggestionId,
+      status: "dismissed ",
+      reviewedBy: " unit-test ",
+    });
+    expect((reviewed.details as { changed: boolean }).changed).toBe(true);
+    expect(taskBridge.listSuggestions({ status: "dismissed" })[0]).toMatchObject({
+      status: "dismissed",
+      reviewedBy: "unit-test",
+    });
+
+    const rerecorded = await suggestionsTool.execute("suggest-record-again", {
+      conversationId: 1,
+      mode: "record",
+    });
+    expect(
+      (rerecorded.details as { accounting: { recorded: number } }).accounting
+        .recorded
+    ).toBe(0);
+    expect(
+      (rerecorded.details as { accounting: { preservedReviewed: number } })
+        .accounting.preservedReviewed
+    ).toBe(1);
+  });
+
+  it("records unlinked blocker observations as task-creation suggestions", async () => {
+    const db = makeDb();
+    createObservedWorkItem(db, "work_blocker", ["sum_blocker"], "blocker");
+    const observedWork = new ObservedWorkStore(db);
+    const taskBridge = new TaskBridgeSuggestionStore(db);
+    const lcm = {
+      getObservedWorkStore: () => observedWork,
+      getTaskBridgeSuggestionStore: () => taskBridge,
+      getConversationStore: () => ({
+        getConversationBySessionKey: async () => null,
+        getConversationBySessionId: async () => null,
+      }),
+    };
+    const deps = {
+      resolveSessionIdFromSessionKey: async () => undefined,
+    } as unknown as LcmDependencies;
+    const suggestionsTool = createLcmTaskSuggestionsTool({
+      deps,
+      lcm: lcm as never,
+      sessionId: "task-suggestion-session",
+    });
+
+    const preview = await suggestionsTool.execute("suggest-preview", {
+      conversationId: 1,
+      kinds: ["blocker"],
+    });
+    expect(JSON.stringify(preview.details)).toContain("create_task");
+    expect(JSON.stringify(preview.details)).not.toContain("mark_task_blocked");
+
+    await suggestionsTool.execute("suggest-record", {
+      conversationId: 1,
+      kinds: ["blocker"],
+      mode: "record",
+    });
+    const pending = taskBridge.listSuggestions({ status: "pending" });
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.suggestionKind).toBe("create_task");
+  });
+
+  it("records ambiguous observations as task-creation suggestions until a task is linked", async () => {
+    const db = makeDb();
+    createObservedWorkItem(db, "work_ambiguous", ["sum_ambiguous"], "question", "observed_ambiguous");
+    const observedWork = new ObservedWorkStore(db);
+    const taskBridge = new TaskBridgeSuggestionStore(db);
+    const lcm = {
+      getObservedWorkStore: () => observedWork,
+      getTaskBridgeSuggestionStore: () => taskBridge,
+      getConversationStore: () => ({
+        getConversationBySessionKey: async () => null,
+        getConversationBySessionId: async () => null,
+      }),
+    };
+    const deps = {
+      resolveSessionIdFromSessionKey: async () => undefined,
+    } as unknown as LcmDependencies;
+    const suggestionsTool = createLcmTaskSuggestionsTool({
+      deps,
+      lcm: lcm as never,
+      sessionId: "task-suggestion-session",
+    });
+
+    const preview = await suggestionsTool.execute("suggest-preview", {
+      conversationId: 1,
+      statuses: ["observed_ambiguous"],
+    });
+    expect(JSON.stringify(preview.details)).toContain("create_task");
+    expect(JSON.stringify(preview.details)).not.toContain("add_task_evidence");
+
+    await suggestionsTool.execute("suggest-record", {
+      conversationId: 1,
+      statuses: ["observed_ambiguous"],
+      mode: "record",
+    });
+    const pending = taskBridge.listSuggestions({ status: "pending" });
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.suggestionKind).toBe("create_task");
+  });
+
+  describe("bulkUpsertSuggestions", () => {
+    it("returns [] for an empty input without opening a transaction", async () => {
+      const db = makeDb();
+      const store = new TaskBridgeSuggestionStore(db);
+      // If this opened a tx, a follow-up BEGIN IMMEDIATE would fail with
+      // "cannot start a transaction within a transaction".
+      const results = await store.bulkUpsertSuggestions([]);
+      expect(results).toEqual([]);
+      db.exec("BEGIN IMMEDIATE");
+      db.exec("COMMIT");
+    });
+
+    it("inserts new rows and refreshes existing pending rows in one batch", async () => {
+      const db = makeDb();
+      createObservedWorkItem(db, "work_bulk_a", ["sum_a1", "sum_a2"]);
+      const observedWork = new ObservedWorkStore(db);
+      observedWork.upsertItem({
+        workItemId: "work_bulk_b",
+        conversationId: 1,
+        firstSeenAt: "2026-04-28T00:00:00.000Z",
+        lastSeenAt: "2026-04-28T01:00:00.000Z",
+        title: "Bulk B",
+        observedStatus: "observed_unfinished",
+        kind: "follow_up",
+        confidence: 0.8,
+        fingerprint: "observed:work_bulk_b",
+      });
+      addObservedSources(db, "work_bulk_b", ["sum_b1"]);
+
+      const store = new TaskBridgeSuggestionStore(db);
+      // Pre-seed `sug_a` so it should come back as "refreshed" on the second
+      // pass; `sug_b` is brand new and should come back as "inserted".
+      expect(
+        await store.upsertSuggestion({
+          suggestionId: "sug_a",
+          workItemId: "work_bulk_a",
+          suggestionKind: "create_task",
+          confidence: 0.7,
+          rationale: "Initial insert.",
+          sourceIds: ["sum_a1"],
+        })
+      ).toBe("inserted");
+
+      const results = await store.bulkUpsertSuggestions([
+        {
+          suggestionId: "sug_a",
+          workItemId: "work_bulk_a",
+          suggestionKind: "create_task",
+          confidence: 0.85,
+          rationale: "Refreshed via bulk.",
+          sourceIds: ["sum_a1", "sum_a2"],
+        },
+        {
+          suggestionId: "sug_b",
+          workItemId: "work_bulk_b",
+          suggestionKind: "create_task",
+          confidence: 0.6,
+          rationale: "Brand new via bulk.",
+          sourceIds: ["sum_b1"],
+        },
+      ]);
+      expect(results).toEqual(["refreshed", "inserted"]);
+      const pending = store.listSuggestions({ status: "pending" });
+      expect(pending.map((row) => row.suggestionId).sort()).toEqual([
+        "sug_a",
+        "sug_b",
+      ]);
+    });
+
+    it("preserves the result order and reports preserved_reviewed for reviewed rows", async () => {
+      const db = makeDb();
+      createObservedWorkItem(db, "work_bulk_pres", ["sum_p1", "sum_p2"]);
+      const store = new TaskBridgeSuggestionStore(db);
+      await store.upsertSuggestion({
+        suggestionId: "sug_p1",
+        workItemId: "work_bulk_pres",
+        suggestionKind: "create_task",
+        confidence: 0.7,
+        rationale: "Reviewed already.",
+        sourceIds: ["sum_p1"],
+      });
+      expect(
+        store.reviewSuggestion({
+          suggestionId: "sug_p1",
+          status: "accepted",
+          reviewedBy: "tester",
+        })
+      ).toBe(true);
+
+      const results = await store.bulkUpsertSuggestions([
+        {
+          suggestionId: "sug_p2",
+          workItemId: "work_bulk_pres",
+          suggestionKind: "create_task",
+          confidence: 0.65,
+          rationale: "New row arriving first in the array.",
+          sourceIds: ["sum_p2"],
+        },
+        {
+          suggestionId: "sug_p1",
+          workItemId: "work_bulk_pres",
+          suggestionKind: "create_task",
+          confidence: 0.95,
+          rationale: "Re-scan a reviewed row.",
+          sourceIds: ["sum_p1"],
+        },
+      ]);
+      expect(results).toEqual(["inserted", "preserved_reviewed"]);
+      const accepted = store.listSuggestions({ status: "accepted" });
+      expect(accepted).toHaveLength(1);
+      expect(accepted[0]?.suggestionId).toBe("sug_p1");
+      expect(accepted[0]?.confidence).toBe(0.7);
+    });
+
+    it("demotes a row whose source ID does not belong to its work item to skipped", async () => {
+      const db = makeDb();
+      createObservedWorkItem(db, "work_bulk_ok", ["sum_ok"]);
+      const observedWork = new ObservedWorkStore(db);
+      observedWork.upsertItem({
+        workItemId: "work_bulk_other",
+        conversationId: 1,
+        firstSeenAt: "2026-04-28T00:00:00.000Z",
+        lastSeenAt: "2026-04-28T01:00:00.000Z",
+        title: "Other",
+        observedStatus: "observed_unfinished",
+        kind: "follow_up",
+        confidence: 0.8,
+        fingerprint: "observed:work_bulk_other",
+      });
+      addObservedSources(db, "work_bulk_other", ["sum_other"]);
+      const store = new TaskBridgeSuggestionStore(db);
+      // Middle row has a source ID that exists but does NOT belong to its
+      // declared work item — assertSourceIdsBelongToWorkItem throws inside the
+      // savepoint, which should demote that single row to "skipped" while the
+      // surrounding good rows commit.
+      const results = await store.bulkUpsertSuggestions([
+        {
+          suggestionId: "sug_ok_1",
+          workItemId: "work_bulk_ok",
+          suggestionKind: "create_task",
+          confidence: 0.7,
+          rationale: "Good row 1.",
+          sourceIds: ["sum_ok"],
+        },
+        {
+          suggestionId: "sug_bad",
+          workItemId: "work_bulk_ok",
+          suggestionKind: "create_task",
+          confidence: 0.8,
+          rationale: "Source belongs to a different work item.",
+          sourceIds: ["sum_other"],
+        },
+        {
+          suggestionId: "sug_ok_2",
+          workItemId: "work_bulk_other",
+          suggestionKind: "create_task",
+          confidence: 0.6,
+          rationale: "Good row 2 on a different work item.",
+          sourceIds: ["sum_other"],
+        },
+      ]);
+      expect(results).toEqual(["inserted", "skipped", "inserted"]);
+      const pending = store
+        .listSuggestions({ status: "pending" })
+        .map((row) => row.suggestionId)
+        .sort();
+      expect(pending).toEqual(["sug_ok_1", "sug_ok_2"]);
+    });
   });
 });

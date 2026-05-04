@@ -46,7 +46,8 @@ export type TaskBridgeSuggestion = {
 export type TaskBridgeSuggestionUpsertResult =
   | "inserted"
   | "refreshed"
-  | "preserved_reviewed";
+  | "preserved_reviewed"
+  | "skipped";
 
 type TaskBridgeSuggestionRow = {
   suggestion_id: string;
@@ -127,8 +128,22 @@ function rowToSuggestion(row: TaskBridgeSuggestionRow): TaskBridgeSuggestion {
   };
 }
 
+type ValidatedUpsertArgs = {
+  suggestionId: string;
+  workItemId: string;
+  taskId: string | undefined;
+  suggestionKind: TaskBridgeSuggestionKind;
+  confidence: number;
+  rationale: string;
+  sourceIds: string[];
+  createdBy: string;
+};
+
 export class TaskBridgeSuggestionStore {
   constructor(private readonly db: DatabaseSync) {}
+
+  /** Counter used to make per-row savepoint names unique within a process. */
+  private static savepointId = 0;
 
   private getSuggestionStatus(
     suggestionId: string
@@ -175,9 +190,9 @@ export class TaskBridgeSuggestionStore {
     }
   }
 
-  async upsertSuggestion(
-    input: TaskBridgeSuggestionInput,
-  ): Promise<TaskBridgeSuggestionUpsertResult> {
+  private validateAndNormalizeUpsertInput(
+    input: TaskBridgeSuggestionInput
+  ): ValidatedUpsertArgs {
     const suggestionId = input.suggestionId.trim();
     if (suggestionId.length === 0) {
       throw new Error("suggestionId is required.");
@@ -211,6 +226,22 @@ export class TaskBridgeSuggestionStore {
         `sourceIds must not exceed ${MAX_SUGGESTION_SOURCE_IDS} entries (received ${sourceIds.length}).`
       );
     }
+    return {
+      suggestionId,
+      workItemId,
+      taskId,
+      suggestionKind: input.suggestionKind,
+      confidence: input.confidence,
+      rationale: input.rationale.trim(),
+      sourceIds,
+      createdBy: input.createdBy?.trim() || "lcm_observed",
+    };
+  }
+
+  async upsertSuggestion(
+    input: TaskBridgeSuggestionInput
+  ): Promise<TaskBridgeSuggestionUpsertResult> {
+    const args = this.validateAndNormalizeUpsertInput(input);
     // Wrap the read-then-write (status check + INSERT … ON CONFLICT DO UPDATE)
     // in a single transaction. Without it, two concurrent upserts can both
     // observe `existingStatus === undefined`, both report "inserted", and
@@ -218,67 +249,121 @@ export class TaskBridgeSuggestionStore {
     // so we participate in the per-DB async mutex (issue #260) — a raw
     // BEGIN IMMEDIATE here would throw if a future caller invoked us from
     // inside an enclosing transaction on the same shared DatabaseSync handle.
-    return withDatabaseTransaction(this.db, "BEGIN IMMEDIATE", () => {
-      const existingStatus = this.getSuggestionStatus(suggestionId);
-      if (existingStatus && existingStatus !== "pending") {
-        return "preserved_reviewed" as TaskBridgeSuggestionUpsertResult;
-      }
-      this.assertSourceIdsBelongToWorkItem(workItemId, sourceIds);
-      this.db.prepare(
-        `INSERT INTO lcm_task_bridge_suggestions (
-          suggestion_id, work_item_id, task_id, suggestion_kind, status, confidence,
-          rationale, source_ids, created_by, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-        ON CONFLICT(suggestion_id) DO UPDATE SET
-          work_item_id = CASE
-            WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.work_item_id
-            ELSE lcm_task_bridge_suggestions.work_item_id
-          END,
-          task_id = CASE
-            WHEN lcm_task_bridge_suggestions.status = 'pending'
-              -- Refreshed kind drives task_id: link/mark/add suggestions get
-              -- excluded.task_id (which is required and validated above for
-              -- task-targeting kinds), create_task gets NULL (it intentionally
-              -- targets no task). COALESCE-ing the old value would leave a
-              -- stale task association on a pending row whose kind no longer
-              -- targets that task — listSuggestions({ taskId }) would then
-              -- return suggestions that don't actually concern that task.
-              THEN excluded.task_id
-            ELSE lcm_task_bridge_suggestions.task_id
-          END,
-          suggestion_kind = CASE
-            WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.suggestion_kind
-            ELSE lcm_task_bridge_suggestions.suggestion_kind
-          END,
-          confidence = CASE
-            WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.confidence
-            ELSE lcm_task_bridge_suggestions.confidence
-          END,
-          rationale = CASE
-            WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.rationale
-            ELSE lcm_task_bridge_suggestions.rationale
-          END,
-          source_ids = CASE
-            WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.source_ids
-            ELSE lcm_task_bridge_suggestions.source_ids
-          END,
-          updated_at = CASE
-            WHEN lcm_task_bridge_suggestions.status = 'pending' THEN datetime('now')
-            ELSE lcm_task_bridge_suggestions.updated_at
-          END`,
-      ).run(
-        suggestionId,
-        workItemId,
-        taskId ?? null,
-        input.suggestionKind,
-        "pending",
-        input.confidence,
-        input.rationale.trim(),
-        JSON.stringify(sourceIds),
-        input.createdBy?.trim() || "lcm_observed",
-      );
-      return existingStatus === "pending" ? "refreshed" : "inserted";
-    });
+    return withDatabaseTransaction(this.db, "BEGIN IMMEDIATE", () =>
+      this.upsertSuggestionInTransaction(args)
+    );
+  }
+
+  /**
+   * Upsert many suggestions inside a single SQLite transaction.
+   *
+   * Each individual upsert still preserves the same CASE-WHEN guards as
+   * `upsertSuggestion`, but the whole batch commits with one fsync, which is a
+   * dramatic speed-up when callers (e.g. the LCM task suggestion tool's
+   * `record` mode) push 50 candidates at once.
+   *
+   * Per-row failure semantics: input validation errors (bad confidence, blank
+   * IDs, requested non-pending status, missing taskId for targeted kinds, no
+   * source IDs, or sourceIds beyond MAX_SUGGESTION_SOURCE_IDS) still throw
+   * before the transaction opens — the whole batch aborts with no fsync. Once
+   * inside the transaction, per-row INSERT/UPSERT errors (e.g. a concurrent
+   * FK-deletion of the work item or its source evidence) are demoted to a
+   * "skipped" outcome via SQLite SAVEPOINTs around each row, so a single bad
+   * row does not poison the rest of the batch. The result array is
+   * order-preserving: `results[i]` corresponds to `inputs[i]`.
+   */
+  async bulkUpsertSuggestions(
+    inputs: TaskBridgeSuggestionInput[]
+  ): Promise<TaskBridgeSuggestionUpsertResult[]> {
+    if (inputs.length === 0) {
+      // Skip transaction entirely when there's nothing to do.
+      return [];
+    }
+    const prepared = inputs.map((input) =>
+      this.validateAndNormalizeUpsertInput(input)
+    );
+    return withDatabaseTransaction(this.db, "BEGIN IMMEDIATE", () =>
+      prepared.map((args) => {
+        const savepointName = `lcm_task_bridge_row_sp_${++TaskBridgeSuggestionStore.savepointId}`;
+        this.db.exec(`SAVEPOINT ${savepointName}`);
+        try {
+          const result = this.upsertSuggestionInTransaction(args);
+          this.db.exec(`RELEASE SAVEPOINT ${savepointName}`);
+          return result;
+        } catch {
+          // Demote to "skipped" instead of poisoning the whole batch. Common
+          // causes: concurrent FK-deletion of the work item or its observed
+          // source evidence between candidate scan and INSERT.
+          this.db.exec(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+          this.db.exec(`RELEASE SAVEPOINT ${savepointName}`);
+          return "skipped" as TaskBridgeSuggestionUpsertResult;
+        }
+      })
+    );
+  }
+
+  private upsertSuggestionInTransaction(
+    args: ValidatedUpsertArgs
+  ): TaskBridgeSuggestionUpsertResult {
+    const existingStatus = this.getSuggestionStatus(args.suggestionId);
+    if (existingStatus && existingStatus !== "pending") {
+      return "preserved_reviewed";
+    }
+    this.assertSourceIdsBelongToWorkItem(args.workItemId, args.sourceIds);
+    this.db.prepare(
+      `INSERT INTO lcm_task_bridge_suggestions (
+        suggestion_id, work_item_id, task_id, suggestion_kind, status, confidence,
+        rationale, source_ids, created_by, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      ON CONFLICT(suggestion_id) DO UPDATE SET
+        work_item_id = CASE
+          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.work_item_id
+          ELSE lcm_task_bridge_suggestions.work_item_id
+        END,
+        task_id = CASE
+          WHEN lcm_task_bridge_suggestions.status = 'pending'
+            -- Refreshed kind drives task_id: link/mark/add suggestions get
+            -- excluded.task_id (which is required and validated above for
+            -- task-targeting kinds), create_task gets NULL (it intentionally
+            -- targets no task). COALESCE-ing the old value would leave a
+            -- stale task association on a pending row whose kind no longer
+            -- targets that task — listSuggestions({ taskId }) would then
+            -- return suggestions that don't actually concern that task.
+            THEN excluded.task_id
+          ELSE lcm_task_bridge_suggestions.task_id
+        END,
+        suggestion_kind = CASE
+          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.suggestion_kind
+          ELSE lcm_task_bridge_suggestions.suggestion_kind
+        END,
+        confidence = CASE
+          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.confidence
+          ELSE lcm_task_bridge_suggestions.confidence
+        END,
+        rationale = CASE
+          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.rationale
+          ELSE lcm_task_bridge_suggestions.rationale
+        END,
+        source_ids = CASE
+          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.source_ids
+          ELSE lcm_task_bridge_suggestions.source_ids
+        END,
+        updated_at = CASE
+          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN datetime('now')
+          ELSE lcm_task_bridge_suggestions.updated_at
+        END`,
+    ).run(
+      args.suggestionId,
+      args.workItemId,
+      args.taskId ?? null,
+      args.suggestionKind,
+      "pending",
+      args.confidence,
+      args.rationale,
+      JSON.stringify(args.sourceIds),
+      args.createdBy,
+    );
+    return existingStatus === "pending" ? "refreshed" : "inserted";
   }
 
   listSuggestions(input?: {
@@ -333,6 +418,10 @@ export class TaskBridgeSuggestionStore {
     if (!REVIEW_STATUSES.has(input.status)) {
       throw new Error("review status must be accepted, rejected, dismissed, or expired.");
     }
+    const suggestionId = input.suggestionId?.trim();
+    if (!suggestionId) {
+      throw new Error("suggestionId is required.");
+    }
     const reviewedBy = input.reviewedBy?.trim() || null;
     const result = this.db.prepare(
       `UPDATE lcm_task_bridge_suggestions
@@ -341,7 +430,30 @@ export class TaskBridgeSuggestionStore {
            reviewed_at = datetime('now'),
            updated_at = datetime('now')
        WHERE suggestion_id = ? AND status = 'pending'`,
-    ).run(input.status, reviewedBy, input.suggestionId);
+    ).run(input.status, reviewedBy, suggestionId);
     return result.changes > 0;
+  }
+
+  /**
+   * Returns the observed-work conversation_id for the given suggestion (joined
+   * via work_item_id), or undefined if the suggestion does not exist or its
+   * underlying observed-work item has been deleted. Used by the review tool to
+   * gate cross-conversation review updates.
+   */
+  getSuggestionConversationId(suggestionId: string): number | undefined {
+    const trimmed = suggestionId?.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    const row = this.db
+      .prepare(
+        `SELECT owi.conversation_id AS conversation_id
+         FROM lcm_task_bridge_suggestions AS s
+         JOIN lcm_observed_work_items AS owi
+           ON owi.work_item_id = s.work_item_id
+         WHERE s.suggestion_id = ?`
+      )
+      .get(trimmed) as { conversation_id: number } | undefined;
+    return row?.conversation_id;
   }
 }
