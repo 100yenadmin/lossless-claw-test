@@ -50,6 +50,7 @@ import {
   DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO,
   describeLcmConfigSource,
 } from "./db/config.js";
+import { ObservedWorkExtractor } from "./observed-work-extractor.js";
 import { RetrievalEngine } from "./retrieval.js";
 import { RollupBuilder } from "./rollup-builder.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
@@ -70,6 +71,7 @@ import {
   type MessagePartRecord,
   type MessagePartType,
 } from "./store/conversation-store.js";
+import { EventObservationStore } from "./store/event-observation-store.js";
 import { ObservedWorkStore } from "./store/observed-work-store.js";
 import { RollupStore } from "./store/rollup-store.js";
 import { SummaryStore } from "./store/summary-store.js";
@@ -1826,7 +1828,6 @@ function messageContentCoveredBySummary(params: {
   return false;
 }
 
-
 const MAX_ROLLUP_MAINTENANCE_DAYS_BACK = 30;
 
 function computeRollupMaintenanceDaysBack(
@@ -1871,7 +1872,9 @@ export class LcmContextEngine implements ContextEngine {
   private summaryStore: SummaryStore;
   private compactionTelemetryStore: CompactionTelemetryStore;
   private compactionMaintenanceStore: CompactionMaintenanceStore;
+  private eventObservationStore: EventObservationStore;
   private observedWorkStore: ObservedWorkStore;
+  private observedWorkExtractor: ObservedWorkExtractor;
   private taskBridgeSuggestionStore: TaskBridgeSuggestionStore;
   private rollupStore: RollupStore;
   private rollupBuilder: RollupBuilder;
@@ -1999,7 +2002,13 @@ export class LcmContextEngine implements ContextEngine {
     this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
     this.compactionTelemetryStore = new CompactionTelemetryStore(this.db);
     this.compactionMaintenanceStore = new CompactionMaintenanceStore(this.db);
+    this.eventObservationStore = new EventObservationStore(this.db);
     this.observedWorkStore = new ObservedWorkStore(this.db);
+    this.observedWorkExtractor = new ObservedWorkExtractor(
+      this.db,
+      this.observedWorkStore,
+      this.eventObservationStore,
+    );
     this.taskBridgeSuggestionStore = new TaskBridgeSuggestionStore(this.db);
     this.rollupStore = new RollupStore(this.db);
     this.rollupBuilder = new RollupBuilder(this.rollupStore, {
@@ -6006,6 +6015,45 @@ export class LcmContextEngine implements ContextEngine {
             );
             markRollupRebuildPending("rollup-build-failed");
           }
+          if (this.config.observedWorkMaintenanceEnabled) {
+            try {
+              const observedResult = await this.observedWorkExtractor.processConversation(
+                conversation.conversationId,
+                { limit: 500 },
+              );
+              if (
+                observedResult.summariesScanned > 0 ||
+                observedResult.workItemsUpserted > 0 ||
+                observedResult.eventsUpserted > 0
+              ) {
+                this.deps.log.info(
+                  `[lcm] maintain: observed-work extraction conversation=${conversation.conversationId} ${sessionLabel} summariesScanned=${observedResult.summariesScanned} workItemsUpserted=${observedResult.workItemsUpserted} eventsUpserted=${observedResult.eventsUpserted}`,
+                );
+              }
+            } catch (error) {
+              this.deps.log.warn(
+                `[lcm] maintain: observed-work extraction failed conversation=${conversation.conversationId} ${sessionLabel}: ${describeLogError(error)}`,
+              );
+              try {
+                // Mark rebuild pending AND null the cursor so the next maintain()
+                // pass restarts from the beginning. `pendingRebuild` alone is
+                // write-only — the extractor's listUnprocessedLeafSummaries()
+                // only consults the (createdAt,id,rowid) cursor, so leaving the
+                // cursor in place would cause crashed batches to be silently
+                // skipped on the next pass. Nulling all three cursor fields
+                // forces a cursorless rescan from the conversation's first leaf.
+                this.observedWorkStore.upsertState({
+                  conversationId: conversation.conversationId,
+                  pendingRebuild: true,
+                });
+                this.observedWorkStore.clearProcessingCursor(conversation.conversationId);
+              } catch (stateError) {
+                this.deps.log.warn(
+                  `[lcm] maintain: failed to preserve observed-work pending state conversation=${conversation.conversationId} ${sessionLabel}: ${describeLogError(stateError)}`,
+                );
+              }
+            }
+          }
           return result;
         };
         const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
@@ -8022,10 +8070,13 @@ export class LcmContextEngine implements ContextEngine {
     return this.observedWorkStore;
   }
 
+  getEventObservationStore(): EventObservationStore {
+    return this.eventObservationStore;
+  }
+
   getTaskBridgeSuggestionStore(): TaskBridgeSuggestionStore {
     return this.taskBridgeSuggestionStore;
   }
-
 
   getRollupStore(): RollupStore {
     return this.rollupStore;

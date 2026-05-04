@@ -129,6 +129,8 @@ export type LcmConfig = {
   rollupWeeklyMaxTokens: number;
   /** Maximum tokens for monthly rollup content. Default 560000 (≈4 weeks × 140K). */
   rollupMonthlyMaxTokens: number;
+  /** When true, maintain() may run observed-work and event extraction over summaries. */
+  observedWorkMaintenanceEnabled: boolean;
   /** When true, register suggestion-ledger task bridge tools. External task writes remain forbidden. */
   taskBridgeToolsEnabled: boolean;
   /** Controls whether proactive threshold compaction runs inline or is deferred. */
@@ -507,6 +509,10 @@ export function resolveLcmConfigWithDiagnostics(
       rollupMonthlyMaxTokens:
         parseFinitePositiveInt(env.LCM_ROLLUP_MONTHLY_MAX_TOKENS)
           ?? toPositiveNumber(pc.rollupMonthlyMaxTokens) ?? 560000,
+      observedWorkMaintenanceEnabled:
+        env.LCM_OBSERVED_WORK_MAINTENANCE_ENABLED !== undefined
+          ? env.LCM_OBSERVED_WORK_MAINTENANCE_ENABLED === "true"
+          : toBool(pc.observedWorkMaintenanceEnabled) ?? false,
       taskBridgeToolsEnabled:
         env.LCM_TASK_BRIDGE_TOOLS_ENABLED !== undefined
           ? env.LCM_TASK_BRIDGE_TOOLS_ENABLED === "true"

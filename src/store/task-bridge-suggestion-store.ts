@@ -1,4 +1,4 @@
-import type { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import { withDatabaseTransaction } from "../transaction-mutex.js";
 
 export type TaskBridgeSuggestionKind =
@@ -79,6 +79,9 @@ const TASK_TARGETING_KINDS = new Set<TaskBridgeSuggestionKind>([
   "add_task_evidence",
 ]);
 
+const MAX_SUGGESTION_SOURCE_IDS = 50;
+const SQLITE_BIND_CHUNK_SIZE = 500;
+
 function normalizeSourceIds(sourceIds: string[]): string[] {
   return [
     ...new Set(
@@ -87,6 +90,17 @@ function normalizeSourceIds(sourceIds: string[]): string[] {
         .filter((sourceId) => sourceId.length > 0)
     ),
   ];
+}
+
+function chunk<T>(values: T[], size: number): T[][] {
+  if (size <= 0 || values.length <= size) {
+    return values.length === 0 ? [] : [values];
+  }
+  const chunks: T[][] = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
 }
 
 function rowToSuggestion(row: TaskBridgeSuggestionRow): TaskBridgeSuggestion {
@@ -114,8 +128,22 @@ function rowToSuggestion(row: TaskBridgeSuggestionRow): TaskBridgeSuggestion {
   };
 }
 
+type ValidatedUpsertArgs = {
+  suggestionId: string;
+  workItemId: string;
+  taskId: string | undefined;
+  suggestionKind: TaskBridgeSuggestionKind;
+  confidence: number;
+  rationale: string;
+  sourceIds: string[];
+  createdBy: string;
+};
+
 export class TaskBridgeSuggestionStore {
   constructor(private readonly db: DatabaseSync) {}
+
+  /** Counter used to make per-row savepoint names unique within a process. */
+  private static savepointId = 0;
 
   private getSuggestionStatus(
     suggestionId: string
@@ -134,16 +162,26 @@ export class TaskBridgeSuggestionStore {
     workItemId: string,
     sourceIds: string[]
   ): void {
-    const placeholders = sourceIds.map(() => "?").join(", ");
-    const rows = this.db
-      .prepare(
-        `SELECT DISTINCT source_id
-         FROM lcm_observed_work_sources
-         WHERE work_item_id = ?
-           AND source_id IN (${placeholders})`
-      )
-      .all(workItemId, ...sourceIds) as Array<{ source_id: string }>;
-    const found = new Set(rows.map((row) => row.source_id));
+    if (sourceIds.length === 0) {
+      return;
+    }
+    // Chunk the IN(...) lookup so dense evidence sets can't exceed the
+    // SQLite bind-variable limit (mirrors ObservedWorkExtractor.loadExistingItems).
+    const found = new Set<string>();
+    for (const batch of chunk(sourceIds, SQLITE_BIND_CHUNK_SIZE)) {
+      const placeholders = batch.map(() => "?").join(", ");
+      const rows = this.db
+        .prepare(
+          `SELECT DISTINCT source_id
+           FROM lcm_observed_work_sources
+           WHERE work_item_id = ?
+             AND source_id IN (${placeholders})`
+        )
+        .all(workItemId, ...batch) as Array<{ source_id: string }>;
+      for (const row of rows) {
+        found.add(row.source_id);
+      }
+    }
     const missing = sourceIds.filter((sourceId) => !found.has(sourceId));
     if (missing.length > 0) {
       throw new Error(
@@ -152,25 +190,9 @@ export class TaskBridgeSuggestionStore {
     }
   }
 
-  async upsertSuggestion(
+  private validateAndNormalizeUpsertInput(
     input: TaskBridgeSuggestionInput
-  ): Promise<TaskBridgeSuggestionUpsertResult> {
-    const args = this.validateAndNormalizeUpsertInput(input);
-    return withDatabaseTransaction(this.db, "BEGIN IMMEDIATE", () =>
-      this.upsertSuggestionInTransaction(args)
-    );
-  }
-
-  private validateAndNormalizeUpsertInput(input: TaskBridgeSuggestionInput): {
-    suggestionId: string;
-    workItemId: string;
-    taskId: string | undefined;
-    suggestionKind: TaskBridgeSuggestionKind;
-    confidence: number;
-    rationale: string;
-    sourceIds: string[];
-    createdBy: string;
-  } {
+  ): ValidatedUpsertArgs {
     const suggestionId = input.suggestionId.trim();
     if (suggestionId.length === 0) {
       throw new Error("suggestionId is required.");
@@ -199,6 +221,11 @@ export class TaskBridgeSuggestionStore {
     if (sourceIds.length === 0) {
       throw new Error("at least one source ID is required.");
     }
+    if (sourceIds.length > MAX_SUGGESTION_SOURCE_IDS) {
+      throw new Error(
+        `sourceIds must not exceed ${MAX_SUGGESTION_SOURCE_IDS} entries (received ${sourceIds.length}).`
+      );
+    }
     return {
       suggestionId,
       workItemId,
@@ -211,6 +238,22 @@ export class TaskBridgeSuggestionStore {
     };
   }
 
+  async upsertSuggestion(
+    input: TaskBridgeSuggestionInput
+  ): Promise<TaskBridgeSuggestionUpsertResult> {
+    const args = this.validateAndNormalizeUpsertInput(input);
+    // Wrap the read-then-write (status check + INSERT … ON CONFLICT DO UPDATE)
+    // in a single transaction. Without it, two concurrent upserts can both
+    // observe `existingStatus === undefined`, both report "inserted", and
+    // race on the conflict resolution. Route through `withDatabaseTransaction`
+    // so we participate in the per-DB async mutex (issue #260) — a raw
+    // BEGIN IMMEDIATE here would throw if a future caller invoked us from
+    // inside an enclosing transaction on the same shared DatabaseSync handle.
+    return withDatabaseTransaction(this.db, "BEGIN IMMEDIATE", () =>
+      this.upsertSuggestionInTransaction(args)
+    );
+  }
+
   /**
    * Upsert many suggestions inside a single SQLite transaction.
    *
@@ -221,12 +264,13 @@ export class TaskBridgeSuggestionStore {
    *
    * Per-row failure semantics: input validation errors (bad confidence, blank
    * IDs, requested non-pending status, missing taskId for targeted kinds, no
-   * source IDs) still throw before the transaction opens — the whole batch
-   * aborts with no fsync. Once inside the transaction, per-row INSERT/UPSERT
-   * errors (e.g. a concurrent FK-deletion of the work item or its source
-   * evidence) are demoted to a "skipped" outcome via SQLite SAVEPOINTs around
-   * each row, so a single bad row does not poison the rest of the batch. The
-   * result array is order-preserving: `results[i]` corresponds to `inputs[i]`.
+   * source IDs, or sourceIds beyond MAX_SUGGESTION_SOURCE_IDS) still throw
+   * before the transaction opens — the whole batch aborts with no fsync. Once
+   * inside the transaction, per-row INSERT/UPSERT errors (e.g. a concurrent
+   * FK-deletion of the work item or its source evidence) are demoted to a
+   * "skipped" outcome via SQLite SAVEPOINTs around each row, so a single bad
+   * row does not poison the rest of the batch. The result array is
+   * order-preserving: `results[i]` corresponds to `inputs[i]`.
    */
   async bulkUpsertSuggestions(
     inputs: TaskBridgeSuggestionInput[]
@@ -258,16 +302,9 @@ export class TaskBridgeSuggestionStore {
     );
   }
 
-  private upsertSuggestionInTransaction(args: {
-    suggestionId: string;
-    workItemId: string;
-    taskId: string | undefined;
-    suggestionKind: TaskBridgeSuggestionKind;
-    confidence: number;
-    rationale: string;
-    sourceIds: string[];
-    createdBy: string;
-  }): TaskBridgeSuggestionUpsertResult {
+  private upsertSuggestionInTransaction(
+    args: ValidatedUpsertArgs
+  ): TaskBridgeSuggestionUpsertResult {
     const existingStatus = this.getSuggestionStatus(args.suggestionId);
     if (existingStatus && existingStatus !== "pending") {
       return "preserved_reviewed";
@@ -285,7 +322,14 @@ export class TaskBridgeSuggestionStore {
         END,
         task_id = CASE
           WHEN lcm_task_bridge_suggestions.status = 'pending'
-            THEN COALESCE(excluded.task_id, lcm_task_bridge_suggestions.task_id)
+            -- Refreshed kind drives task_id: link/mark/add suggestions get
+            -- excluded.task_id (which is required and validated above for
+            -- task-targeting kinds), create_task gets NULL (it intentionally
+            -- targets no task). COALESCE-ing the old value would leave a
+            -- stale task association on a pending row whose kind no longer
+            -- targets that task — listSuggestions({ taskId }) would then
+            -- return suggestions that don't actually concern that task.
+            THEN excluded.task_id
           ELSE lcm_task_bridge_suggestions.task_id
         END,
         suggestion_kind = CASE
@@ -322,9 +366,6 @@ export class TaskBridgeSuggestionStore {
     return existingStatus === "pending" ? "refreshed" : "inserted";
   }
 
-  /** Counter used to make per-row savepoint names unique within a process. */
-  private static savepointId = 0;
-
   listSuggestions(input?: {
     status?: TaskBridgeSuggestionStatus;
     suggestionKind?: TaskBridgeSuggestionKind;
@@ -333,7 +374,7 @@ export class TaskBridgeSuggestionStore {
     limit?: number;
   }): TaskBridgeSuggestion[] {
     const where: string[] = [];
-    const args: unknown[] = [];
+    const args: SQLInputValue[] = [];
     if (input?.status) {
       where.push("status = ?");
       args.push(input.status);
@@ -352,13 +393,18 @@ export class TaskBridgeSuggestionStore {
     }
     const limit = Math.max(1, Math.min(input?.limit ?? 20, 100));
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    // SQLite `datetime('now')` is whole-second precision, so suggestions
+    // refreshed in the same scan tick share `updated_at` and `created_at`.
+    // Without a deterministic tiebreaker their relative order in the result
+    // depends on storage layout — append `suggestion_id ASC` so the ordering
+    // is stable and tests can rely on it.
     const rows = this.db.prepare(
       `SELECT suggestion_id, work_item_id, task_id, suggestion_kind, status,
               confidence, rationale, source_ids, created_by, reviewed_by, reviewed_at,
               created_at, updated_at
        FROM lcm_task_bridge_suggestions
        ${whereSql}
-       ORDER BY updated_at DESC, created_at DESC
+       ORDER BY updated_at DESC, created_at DESC, suggestion_id ASC
        LIMIT ?`,
     ).all(...args, limit) as TaskBridgeSuggestionRow[];
     return rows.map(rowToSuggestion);

@@ -8,6 +8,7 @@
     "tools": [
       "lcm_grep",
       "lcm_describe",
+      "lcm_event_search",
       "lcm_expand",
       "lcm_expand_query",
       "lcm_recent",
@@ -225,6 +226,10 @@
     "rollupMonthlyMaxTokens": {
       "label": "Rollup Monthly Max Tokens",
       "help": "Maximum tokens for monthly rollup content. Default 560000 (≈4 weeks × 140K)."
+    },
+    "observedWorkMaintenanceEnabled": {
+      "label": "Observed Work Maintenance",
+      "help": "When enabled, maintain() runs observed-work and event extraction over summaries; required to register lcm_work_density and lcm_event_search."
     },
     "taskBridgeToolsEnabled": {
       "label": "Task Bridge Suggestion Tools",
@@ -450,6 +455,9 @@
         "minimum": 1
       },
       "taskBridgeToolsEnabled": {
+        "type": "boolean"
+      },
+      "observedWorkMaintenanceEnabled": {
         "type": "boolean"
       },
       "proactiveThresholdCompactionMode": {

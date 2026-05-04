@@ -1286,10 +1286,20 @@ export function runLcmMigrations(
           conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
           last_processed_summary_created_at TEXT,
           last_processed_summary_id TEXT,
+          last_processed_summary_rowid INTEGER,
           pending_rebuild INTEGER NOT NULL DEFAULT 0,
           updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
       `);
+    });
+
+    runMigrationStep("ensureObservedWorkStateCursorColumns", log, () => {
+      addColumnIfMissing(
+        db,
+        "lcm_observed_work_state",
+        "last_processed_summary_rowid",
+        "INTEGER",
+      );
     });
 
     runMigrationStep("ensureObservedWorkIndexes", log, () => {
@@ -1353,6 +1363,49 @@ export function runLcmMigrations(
 
         CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_task_idx
           ON lcm_task_bridge_suggestions(task_id, status);
+      `);
+    });
+
+    runMigrationStep("ensureEventObservationTables", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_event_observations (
+          event_id TEXT PRIMARY KEY,
+          conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+          event_kind TEXT NOT NULL CHECK (event_kind IN (
+            'primary',
+            'retelling',
+            'memory_injection',
+            'echo',
+            'imported',
+            'operational_incident',
+            'decision'
+          )),
+          title TEXT NOT NULL,
+          description TEXT,
+          query_key TEXT,
+          event_time TEXT,
+          ingest_time TEXT NOT NULL,
+          confidence REAL NOT NULL DEFAULT 0.5 CHECK (confidence >= 0 AND confidence <= 1),
+          rationale TEXT NOT NULL,
+          source_type TEXT NOT NULL CHECK (source_type IN ('summary', 'rollup', 'message')),
+          source_id TEXT NOT NULL,
+          source_ids TEXT NOT NULL DEFAULT '[]',
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+    });
+
+    runMigrationStep("ensureEventObservationIndexes", log, () => {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_event_observations_conversation_kind_time_idx
+          ON lcm_event_observations(conversation_id, event_kind, event_time DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_event_observations_query_time_idx
+          ON lcm_event_observations(query_key, event_time DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_event_observations_source_idx
+          ON lcm_event_observations(source_type, source_id);
       `);
     });
 
