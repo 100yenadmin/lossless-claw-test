@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, statSync } from "node:fs";
-import { mkdir, open, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, rename, stat, writeFile } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { join, resolve as resolvePath } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -8050,13 +8050,20 @@ export class LcmContextEngine implements ContextEngine {
       return;
     }
 
+    // MAJOR-4: narrow the union before accessing `backupPath`. The
+    // `backup_failed` variant has no `backupPath`, so this access is unsafe
+    // without checking the kind first.
+    const backupPath =
+      result.kind === "rotate_failed" || result.kind === "unavailable"
+        ? result.backupPath
+        : undefined;
     this.logAutoRotateSessionFileDecision({
       ...baseLog,
       action: "warn",
       conversationId: result.currentConversationId ?? conversation.conversationId,
       sizeBytes,
       durationMs: Date.now() - startedAt,
-      backupPath: result.backupPath,
+      backupPath,
       currentMessageCount: result.currentMessageCount,
       reason: result.kind,
       error: result.reason,
@@ -8603,7 +8610,23 @@ export class LcmContextEngine implements ContextEngine {
       JSON.stringify(header),
       ...linearizedEntries.map((entry) => JSON.stringify(entry)),
     ].join("\n") + "\n";
-    await writeFile(params.sessionFile, serialized, "utf8");
+    // MAJOR-1: atomic rewrite. Write to a temp file then rename so a crash
+    // mid-write or ENOSPC cannot truncate / corrupt the live transcript. The
+    // SQLite-level backup at higher layers does NOT cover the rotated JSONL,
+    // so the live file is the only copy of those entries until the next
+    // checkpoint. On rename failure the .tmp is left behind for manual
+    // recovery and the error is rethrown.
+    const tempPath = `${params.sessionFile}.tmp.${process.pid}.${Date.now()}`;
+    await writeFile(tempPath, serialized, "utf8");
+    try {
+      await rename(tempPath, params.sessionFile);
+    } catch (err) {
+      this.deps.log.warn(
+        `[lcm] auto-rotate atomic rename failed for ${params.sessionFile}: ` +
+          `${describeLogError(err)} - recovery file at ${tempPath}`,
+      );
+      throw err;
+    }
     this.clearStableOrphanStrippingOrdinal(params.conversationId);
 
     const rewrittenStats = await stat(params.sessionFile);

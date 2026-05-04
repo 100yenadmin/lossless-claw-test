@@ -2571,7 +2571,22 @@ const lcmPlugin = {
       return error instanceof Error ? error : new Error(String(error));
     }
 
-    /** Start the non-blocking startup scan for oversized LCM-managed transcripts. */
+    /**
+     * Start the non-blocking startup scan for oversized LCM-managed transcripts.
+     *
+     * NOTE (MAJOR-3 audit): this is fire-and-forget and runs concurrently with
+     * any host writes to the same transcripts. Two mitigations make that safe:
+     *  1. The rewrite path in `engine.ts` (see `LcmContextEngine`'s rotate
+     *     helpers) writes to a `${sessionFile}.tmp.<pid>.<ts>` file and
+     *     atomically renames it into place (MAJOR-1). This prevents a
+     *     concurrent host append from observing a half-written transcript.
+     *  2. The rotate path takes a SQLite-level backup before rewriting, so
+     *     a torn read by the host (between rename and the next checkpoint)
+     *     can be reconstructed from the DB on next startup.
+     *
+     * If you ever change the rewrite path away from atomic-rename, revisit
+     * this scheduler — clobber risk returns immediately.
+     */
     function scheduleStartupAutoRotate(nextEngine: LcmContextEngine): void {
       void nextEngine.autoRotateManagedSessionFilesAtStartup().catch((error) => {
         deps.log.warn(

@@ -11338,6 +11338,92 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     );
   });
 
+  // MAJOR-2 (Round-1 audit regression): when reconcile throws, the
+  // fail-closed precondition (`reconcileSucceeded === true`) no longer holds,
+  // so dedup falls back to ingest-on-no-overlap rather than silently skipping
+  // the whole batch. This guards against silent history loss on reconcile
+  // failure.
+  it("ingests oversized no-overlap batch when reconcile fails (fallback path)", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: vi.fn(),
+        warn: warnLog,
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
+    const sessionId = "dedup-oversized-no-overlap-reconcile-failed";
+
+    // Seed prior history.
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-no-overlap-reconcile-failed-1"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "assistant", content: "old B" }),
+        makeMessage({ role: "tool", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    // Force the next afterTurn's reconcile to throw. Cast through `unknown`
+    // because `reconcileTranscriptTailForAfterTurn` is private; the test is
+    // explicitly probing the failure-mode contract documented in the
+    // afterTurn try/catch around the reconcile call.
+    const reconcileError = new Error("simulated reconcile failure");
+    const engineForPatch = engine as unknown as {
+      reconcileTranscriptTailForAfterTurn: (...args: unknown[]) => Promise<void>;
+    };
+    const originalReconcile =
+      engineForPatch.reconcileTranscriptTailForAfterTurn.bind(engine);
+    engineForPatch.reconcileTranscriptTailForAfterTurn = async () => {
+      throw reconcileError;
+    };
+
+    try {
+      await engine.afterTurn({
+        sessionId,
+        sessionFile: createSessionFilePath("dedup-no-overlap-reconcile-failed-2"),
+        messages: [
+          makeMessage({ role: "user", content: "unanchored user" }),
+          makeMessage({ role: "assistant", content: "unanchored assistant" }),
+        ],
+        prePromptMessageCount: 0,
+        tokenBudget: 4096,
+      });
+    } finally {
+      engineForPatch.reconcileTranscriptTailForAfterTurn = originalReconcile;
+    }
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    const stored = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+
+    // Critical assertion: the new turn IS ingested when reconcile failed.
+    // Compare with the sibling fail-closed test (above) where reconcile
+    // succeeds and the no-overlap batch is correctly skipped.
+    expect(stored.map((m) => m.content)).toContain("unanchored user");
+    expect(stored.map((m) => m.content)).toContain("unanchored assistant");
+
+    // The reconcile failure must have been logged.
+    const reconcileWarnings = warnLog.mock.calls.filter((call) =>
+      typeof call[0] === "string" && call[0].includes("transcript reconcile failed"),
+    );
+    expect(reconcileWarnings.length).toBeGreaterThan(0);
+
+    // And the fail-closed log line must NOT have been emitted, since dedup
+    // took the ingest fallback path instead of skipping.
+    const failClosedCalls = warnLog.mock.calls.filter((call) =>
+      typeof call[0] === "string" && call[0].includes("fail-closed skipping full batch"),
+    );
+    expect(failClosedCalls).toEqual([]);
+  });
+
   it("preserves a legitimate repeated first new message", async () => {
     const engine = createEngine();
     const sessionId = "dedup-repeated-first-new-message";
