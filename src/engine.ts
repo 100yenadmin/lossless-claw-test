@@ -8616,8 +8616,27 @@ export class LcmContextEngine implements ContextEngine {
     // so the live file is the only copy of those entries until the next
     // checkpoint. On rename failure the .tmp is left behind for manual
     // recovery and the error is rethrown.
-    const tempPath = `${params.sessionFile}.tmp.${process.pid}.${Date.now()}`;
-    await writeFile(tempPath, serialized, "utf8");
+    // Round-2 audit: include randomUUID() segment so two near-simultaneous
+    // rotates (startup-scan + afterTurn within the same ms for the same conv)
+    // cannot collide on tempPath. Round-1 added pid+Date.now() but the
+    // DB-level lock guards rows, not JSONL paths.
+    const tempPath = `${params.sessionFile}.tmp.${process.pid}.${Date.now()}.${randomUUID().slice(0, 8)}`;
+    try {
+      await writeFile(tempPath, serialized, "utf8");
+    } catch (err) {
+      // Round-2 audit: if writeFile fails partway through (ENOSPC, EIO, quota)
+      // a partial .tmp could persist forever. Try to clean it up; if cleanup
+      // itself fails (e.g. file never existed), swallow that error and rethrow
+      // the original write error so the caller sees the real cause.
+      await rename(tempPath, tempPath).catch(() => {}); // probe existence
+      try {
+        const { unlink } = await import("node:fs/promises");
+        await unlink(tempPath).catch(() => {});
+      } catch {
+        // ignore cleanup errors — the write error is what matters
+      }
+      throw err;
+    }
     try {
       await rename(tempPath, params.sessionFile);
     } catch (err) {
