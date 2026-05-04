@@ -50,8 +50,18 @@ const LcmWorkDensitySchema = Type.Object({
   since: Type.Optional(Type.String({ description: "Only include observed items last seen at or after this ISO timestamp." })),
   before: Type.Optional(Type.String({ description: "Only include observed items first seen before this ISO timestamp." })),
   topic: Type.Optional(Type.String({ description: "Exact topic_key filter." })),
-  statuses: Type.Optional(Type.Array(Type.String({ enum: [...STATUS_VALUES] }), { description: "Observed statuses to include." })),
-  kinds: Type.Optional(Type.Array(Type.String({ enum: [...KIND_VALUES] }), { description: "Observed work kinds to include." })),
+  statuses: Type.Optional(
+    Type.Array(
+      Type.Union(STATUS_VALUES.map((value) => Type.Literal(value))),
+      { description: "Observed statuses to include." },
+    ),
+  ),
+  kinds: Type.Optional(
+    Type.Array(
+      Type.Union(KIND_VALUES.map((value) => Type.Literal(value))),
+      { description: "Observed work kinds to include." },
+    ),
+  ),
   includeSources: Type.Optional(Type.Boolean({ description: "Include observed-work source IDs. Defaults to false." })),
   detailLevel: Type.Optional(Type.Number({ description: "0 = compact counts only; values above 0 include the bounded top item sections. Default 1.", minimum: 0, maximum: 2 })),
   maxOutputTokens: Type.Optional(Type.Number({ description: "Approximate response budget; rich item/source sections are trimmed to stay within it when possible.", minimum: 256 })),

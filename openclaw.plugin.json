@@ -225,6 +225,10 @@
       "label": "Rollup Monthly Max Tokens",
       "help": "Maximum tokens for monthly rollup content. Default 560000 (≈4 weeks × 140K)."
     },
+    "observedWorkMaintenanceEnabled": {
+      "label": "Observed Work Maintenance",
+      "help": "Allow maintain() to run observed-work and event extraction over LCM summaries; disabled by default"
+    },
     "proactiveThresholdCompactionMode": {
       "label": "Proactive Threshold Compaction Mode",
       "help": "Choose deferred compaction debt by default or keep legacy inline proactive compaction"
@@ -443,6 +447,9 @@
       "rollupMonthlyMaxTokens": {
         "type": "integer",
         "minimum": 1
+      },
+      "observedWorkMaintenanceEnabled": {
+        "type": "boolean"
       },
       "proactiveThresholdCompactionMode": {
         "type": "string",

@@ -7,7 +7,7 @@ type MigrationLogger = {
   info?: (message: string) => void;
 };
 
-type SummaryColumnInfo = {
+type TableColumnInfo = {
   name?: string;
 };
 
@@ -240,7 +240,7 @@ const LCM_INITIAL_SCHEMA_STATEMENTS: readonly string[] = [
 ];
 
 function ensureSummaryDepthColumn(db: DatabaseSync): void {
-  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
+  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as TableColumnInfo[];
   const hasDepth = summaryColumns.some((col) => col.name === "depth");
   if (!hasDepth) {
     db.exec(`ALTER TABLE summaries ADD COLUMN depth INTEGER NOT NULL DEFAULT 0`);
@@ -248,7 +248,7 @@ function ensureSummaryDepthColumn(db: DatabaseSync): void {
 }
 
 function ensureSummaryMetadataColumns(db: DatabaseSync): void {
-  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
+  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as TableColumnInfo[];
   const hasEarliestAt = summaryColumns.some((col) => col.name === "earliest_at");
   const hasLatestAt = summaryColumns.some((col) => col.name === "latest_at");
   const hasDescendantCount = summaryColumns.some((col) => col.name === "descendant_count");
@@ -283,7 +283,7 @@ function isoStringOrNull(value: Date | null): string | null {
 }
 
 function ensureSummaryModelColumn(db: DatabaseSync): void {
-  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
+  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as TableColumnInfo[];
   const hasModel = summaryColumns.some((col) => col.name === "model");
   if (!hasModel) {
     db.exec(`ALTER TABLE summaries ADD COLUMN model TEXT NOT NULL DEFAULT 'unknown'`);
@@ -291,7 +291,7 @@ function ensureSummaryModelColumn(db: DatabaseSync): void {
 }
 
 function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
-  const telemetryColumns = db.prepare(`PRAGMA table_info(conversation_compaction_telemetry)`).all() as SummaryColumnInfo[];
+  const telemetryColumns = db.prepare(`PRAGMA table_info(conversation_compaction_telemetry)`).all() as TableColumnInfo[];
   const hasConsecutiveColdObservations = telemetryColumns.some(
     (col) => col.name === "consecutive_cold_observations",
   );
@@ -423,7 +423,7 @@ function ensureMessagePartsTable(db: DatabaseSync): void {
 }
 
 function ensureMessageIdentityHashColumn(db: DatabaseSync): void {
-  const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
+  const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as TableColumnInfo[];
   const hasIdentityHash = messageColumns.some((col) => col.name === "identity_hash");
   if (!hasIdentityHash) {
     db.exec(`ALTER TABLE messages ADD COLUMN identity_hash TEXT`);
@@ -949,7 +949,7 @@ function addColumnIfMissing(
   columnName: string,
   columnDefinition: string,
 ): void {
-  const columns = db.prepare(`PRAGMA table_info(${quoteSqlIdentifier(tableName)})`).all() as SummaryColumnInfo[];
+  const columns = db.prepare(`PRAGMA table_info(${quoteSqlIdentifier(tableName)})`).all() as TableColumnInfo[];
   if (!columns.some((col) => col.name === columnName)) {
     db.exec(
       `ALTER TABLE ${quoteSqlIdentifier(tableName)} ADD COLUMN ${quoteSqlIdentifier(columnName)} ${columnDefinition}`,
@@ -978,7 +978,7 @@ function shouldRecreateStandaloneFtsTable(db: DatabaseSync, spec: FtsTableSpec):
 
     const columns = db
       .prepare(`PRAGMA table_info(${quoteSqlIdentifier(spec.tableName)})`)
-      .all() as SummaryColumnInfo[];
+      .all() as TableColumnInfo[];
     const columnNames = new Set(
       columns
         .map((col) => col.name)
@@ -1219,12 +1219,6 @@ export function runLcmMigrations(
     });
 
     runMigrationStep("ensureObservedWorkTables", log, () => {
-      // Issue each CREATE TABLE in its own db.exec() so a failure on one
-      // statement throws instead of silently aborting the rest. Node's
-      // sqlite multi-statement exec swallows partial failures and leaves
-      // the schema half-installed — see the file header note plus PR #482
-      // / issue #569. The same one-statement-per-exec pattern is used
-      // throughout this file.
       db.exec(`
         CREATE TABLE IF NOT EXISTS lcm_observed_work_items (
           work_item_id TEXT PRIMARY KEY,
@@ -1269,9 +1263,8 @@ export function runLcmMigrations(
           fingerprint_version INTEGER NOT NULL DEFAULT 1,
           created_at TEXT NOT NULL DEFAULT (datetime('now')),
           updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )
-      `);
-      db.exec(`
+        );
+
         CREATE TABLE IF NOT EXISTS lcm_observed_work_sources (
           work_item_id TEXT NOT NULL REFERENCES lcm_observed_work_items(work_item_id) ON DELETE CASCADE,
           source_type TEXT NOT NULL CHECK (source_type IN ('summary', 'rollup', 'message')),
@@ -1287,9 +1280,8 @@ export function runLcmMigrations(
           )),
           created_at TEXT NOT NULL DEFAULT (datetime('now')),
           PRIMARY KEY (work_item_id, source_type, source_id, evidence_kind)
-        )
-      `);
-      db.exec(`
+        );
+
         CREATE TABLE IF NOT EXISTS lcm_observed_work_state (
           conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
           last_processed_summary_created_at TEXT,
@@ -1297,7 +1289,7 @@ export function runLcmMigrations(
           last_processed_summary_rowid INTEGER,
           pending_rebuild INTEGER NOT NULL DEFAULT 0,
           updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )
+        );
       `);
     });
 
@@ -1311,41 +1303,22 @@ export function runLcmMigrations(
     });
 
     runMigrationStep("ensureObservedWorkIndexes", log, () => {
-      // One CREATE INDEX per exec() — see ensureObservedWorkTables note.
-      db.exec(
-        `CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_status_kind_seen_idx
-           ON lcm_observed_work_items(conversation_id, observed_status, kind, last_seen_at DESC)`,
-      );
-      db.exec(
-        `CREATE INDEX IF NOT EXISTS lcm_observed_work_items_owner_status_kind_seen_idx
-           ON lcm_observed_work_items(owner_id, observed_status, kind, last_seen_at DESC)`,
-      );
-      db.exec(
-        `CREATE INDEX IF NOT EXISTS lcm_observed_work_items_topic_status_seen_idx
-           ON lcm_observed_work_items(topic_key, observed_status, last_seen_at DESC)`,
-      );
-      db.exec(
-        `CREATE INDEX IF NOT EXISTS lcm_observed_work_items_fingerprint_idx
-           ON lcm_observed_work_items(fingerprint)`,
-      );
-      db.exec(
-        `CREATE INDEX IF NOT EXISTS lcm_observed_work_sources_source_idx
-           ON lcm_observed_work_sources(source_type, source_id)`,
-      );
-      // Hot-path index for getDensity({conversationId, since}): a composite on
-      // (conversation_id, observed_status, last_seen_at DESC) avoids a status
-      // scan when callers omit `kind` (a common dashboard query).
-      db.exec(
-        `CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_status_seen_idx
-           ON lcm_observed_work_items(conversation_id, observed_status, last_seen_at DESC)`,
-      );
-      // Hot-path index for getDensity({conversationId, before}): the `before`
-      // predicate filters on first_seen_at which the existing seen-DESC index
-      // can't satisfy — direct ASC scan beats the alternative.
-      db.exec(
-        `CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_first_seen_idx
-           ON lcm_observed_work_items(conversation_id, first_seen_at)`,
-      );
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_status_kind_seen_idx
+          ON lcm_observed_work_items(conversation_id, observed_status, kind, last_seen_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_owner_status_kind_seen_idx
+          ON lcm_observed_work_items(owner_id, observed_status, kind, last_seen_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_topic_status_seen_idx
+          ON lcm_observed_work_items(topic_key, observed_status, last_seen_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_fingerprint_idx
+          ON lcm_observed_work_items(fingerprint);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_sources_source_idx
+          ON lcm_observed_work_sources(source_type, source_id);
+      `);
     });
 
     runMigrationStep("ensureTaskBridgeSuggestionTables", log, () => {
@@ -1381,19 +1354,16 @@ export function runLcmMigrations(
     });
 
     runMigrationStep("ensureTaskBridgeSuggestionIndexes", log, () => {
-      // One CREATE INDEX per exec() — see ensureObservedWorkTables note.
-      db.exec(
-        `CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_status_kind_idx
-           ON lcm_task_bridge_suggestions(status, suggestion_kind, created_at DESC)`,
-      );
-      db.exec(
-        `CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_work_item_idx
-           ON lcm_task_bridge_suggestions(work_item_id, status)`,
-      );
-      db.exec(
-        `CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_task_idx
-           ON lcm_task_bridge_suggestions(task_id, status)`,
-      );
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_status_kind_idx
+          ON lcm_task_bridge_suggestions(status, suggestion_kind, created_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_work_item_idx
+          ON lcm_task_bridge_suggestions(work_item_id, status);
+
+        CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_task_idx
+          ON lcm_task_bridge_suggestions(task_id, status);
+      `);
     });
 
     runMigrationStep("ensureEventObservationTables", log, () => {
@@ -1427,23 +1397,16 @@ export function runLcmMigrations(
     });
 
     runMigrationStep("ensureEventObservationIndexes", log, () => {
-      // One CREATE INDEX per exec() — see ensureObservedWorkTables note.
-      db.exec(
-        `CREATE INDEX IF NOT EXISTS lcm_event_observations_conversation_kind_time_idx
-           ON lcm_event_observations(conversation_id, event_kind, event_time DESC)`,
-      );
-      db.exec(
-        `CREATE INDEX IF NOT EXISTS lcm_event_observations_query_time_idx
-           ON lcm_event_observations(query_key, event_time DESC)`,
-      );
-      db.exec(
-        `CREATE INDEX IF NOT EXISTS lcm_event_observations_conversation_observed_time_idx
-           ON lcm_event_observations(conversation_id, coalesce(event_time, ingest_time) DESC)`,
-      );
-      db.exec(
-        `CREATE INDEX IF NOT EXISTS lcm_event_observations_source_idx
-           ON lcm_event_observations(source_type, source_id)`,
-      );
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_event_observations_conversation_kind_time_idx
+          ON lcm_event_observations(conversation_id, event_kind, event_time DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_event_observations_query_time_idx
+          ON lcm_event_observations(query_key, event_time DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_event_observations_source_idx
+          ON lcm_event_observations(source_type, source_id);
+      `);
     });
 
     const detectedFeatures = options?.fts5Available === false ? null : getLcmDbFeatures(db);

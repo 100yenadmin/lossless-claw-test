@@ -50,6 +50,7 @@ import {
   DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO,
   describeLcmConfigSource,
 } from "./db/config.js";
+import { ObservedWorkExtractor } from "./observed-work-extractor.js";
 import { RetrievalEngine } from "./retrieval.js";
 import { RollupBuilder } from "./rollup-builder.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
@@ -70,7 +71,6 @@ import {
   type MessagePartRecord,
   type MessagePartType,
 } from "./store/conversation-store.js";
-import { ObservedWorkExtractor } from "./observed-work-extractor.js";
 import { EventObservationStore } from "./store/event-observation-store.js";
 import { ObservedWorkStore } from "./store/observed-work-store.js";
 import { RollupStore } from "./store/rollup-store.js";
@@ -1826,7 +1826,6 @@ function messageContentCoveredBySummary(params: {
   }
   return false;
 }
-
 
 const MAX_ROLLUP_MAINTENANCE_DAYS_BACK = 30;
 
@@ -6013,6 +6012,45 @@ export class LcmContextEngine implements ContextEngine {
             );
             markRollupRebuildPending("rollup-build-failed");
           }
+          if (this.config.observedWorkMaintenanceEnabled) {
+            try {
+              const observedResult = await this.observedWorkExtractor.processConversation(
+                conversation.conversationId,
+                { limit: 500 },
+              );
+              if (
+                observedResult.summariesScanned > 0 ||
+                observedResult.workItemsUpserted > 0 ||
+                observedResult.eventsUpserted > 0
+              ) {
+                this.deps.log.info(
+                  `[lcm] maintain: observed-work extraction conversation=${conversation.conversationId} ${sessionLabel} summariesScanned=${observedResult.summariesScanned} workItemsUpserted=${observedResult.workItemsUpserted} eventsUpserted=${observedResult.eventsUpserted}`,
+                );
+              }
+            } catch (error) {
+              this.deps.log.warn(
+                `[lcm] maintain: observed-work extraction failed conversation=${conversation.conversationId} ${sessionLabel}: ${describeLogError(error)}`,
+              );
+              try {
+                // Mark rebuild pending AND null the cursor so the next maintain()
+                // pass restarts from the beginning. `pendingRebuild` alone is
+                // write-only — the extractor's listUnprocessedLeafSummaries()
+                // only consults the (createdAt,id,rowid) cursor, so leaving the
+                // cursor in place would cause crashed batches to be silently
+                // skipped on the next pass. Nulling all three cursor fields
+                // forces a cursorless rescan from the conversation's first leaf.
+                this.observedWorkStore.upsertState({
+                  conversationId: conversation.conversationId,
+                  pendingRebuild: true,
+                });
+                this.observedWorkStore.clearProcessingCursor(conversation.conversationId);
+              } catch (stateError) {
+                this.deps.log.warn(
+                  `[lcm] maintain: failed to preserve observed-work pending state conversation=${conversation.conversationId} ${sessionLabel}: ${describeLogError(stateError)}`,
+                );
+              }
+            }
+          }
           return result;
         };
         const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
@@ -7197,12 +7235,6 @@ export class LcmContextEngine implements ContextEngine {
         activityBand: params.activityBand,
       });
       this.clearStableOrphanStrippingOrdinal(params.conversationId);
-      // Run observed-work + event-observation extraction immediately after
-      // each successful leaf-compaction pass so the read tools (lcm_work_density,
-      // lcm_event_search) reflect newly-persisted summaries. Failures here are
-      // logged and swallowed: extraction is best-effort and must never block the
-      // compaction round-trip.
-      await this.runObservedWorkExtraction(params.conversationId);
     }
 
     const tokensBefore = observedTokens ?? storedTokensBefore;
@@ -8035,29 +8067,9 @@ export class LcmContextEngine implements ContextEngine {
     return this.observedWorkStore;
   }
 
-  /**
-   * Run observed-work + event-observation extraction over any newly-persisted
-   * leaf summaries. Best-effort — errors are logged and swallowed so a flaky
-   * extraction pass never aborts a compaction round.
-   */
-  private async runObservedWorkExtraction(conversationId: number): Promise<void> {
-    try {
-      await this.observedWorkExtractor.processConversation(conversationId);
-    } catch (error) {
-      this.deps.log.warn(
-        `[lcm] observed-work extraction failed for conversation ${conversationId}: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-  }
-
-  getObservedWorkExtractor(): ObservedWorkExtractor {
-    return this.observedWorkExtractor;
-  }
-
   getEventObservationStore(): EventObservationStore {
     return this.eventObservationStore;
   }
-
 
   getRollupStore(): RollupStore {
     return this.rollupStore;

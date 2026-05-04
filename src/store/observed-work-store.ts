@@ -461,6 +461,25 @@ export class ObservedWorkStore {
     );
   }
 
+  /**
+   * Reset the (createdAt, id, rowid) processing cursor to NULL while leaving
+   * pending_rebuild and any other state intact. Used by the maintain() catch
+   * block when extractor processing fails: nulling the cursor forces the next
+   * pass to rescan from the first leaf summary (i.e. a real "rebuild"), since
+   * `listUnprocessedLeafSummaries` keys exclusively off the cursor fields and
+   * does not read pending_rebuild.
+   */
+  clearProcessingCursor(conversationId: number): void {
+    this.db.prepare(
+      `UPDATE lcm_observed_work_state
+         SET last_processed_summary_created_at = NULL,
+             last_processed_summary_id = NULL,
+             last_processed_summary_rowid = NULL,
+             updated_at = datetime('now')
+       WHERE conversation_id = ?`,
+    ).run(conversationId);
+  }
+
   getState(conversationId: number): ObservedWorkProcessingState | null {
     const row = this.db.prepare(
       `SELECT conversation_id, last_processed_summary_created_at, last_processed_summary_id,

@@ -81,6 +81,18 @@ describe("openclaw.plugin.json manifest drift guard (#570)", () => {
     // Each createLcm*Tool factory must correspond to exactly one declared
     // contract. If a registerTool call is added without a manifest update,
     // factories.length grows and this assertion fails.
+    //
+    // Expected asymmetry (PR #28): the `lcm_work_density` and
+    // `lcm_event_search` tools are declared in `contracts.tools` but their
+    // `api.registerTool(...)` calls are wrapped in
+    // `if (config.observedWorkMaintenanceEnabled) { ... }` blocks. The regex
+    // above matches all call sites regardless of surrounding conditionals, so
+    // both the runtime registrations and the manifest declarations stay in
+    // lockstep at the *source* level. A host that disables the flag will
+    // never see those tools registered at runtime; the manifest entries are
+    // still required because OpenClaw's manifest-validation rejects any
+    // `registerTool` call whose name isn't pre-declared, even if it never
+    // fires for a given launch.
     expect(factories.length).toBe(manifest.contracts.tools.length);
     // Each factory name should map 1:1 to a declared tool (createLcmGrepTool
     // -> lcm_grep, createLcmExpandQueryTool -> lcm_expand_query, etc.).

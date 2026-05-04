@@ -899,6 +899,36 @@ describe("ObservedWorkStore", () => {
     expect(updated.pending_rebuild).toBe(1);
   });
 
+  it("clearProcessingCursor resets the (createdAt,id,rowid) cursor so the next pass rescans from the start", () => {
+    // Regression for the maintain() crash-recovery path: when the extractor
+    // throws, engine.maintain() sets pending_rebuild=true AND nulls the
+    // cursor via clearProcessingCursor. The cursor reset is what actually
+    // forces re-processing — `listUnprocessedLeafSummaries` keys exclusively
+    // off the cursor fields and never reads pending_rebuild. If the cursor
+    // were left in place after a crash, every leaf summary processed up to
+    // the crash point would be silently skipped on retry.
+    const db = makeDb();
+    createConversation(db, 77);
+    const store = new ObservedWorkStore(db);
+    store.upsertState({
+      conversationId: 77,
+      lastProcessedSummaryCreatedAt: "2026-04-28T02:00:00.000Z",
+      lastProcessedSummaryId: "sum_pre_crash",
+      lastProcessedSummaryRowid: 9,
+    });
+    // Simulate the engine's catch block after a crashed extractor batch.
+    store.upsertState({ conversationId: 77, pendingRebuild: true });
+    store.clearProcessingCursor(77);
+    const state = store.getState(77);
+    expect(state).not.toBeNull();
+    expect(state!.pendingRebuild).toBe(true);
+    // Critical: cursor fields must be undefined so listUnprocessedLeafSummaries
+    // falls through to the cursor-less branch and rescans from the first leaf.
+    expect(state!.lastProcessedSummaryCreatedAt).toBeUndefined();
+    expect(state!.lastProcessedSummaryId).toBeUndefined();
+    expect(state!.lastProcessedSummaryRowid).toBeUndefined();
+  });
+
   it("rejects partial processed-summary cursor updates", () => {
     const db = makeDb();
     createConversation(db, 99);

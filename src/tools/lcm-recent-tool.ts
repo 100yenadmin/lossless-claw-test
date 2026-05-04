@@ -265,8 +265,6 @@ function getLcmRollupStore(
   throw new Error("LCM rollup database is unavailable.");
 }
 
-// startOfWeekDayString lives in src/timezone-windows.ts and is imported above
-// to keep week-boundary behavior aligned with lcm_work_density.
 
 function startOfMonthDayString(dayString: string): string {
   const [year, month] = dayString.split("-");
