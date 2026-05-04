@@ -1,5 +1,6 @@
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import { clampListLimit, placeholders } from "../db/sql-utils.js";
+import { appendConversationScopeConstraint } from "./conversation-scope.js";
 
 export type ObservedWorkStatus =
   | "observed_completed"
@@ -48,6 +49,14 @@ export type ObservedWorkItemInput = {
 
 export type ObservedWorkDensityQuery = {
   conversationId?: number;
+  /**
+   * Optional set of conversation IDs to scope the query across. When supplied
+   * with at least one element, this takes precedence over `conversationId`
+   * and limits results to membership in this set. Used by family-aware
+   * retrieval (PR #338 + v0.9.4 family extension) so density spans /new and
+   * /reset boundaries.
+   */
+  conversationIds?: number[];
   since?: string;
   before?: string;
   statuses?: ObservedWorkStatus[];
@@ -710,11 +719,14 @@ export class ObservedWorkStore {
         WHERE src.work_item_id = lcm_observed_work_items.work_item_id
       )`,
     ];
-    const args: SQLInputValue[] = [];
-    if (query.conversationId != null) {
-      where.push("conversation_id = ?");
-      args.push(query.conversationId);
-    }
+    const args: Array<string | number> = [];
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "conversation_id",
+      conversationId: query.conversationId,
+      conversationIds: query.conversationIds,
+    });
     if (query.since) {
       // Direct ISO 8601 comparison — sorts lexicographically and uses indexes
       // on last_seen_at; julianday() wrappers would force a full scan.

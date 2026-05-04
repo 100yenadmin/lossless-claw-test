@@ -388,6 +388,10 @@ export function createLcmWorkDensityTool(input: {
       const includeSources = p.includeSources === true;
       const result = store.getDensity({
         conversationId: scope.conversationId,
+        // Span the full session family (active + archived siblings under the
+        // same session_key) so density covers /new and /reset boundaries.
+        // PR #338 + v0.9.4 family-scope extension.
+        conversationIds: scope.conversationIds,
         since,
         before,
         statuses,

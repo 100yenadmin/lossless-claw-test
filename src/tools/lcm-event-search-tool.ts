@@ -111,6 +111,9 @@ export function createLcmEventSearchTool(input: {
       const query = typeof p.query === "string" && p.query.trim() ? p.query.trim() : undefined;
       const observations = lcm.getEventObservationStore().listObservations({
         conversationId: scope.conversationId,
+        // Span the session family so event_search covers /new and /reset
+        // boundaries. PR #338 + v0.9.4 family-scope extension.
+        conversationIds: scope.conversationIds,
         eventKinds,
         query,
         since,

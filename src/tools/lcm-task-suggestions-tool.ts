@@ -201,6 +201,9 @@ export function createLcmTaskSuggestionsTool(input: {
       const mode = p.mode === "record" ? "record" : "preview";
       const density = lcm.getObservedWorkStore().getDensity({
         conversationId: scope.conversationId,
+        // Span the session family so suggestions surface observed work from
+        // across /new and /reset boundaries. PR #338 + v0.9.4 extension.
+        conversationIds: scope.conversationIds,
         since,
         before,
         statuses,
