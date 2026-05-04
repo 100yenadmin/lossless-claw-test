@@ -883,6 +883,64 @@ describe("LCM sub-day window retrieval", () => {
     expect(hiddenDetails.sourceIds).toEqual([]);
   });
 
+
+  it("excludes tool/system/internal raw messages from bounded fallback", async () => {
+    const { db, conversationStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "sanitized-raw-fallback",
+      sessionKey: "agent:main:sanitized-raw-fallback",
+      title: "Sanitized raw fallback",
+    });
+
+    const visible = await conversationStore.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 1,
+      role: "assistant",
+      content: "Visible operator-safe fallback note.",
+      tokenCount: 8,
+    });
+    const tool = await conversationStore.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 2,
+      role: "tool",
+      content: "RAW TOOL OUTPUT SHOULD NOT LEAK",
+      tokenCount: 8,
+    });
+    const system = await conversationStore.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 3,
+      role: "system",
+      content: "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>> INTERNAL SHOULD NOT LEAK",
+      tokenCount: 8,
+    });
+    for (const message of [visible, tool, system]) {
+      db.prepare("UPDATE messages SET created_at = ? WHERE message_id = ?").run(
+        "2026-04-27T10:00:00.000Z",
+        message.messageId
+      );
+    }
+
+    const recentTool = createLcmRecentTool({
+      deps: makeRecentDeps(),
+      lcm: makeLcmForConversation({
+        conversationId: conversation.conversationId,
+        rollupStore,
+        sessionId: "sanitized-raw-fallback",
+      }) as never,
+      sessionId: "sanitized-raw-fallback",
+    });
+
+    const result = await recentTool.execute("call-sanitized-fallback", {
+      period: "date:2026-04-27",
+      includeSources: true,
+    });
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("Visible operator-safe fallback note");
+    expect(text).not.toContain("RAW TOOL OUTPUT SHOULD NOT LEAK");
+    expect(text).not.toContain("BEGIN_OPENCLAW_INTERNAL_CONTEXT");
+    expect((result.details as { totalMatches?: number }).totalMatches).toBe(1);
+  });
+
   it("hides fallback source IDs unless requested and clamps output budget", async () => {
     const { db, conversationStore, summaryStore } = createStores();
     const conversation = await conversationStore.createConversation({
@@ -2071,31 +2129,31 @@ describe("LCM sub-day window retrieval", () => {
     ).toBe(true);
   });
 
-  it("bypasses stored day rollups when rebuild is pending without a message timestamp", async () => {
+  it("keeps stored past-day rollups when rebuild is pending for a later day", async () => {
     const { conversationStore, summaryStore, rollupStore } = createStores();
     const conversation = await conversationStore.createConversation({
-      sessionId: "pending-summary-only",
-      sessionKey: "agent:main:pending-summary-only",
-      title: "Pending summary only",
+      sessionId: "pending-later-day",
+      sessionKey: "agent:main:pending-later-day",
+      title: "Pending later day",
     });
     await summaryStore.insertSummary({
-      summaryId: "sum_pending_summary_only",
+      summaryId: "sum_pending_later_day",
       conversationId: conversation.conversationId,
       kind: "leaf",
       depth: 0,
-      content: "Summary-only repair should be visible through fallback.",
+      content: "Fallback-only repair should stay hidden by ready historical rollup.",
       tokenCount: 10,
       latestAt: new Date("2026-04-27T10:00:00.000Z"),
     });
     rollupStore.upsertRollup({
-      rollup_id: "rollup_pending_summary_only",
+      rollup_id: "rollup_pending_later_day",
       conversation_id: conversation.conversationId,
       period_kind: "day",
       period_key: "2026-04-27",
       period_start: "2026-04-27T00:00:00.000Z",
       period_end: "2026-04-28T00:00:00.000Z",
       timezone: "UTC",
-      content: "STALE SUMMARY-ONLY ROLLUP SHOULD NOT BE USED",
+      content: "READY HISTORICAL ROLLUP SHOULD BE USED",
       token_count: 10,
       source_summary_ids: JSON.stringify([]),
       source_message_count: 0,
@@ -2108,6 +2166,7 @@ describe("LCM sub-day window retrieval", () => {
     });
     rollupStore.upsertState(conversation.conversationId, {
       timezone: "UTC",
+      last_message_at: "2026-04-29T10:05:00.000Z",
       pending_rebuild: 1,
     });
 
@@ -2118,7 +2177,7 @@ describe("LCM sub-day window retrieval", () => {
       getConversationStore: () => ({
         getConversationBySessionId: async () => ({
           conversationId: conversation.conversationId,
-          sessionId: "pending-summary-only",
+          sessionId: "pending-later-day",
           title: null,
           bootstrappedAt: null,
           createdAt: now,
@@ -2130,18 +2189,18 @@ describe("LCM sub-day window retrieval", () => {
     const tool = createLcmRecentTool({
       deps: makeRecentDeps(),
       lcm: lcm as never,
-      sessionId: "pending-summary-only",
+      sessionId: "pending-later-day",
     });
 
-    const result = await tool.execute("call-pending-summary-only", {
+    const result = await tool.execute("call-pending-later-day", {
       period: "date:2026-04-27",
       includeSources: true,
     });
     const text = (result.content[0] as { text: string }).text;
-    expect(text).toContain("**Status:** fallback");
-    expect(text).toContain("**Degraded:** Rollup rebuild is pending, so stored day rollups were bypassed.");
-    expect(text).toContain("Summary-only repair");
-    expect(text).not.toContain("STALE SUMMARY-ONLY ROLLUP");
+    expect(text).toContain("**Status:** ready");
+    expect(text).toContain("READY HISTORICAL ROLLUP SHOULD BE USED");
+    expect(text).not.toContain("Fallback-only repair");
+    expect((result.details as { usedFallback?: boolean }).usedFallback).toBe(false);
   });
 
   it("combines complete prior daily rollups with live fallback for 7d", async () => {
@@ -3060,7 +3119,7 @@ describe("LCM weekly and monthly rollups", () => {
     ).toBe(31);
   });
 
-  it("does not serve stored aggregate rollups while rebuild is pending", async () => {
+  it("serves stored aggregate rollups when pending rebuild is outside the aggregate window", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     vi.useFakeTimers();
     vi.setSystemTime(now);
@@ -3107,19 +3166,20 @@ describe("LCM weekly and monthly rollups", () => {
         conversationId: conversation.conversationId,
         kind: "leaf",
         depth: 0,
-        content: "Pending rebuild activity must be visible via fallback.",
+        content: "Pending rebuild activity outside the requested week should not force fallback.",
         tokenCount: 10,
-        latestAt: now,
+        latestAt: new Date("2026-05-04T10:00:00.000Z"),
       });
 
       const update = db.prepare(
         `UPDATE lcm_rollups
          SET content = ?
          WHERE conversation_id = ? AND period_kind = 'week' AND period_key = ?`
-      ).run("STALE WEEK ROLLUP SHOULD NOT BE USED", conversation.conversationId, "2026-04-27");
+      ).run("READY STORED WEEK ROLLUP SHOULD BE USED", conversation.conversationId, "2026-04-27");
       expect(update.changes).toBe(1);
       rollupStore.upsertState(conversation.conversationId, {
         timezone: "UTC",
+        last_message_at: "2026-05-04T10:00:00.000Z",
         pending_rebuild: 1,
       });
 
@@ -3149,10 +3209,10 @@ describe("LCM weekly and monthly rollups", () => {
         includeSources: true,
       });
       const text = (result.content[0] as { text: string }).text;
-      expect(text).toContain("Pending rebuild activity");
-      expect(text).not.toContain("STALE WEEK ROLLUP");
+      expect(text).toContain("READY STORED WEEK ROLLUP SHOULD BE USED");
+      expect(text).not.toContain("Pending rebuild activity outside the requested week");
       expect((result.details as { usedFallback?: boolean }).usedFallback).toBe(
-        true
+        false
       );
     } finally {
       vi.useRealTimers();
