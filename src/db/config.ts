@@ -59,6 +59,15 @@ export type DynamicLeafChunkTokensConfig = {
   max: number;
 };
 
+export type AssemblyTraceConfig = {
+  /** Opt-in privacy-safe assembled-context boundary diagnostics. */
+  enabled: boolean;
+  /** Include short redacted text samples; disabled by default. */
+  includeRedactedSample: boolean;
+  /** Maximum first/last assembled messages to sample when samples are enabled. */
+  sampleMessages: number;
+};
+
 export type ProactiveThresholdCompactionMode = "deferred" | "inline";
 
 export type LcmConfigSource = "env" | "plugin-config" | "default";
@@ -147,6 +156,8 @@ export type LcmConfig = {
   cacheAwareCompaction: CacheAwareCompactionConfig;
   /** Dynamic step-band policy for incremental leaf chunk sizing. */
   dynamicLeafChunkTokens: DynamicLeafChunkTokensConfig;
+  /** Opt-in diagnostics for the assembled prompt boundary before model dispatch. */
+  assemblyTrace?: AssemblyTraceConfig;
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -337,6 +348,7 @@ export function resolveLcmConfigWithDiagnostics(
   const pc = pluginConfig ?? {};
   const cacheAwareCompaction = toRecord(pc.cacheAwareCompaction);
   const dynamicLeafChunkTokens = toRecord(pc.dynamicLeafChunkTokens);
+  const assemblyTrace = toRecord(pc.assemblyTrace);
   const proactiveThresholdCompactionMode = toProactiveThresholdCompactionMode(
     env.LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE,
   ) ?? toProactiveThresholdCompactionMode(pc.proactiveThresholdCompactionMode) ?? "deferred";
@@ -547,6 +559,24 @@ export function resolveLcmConfigWithDiagnostics(
             ? env.LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED === "true"
             : toBool(dynamicLeafChunkTokens?.enabled) ?? true,
         max: resolvedDynamicLeafChunkMax,
+      },
+      assemblyTrace: {
+        enabled:
+          env.LCM_ASSEMBLY_TRACE_ENABLED !== undefined
+            ? env.LCM_ASSEMBLY_TRACE_ENABLED === "true"
+            : toBool(assemblyTrace?.enabled) ?? false,
+        includeRedactedSample:
+          env.LCM_ASSEMBLY_TRACE_INCLUDE_REDACTED_SAMPLE !== undefined
+            ? env.LCM_ASSEMBLY_TRACE_INCLUDE_REDACTED_SAMPLE === "true"
+            : toBool(assemblyTrace?.includeRedactedSample) ?? false,
+        sampleMessages: Math.max(
+          0,
+          Math.floor(
+            parseFiniteInt(env.LCM_ASSEMBLY_TRACE_SAMPLE_MESSAGES)
+              ?? toNumber(assemblyTrace?.sampleMessages)
+              ?? 4,
+          ),
+        ),
       },
     },
     diagnostics: {

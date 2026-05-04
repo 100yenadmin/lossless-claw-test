@@ -55,6 +55,11 @@ describe("resolveLcmConfig", () => {
       enabled: true,
       max: 40000,
     });
+    expect(config.assemblyTrace).toEqual({
+      enabled: false,
+      includeRedactedSample: false,
+      sampleMessages: 4,
+    });
   });
 
   it("reads values from plugin config", () => {
@@ -86,6 +91,11 @@ describe("resolveLcmConfig", () => {
       dynamicLeafChunkTokens: {
         enabled: true,
         max: 50000,
+      },
+      assemblyTrace: {
+        enabled: true,
+        includeRedactedSample: true,
+        sampleMessages: 2,
       },
     });
     expect(config.enabled).toBe(false);
@@ -119,6 +129,11 @@ describe("resolveLcmConfig", () => {
     expect(config.dynamicLeafChunkTokens).toEqual({
       enabled: true,
       max: 80000,
+    });
+    expect(config.assemblyTrace).toEqual({
+      enabled: true,
+      includeRedactedSample: true,
+      sampleMessages: 2,
     });
   });
 
@@ -627,6 +642,18 @@ describe("resolveLcmConfig", () => {
           type: "integer",
           minimum: 1,
         },
+      },
+    });
+  });
+
+  it("ships a manifest with assemblyTrace in schema", () => {
+    expect(manifest.configSchema.properties.assemblyTrace).toEqual({
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        enabled: { type: "boolean" },
+        includeRedactedSample: { type: "boolean" },
+        sampleMessages: { type: "integer", minimum: 0 },
       },
     });
   });

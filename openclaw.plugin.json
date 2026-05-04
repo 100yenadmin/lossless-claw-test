@@ -228,6 +228,18 @@
     "fallbackProviders": {
       "label": "Fallback Providers",
       "help": "Explicit fallback provider/model pairs for compaction summarization (e.g., [{\"provider\": \"anthropic\", \"model\": \"claude-haiku-4-5\"}])"
+    },
+    "assemblyTrace": {
+      "label": "Assembly Trace",
+      "help": "Opt-in privacy-safe diagnostics for the assembled LCM context boundary before provider/model dispatch. Logs metadata, hashes, sizes, and item IDs; message bodies are not logged by default."
+    },
+    "assemblyTrace.includeRedactedSample": {
+      "label": "Assembly Trace Redacted Samples",
+      "help": "When assemblyTrace is enabled, include short redacted text samples from the assembled messages. Disabled by default."
+    },
+    "assemblyTrace.sampleMessages": {
+      "label": "Assembly Trace Sample Messages",
+      "help": "Maximum first/last assembled messages to include when redacted samples are enabled."
     }
   },
   "configSchema": {
@@ -461,6 +473,22 @@
           },
           "required": ["provider", "model"],
           "additionalProperties": false
+        }
+      },
+      "assemblyTrace": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "includeRedactedSample": {
+            "type": "boolean"
+          },
+          "sampleMessages": {
+            "type": "integer",
+            "minimum": 0
+          }
         }
       }
     }

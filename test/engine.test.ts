@@ -473,6 +473,97 @@ describe("LcmContextEngine ignored sessions", () => {
     expect(stored.map((message) => message.content)).toEqual(["included turn"]);
   });
 
+  it("logs opt-in assembly trace metadata without message bodies by default", async () => {
+    const info = vi.fn();
+    const engine = createEngineWithDeps(
+      {
+        assemblyTrace: {
+          enabled: true,
+          includeRedactedSample: false,
+          sampleMessages: 4,
+        },
+      },
+      {
+        log: {
+          info,
+          warn: vi.fn(),
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      },
+    );
+
+    await engine.ingest({
+      sessionId: includedSessionId,
+      sessionKey: includedSessionKey,
+      message: makeMessage({ role: "user", content: "private body sk-secret1234567890" }),
+    });
+
+    await engine.assemble({
+      sessionId: includedSessionId,
+      sessionKey: includedSessionKey,
+      messages: [],
+      tokenBudget: 500,
+    });
+
+    const traceLine = info.mock.calls
+      .map((call) => String(call[0]))
+      .find((line) => line.startsWith("[lcm] assembly-trace "));
+    expect(traceLine).toBeTruthy();
+    expect(traceLine).toContain('"reason":"assembled"');
+    expect(traceLine).toContain('"contextItems"');
+    expect(traceLine).toContain('"summaryCount":0');
+    expect(traceLine).toContain('"messageCount":1');
+    expect(traceLine).toContain('"hash"');
+    expect(traceLine).not.toContain("private body");
+    expect(traceLine).not.toContain("sk-secret1234567890");
+  });
+
+  it("redacts optional assembly trace samples when explicitly enabled", async () => {
+    const info = vi.fn();
+    const engine = createEngineWithDeps(
+      {
+        assemblyTrace: {
+          enabled: true,
+          includeRedactedSample: true,
+          sampleMessages: 1,
+        },
+      },
+      {
+        log: {
+          info,
+          warn: vi.fn(),
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      },
+    );
+
+    await engine.ingest({
+      sessionId: includedSessionId,
+      sessionKey: includedSessionKey,
+      message: makeMessage({
+        role: "user",
+        content: "contact me at user@example.com with key sk-secret1234567890",
+      }),
+    });
+
+    await engine.assemble({
+      sessionId: includedSessionId,
+      sessionKey: includedSessionKey,
+      messages: [],
+      tokenBudget: 500,
+    });
+
+    const traceLine = info.mock.calls
+      .map((call) => String(call[0]))
+      .find((line) => line.startsWith("[lcm] assembly-trace "));
+    expect(traceLine).toContain("[redacted-email]");
+    expect(traceLine).toContain("[redacted-secret]");
+    expect(traceLine).not.toContain("user@example.com");
+    expect(traceLine).not.toContain("sk-secret1234567890");
+  });
+
   it("passes through assemble for ignored sessions while assembling included sessions from LCM", async () => {
     const engine = createEngineWithConfig({
       ignoreSessionPatterns: ["agent:*:cron:**"],
