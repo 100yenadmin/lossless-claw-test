@@ -1,3 +1,5 @@
+import { escapeLikePattern } from "../db/sql-utils.js";
+
 const RAW_TERM_RE = /"([^"]+)"|(\S+)/g;
 
 /**
@@ -21,9 +23,8 @@ function normalizeFallbackTerm(raw: string): string {
   return raw.trim().replace(EDGE_PUNCTUATION_RE, "").toLowerCase();
 }
 
-function escapeLike(term: string): string {
-  return term.replace(/([\\%_])/g, "\\$1");
-}
+// `escapeLike` is now shared from sql-utils as `escapeLikePattern`
+// (issue #30 — see import above).
 
 /**
  * Convert a free-text query into a conservative LIKE search plan.
@@ -51,7 +52,7 @@ export function buildLikeSearchPlan(column: string, query: string): LikeSearchPl
   return {
     terms,
     where: terms.map(() => `LOWER(${column}) LIKE ? ESCAPE '\\'`),
-    args: terms.map((term) => `%${escapeLike(term)}%`),
+    args: terms.map((term) => `%${escapeLikePattern(term)}%`),
   };
 }
 

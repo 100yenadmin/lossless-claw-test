@@ -146,7 +146,15 @@ export async function withExclusiveDatabaseLock<T>(
 ): Promise<T> {
   const release = await acquireTransactionLockWithTimeout(db, options.timeoutMs);
   try {
-    return await operation();
+    // Mirror `withDatabaseTransaction` and bump the held-lock depth in
+    // `heldLockContext` (issue #33). Without this, any nested
+    // `withDatabaseTransaction` call from inside the exclusive-lock body
+    // would not see that the lock is already held — it would call
+    // `acquireTransactionLock(db)` again, which deadlocks on the same
+    // mutex we are still holding.
+    const heldLocks = new Map(heldLockContext.getStore() ?? []);
+    heldLocks.set(db, (heldLocks.get(db) ?? 0) + 1);
+    return await heldLockContext.run(heldLocks, async () => operation());
   } finally {
     release();
   }

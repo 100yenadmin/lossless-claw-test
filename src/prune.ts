@@ -6,6 +6,7 @@
  * to clean up messages, summaries, context_items, and other dependent rows.
  */
 import type { DatabaseSync } from "node:sqlite";
+import { withDatabaseTransaction } from "./transaction-mutex.js";
 
 // ── Duration parsing ────────────────────────────────────────────────────────
 
@@ -324,10 +325,10 @@ function deleteCandidates(db: DatabaseSync, candidates: PruneCandidate[]): numbe
  * deleted without modifying the database.  With `confirm: true`, deletes them
  * and relies on ON DELETE CASCADE for cleanup of child rows.
  */
-export function pruneConversations(
+export async function pruneConversations(
   db: DatabaseSync,
   options: PruneOptions,
-): PruneResult {
+): Promise<PruneResult> {
   const days = parseDuration(options.before);
   if (days == null) {
     throw new Error(
@@ -349,23 +350,24 @@ export function pruneConversations(
     candidates = [];
     let batchesRun = 0;
     while (true) {
-      let batchCount = 0;
-      db.exec("BEGIN IMMEDIATE");
-      try {
-        const batch = loadPruneCandidates(db, cutoffDate, batchSize);
-        batchCount = batch.length;
-        if (batch.length === 0) {
-          db.exec("COMMIT");
-          break;
-        }
-        deleted += deleteCandidates(db, batch);
-        candidates.push(...batch);
-        db.exec("COMMIT");
-      } catch (error) {
-        db.exec("ROLLBACK");
-        throw error;
-      }
-      if (batchCount < batchSize) {
+      // Route the per-batch transaction through `withDatabaseTransaction` so
+      // it serializes on the per-DB async mutex rather than racing against
+      // other in-flight async transactions on the same connection (issue
+      // #34). Returns whether the loop should continue.
+      const shouldContinue = await withDatabaseTransaction(
+        db,
+        "BEGIN IMMEDIATE",
+        () => {
+          const batch = loadPruneCandidates(db, cutoffDate, batchSize);
+          if (batch.length === 0) {
+            return false;
+          }
+          deleted += deleteCandidates(db, batch);
+          candidates.push(...batch);
+          return batch.length >= batchSize;
+        },
+      );
+      if (!shouldContinue) {
         break;
       }
       batchesRun += 1;

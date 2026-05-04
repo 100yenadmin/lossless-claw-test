@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
+import { escapeLikePattern, placeholders } from "../db/sql-utils.js";
 import { withDatabaseTransaction } from "../transaction-mutex.js";
 
 export type EventObservationKind =
@@ -96,13 +97,8 @@ type EventEpisodeRow = {
   updated_at: string;
 };
 
-function placeholders(values: readonly unknown[]): string {
-  return values.map(() => "?").join(", ");
-}
-
-function escapeLikePattern(value: string): string {
-  return value.replace(/[\\%_]/g, (part) => `\\${part}`);
-}
+// `placeholders` and `escapeLikePattern` are now shared from sql-utils
+// (issue #30 — see import above).
 
 function hashId(prefix: string, value: string): string {
   return `${prefix}_${createHash("sha256").update(value).digest("hex").slice(0, 24)}`;
@@ -291,6 +287,20 @@ function rowToEpisode(row: EventEpisodeRow, includeSources: boolean): EventEpiso
 }
 
 export class EventObservationStore {
+  // Cascade contract (issue #31): the link table
+  // `lcm_event_episode_observations` declares ON DELETE CASCADE on its
+  // event_id FK to `lcm_event_observations`, so deleting an observation row
+  // wipes its link rows. BUT the parent episode's aggregate columns
+  // (observation_count, first/last_event_time, confidence, source_ids) are
+  // NOT auto-recomputed — they are only refreshed via `rebuildEpisode()`,
+  // which runs as part of `upsertObservation()`.
+  //
+  // Today, observation deletion only happens via `conversations` ON DELETE
+  // CASCADE (which removes the entire episode row through the same path,
+  // so the staleness window is invisible). Any future code path that
+  // deletes an observation directly without removing its conversation MUST
+  // call `unlinkObservation()` (the canonical helper below) instead of
+  // raw SQL, otherwise the parent episode aggregates go stale.
   constructor(private readonly db: DatabaseSync) {}
 
   async upsertObservation(input: EventObservationInput): Promise<void> {
@@ -746,5 +756,38 @@ export class EventObservationStore {
        LIMIT ?`,
     ).all(...args, limit) as EventEpisodeRow[];
     return rows.map((row) => rowToEpisode(row, input?.includeSources === true));
+  }
+
+  /**
+   * Canonical path for deleting a single observation outside of a
+   * conversation cascade (issue #31).
+   *
+   * Looks up every episode the observation participates in, deletes the
+   * observation row (which cascades through the link table via the FK), and
+   * then refreshes each affected episode's aggregate columns by calling
+   * `rebuildEpisode()`. If an episode has no remaining observations it is
+   * removed by `rebuildEpisode()` itself.
+   *
+   * No callers today — this exists purely to keep the contract documented
+   * in code and to give future call sites a single safe entry point.
+   */
+  async unlinkObservation(eventId: string): Promise<void> {
+    await withDatabaseTransaction(this.db, "BEGIN IMMEDIATE", () => {
+      const episodeIds = (
+        this.db.prepare(
+          `SELECT episode_id
+           FROM lcm_event_episode_observations
+           WHERE event_id = ?`,
+        ).all(eventId) as Array<{ episode_id: string }>
+      ).map((row) => row.episode_id);
+      // Delete the observation; FK ON DELETE CASCADE wipes link rows.
+      this.db.prepare(
+        `DELETE FROM lcm_event_observations WHERE event_id = ?`,
+      ).run(eventId);
+      // Refresh aggregates on every episode that referenced it.
+      for (const episodeId of [...new Set(episodeIds)]) {
+        this.rebuildEpisode(episodeId);
+      }
+    });
   }
 }
