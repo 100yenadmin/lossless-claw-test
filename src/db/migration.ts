@@ -1286,10 +1286,20 @@ export function runLcmMigrations(
           conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
           last_processed_summary_created_at TEXT,
           last_processed_summary_id TEXT,
+          last_processed_summary_rowid INTEGER,
           pending_rebuild INTEGER NOT NULL DEFAULT 0,
           updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
       `);
+    });
+
+    runMigrationStep("ensureObservedWorkStateCursorColumns", log, () => {
+      addColumnIfMissing(
+        db,
+        "lcm_observed_work_state",
+        "last_processed_summary_rowid",
+        "INTEGER",
+      );
     });
 
     runMigrationStep("ensureObservedWorkIndexes", log, () => {
@@ -1297,13 +1307,16 @@ export function runLcmMigrations(
         CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_status_kind_seen_idx
           ON lcm_observed_work_items(conversation_id, observed_status, kind, last_seen_at DESC);
 
-        -- Per-status density hot path: when 'kind' is unconstrained (the
-        -- default density tool call), the kind-bearing composite index above
-        -- forces SQLite into a TEMP B-TREE for the ORDER BY last_seen_at DESC
-        -- step. This narrower index lets the planner walk directly in
-        -- last_seen_at order for the (conversation, status) prefix.
+        -- Density queries without a kind filter are the default hot path; the
+        -- conversation/status/kind/last_seen index above forces a TEMP B-TREE
+        -- re-sort on those calls. This narrower index serves them directly.
         CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_status_seen_idx
           ON lcm_observed_work_items(conversation_id, observed_status, last_seen_at DESC);
+
+        -- Supports the before predicate julianday(first_seen_at) less-than ?
+        -- which the last_seen_at indexes above cannot serve.
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_first_seen_idx
+          ON lcm_observed_work_items(conversation_id, first_seen_at);
 
         CREATE INDEX IF NOT EXISTS lcm_observed_work_items_owner_status_kind_seen_idx
           ON lcm_observed_work_items(owner_id, observed_status, kind, last_seen_at DESC);
@@ -1313,9 +1326,6 @@ export function runLcmMigrations(
 
         CREATE INDEX IF NOT EXISTS lcm_observed_work_items_fingerprint_idx
           ON lcm_observed_work_items(fingerprint);
-
-        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_first_seen_idx
-          ON lcm_observed_work_items(conversation_id, first_seen_at);
 
         CREATE INDEX IF NOT EXISTS lcm_observed_work_sources_source_idx
           ON lcm_observed_work_sources(source_type, source_id);
@@ -1364,12 +1374,6 @@ export function runLcmMigrations(
 
         CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_task_idx
           ON lcm_task_bridge_suggestions(task_id, status);
-
-        -- Aligns with listSuggestions() ORDER BY updated_at DESC, created_at DESC
-        -- when filtering by status (and optionally suggestion_kind), avoiding an
-        -- extra sort for the common review/triage workflow.
-        CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_status_kind_updated_idx
-          ON lcm_task_bridge_suggestions(status, suggestion_kind, updated_at DESC, created_at DESC);
       `);
     });
 

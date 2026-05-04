@@ -1,15 +1,6 @@
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import { withDatabaseTransaction } from "../transaction-mutex.js";
 
-/**
- * Hard cap on source IDs persisted per suggestion. Bounds the per-row JSON
- * payload so a pathological caller cannot stuff thousands of IDs into a
- * single `source_ids` column. Truncation is silent (deterministic by
- * insertion order after dedup) — callers that exceed the cap get the most
- * recent N evidence pointers, which is the useful subset.
- */
-const MAX_SUGGESTION_SOURCE_IDS = 50;
-
 export type TaskBridgeSuggestionKind =
   | "create_task"
   | "link_task"
@@ -87,19 +78,36 @@ const TASK_TARGETING_KINDS = new Set<TaskBridgeSuggestionKind>([
   "add_task_evidence",
 ]);
 
+const MAX_SUGGESTION_SOURCE_IDS = 50;
+const SQLITE_BIND_CHUNK_SIZE = 500;
+
 function normalizeSourceIds(sourceIds: string[]): string[] {
-  const deduped = [
+  return [
     ...new Set(
       sourceIds
         .map((sourceId) => sourceId.trim())
         .filter((sourceId) => sourceId.length > 0)
     ),
   ];
-  // Cap before serialization so the persisted `source_ids` JSON column stays
-  // bounded regardless of caller behavior.
-  return deduped.length > MAX_SUGGESTION_SOURCE_IDS
-    ? deduped.slice(0, MAX_SUGGESTION_SOURCE_IDS)
-    : deduped;
+}
+
+function chunk<T>(values: T[], size: number): T[][] {
+  if (size <= 0 || values.length <= size) {
+    return values.length === 0 ? [] : [values];
+  }
+  const chunks: T[][] = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function normalizeOptionalId(value: string | undefined): string | undefined {
+  if (value == null) {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
 }
 
 function rowToSuggestion(row: TaskBridgeSuggestionRow): TaskBridgeSuggestion {
@@ -147,13 +155,14 @@ export class TaskBridgeSuggestionStore {
     workItemId: string,
     sourceIds: string[]
   ): void {
-    // Chunk the IN(...) lookup to stay safely under SQLite's bind-parameter
-    // ceiling (default 999, plus the leading workItemId binding).
-    const CHUNK_SIZE = 500;
+    if (sourceIds.length === 0) {
+      return;
+    }
+    // Chunk the IN(...) lookup so dense evidence sets can't exceed the
+    // SQLite bind-variable limit (mirrors ObservedWorkExtractor.loadExistingItems).
     const found = new Set<string>();
-    for (let offset = 0; offset < sourceIds.length; offset += CHUNK_SIZE) {
-      const chunk = sourceIds.slice(offset, offset + CHUNK_SIZE);
-      const placeholders = chunk.map(() => "?").join(", ");
+    for (const batch of chunk(sourceIds, SQLITE_BIND_CHUNK_SIZE)) {
+      const placeholders = batch.map(() => "?").join(", ");
       const rows = this.db
         .prepare(
           `SELECT DISTINCT source_id
@@ -161,7 +170,7 @@ export class TaskBridgeSuggestionStore {
            WHERE work_item_id = ?
              AND source_id IN (${placeholders})`
         )
-        .all(workItemId, ...chunk) as Array<{ source_id: string }>;
+        .all(workItemId, ...batch) as Array<{ source_id: string }>;
       for (const row of rows) {
         found.add(row.source_id);
       }
@@ -204,6 +213,11 @@ export class TaskBridgeSuggestionStore {
     const sourceIds = normalizeSourceIds(input.sourceIds);
     if (sourceIds.length === 0) {
       throw new Error("at least one source ID is required.");
+    }
+    if (sourceIds.length > MAX_SUGGESTION_SOURCE_IDS) {
+      throw new Error(
+        `sourceIds must not exceed ${MAX_SUGGESTION_SOURCE_IDS} entries (received ${sourceIds.length}).`
+      );
     }
     // Wrap the read-then-write (status check + INSERT … ON CONFLICT DO UPDATE)
     // in a single transaction. Without it, two concurrent upserts can both
@@ -285,19 +299,19 @@ export class TaskBridgeSuggestionStore {
       where.push("suggestion_kind = ?");
       args.push(input.suggestionKind);
     }
-    if (input?.workItemId) {
+    // Trim filter IDs so callers passing whitespace-padded IDs still match the
+    // (trimmed) values that upsertSuggestion writes.
+    const filterWorkItemId = normalizeOptionalId(input?.workItemId);
+    if (filterWorkItemId) {
       where.push("work_item_id = ?");
-      args.push(input.workItemId);
+      args.push(filterWorkItemId);
     }
-    if (input?.taskId) {
+    const filterTaskId = normalizeOptionalId(input?.taskId);
+    if (filterTaskId) {
       where.push("task_id = ?");
-      args.push(input.taskId);
+      args.push(filterTaskId);
     }
-    const requestedLimit =
-      typeof input?.limit === "number" && Number.isFinite(input.limit)
-        ? Math.trunc(input.limit)
-        : 20;
-    const limit = Math.max(1, Math.min(requestedLimit, 100));
+    const limit = Math.max(1, Math.min(input?.limit ?? 20, 100));
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db.prepare(
       `SELECT suggestion_id, work_item_id, task_id, suggestion_kind, status,
@@ -319,7 +333,13 @@ export class TaskBridgeSuggestionStore {
     if (!REVIEW_STATUSES.has(input.status)) {
       throw new Error("review status must be accepted, rejected, dismissed, or expired.");
     }
-    const reviewedBy = input.reviewedBy?.trim() || null;
+    // Trim suggestionId/reviewedBy so callers passing whitespace-padded values
+    // still match the (trimmed) IDs that upsertSuggestion writes.
+    const suggestionId = normalizeOptionalId(input.suggestionId);
+    if (!suggestionId) {
+      throw new Error("suggestionId is required.");
+    }
+    const reviewedBy = normalizeOptionalId(input.reviewedBy);
     const result = this.db.prepare(
       `UPDATE lcm_task_bridge_suggestions
        SET status = ?,
@@ -327,7 +347,7 @@ export class TaskBridgeSuggestionStore {
            reviewed_at = datetime('now'),
            updated_at = datetime('now')
        WHERE suggestion_id = ? AND status = 'pending'`,
-    ).run(input.status, reviewedBy, input.suggestionId);
+    ).run(input.status, reviewedBy ?? null, suggestionId);
     return result.changes > 0;
   }
 }

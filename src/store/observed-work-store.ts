@@ -57,6 +57,24 @@ export type ObservedWorkDensityQuery = {
   limit?: number;
 };
 
+export type ObservedWorkProcessingState = {
+  conversationId: number;
+  lastProcessedSummaryCreatedAt?: string;
+  lastProcessedSummaryId?: string;
+  lastProcessedSummaryRowid?: number;
+  pendingRebuild: boolean;
+  updatedAt: string;
+};
+
+export type ObservedWorkItemSnapshot = {
+  workItemId: string;
+  observedStatus: ObservedWorkStatus;
+  confidence: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  evidenceCount: number;
+};
+
 type ObservedWorkRow = {
   work_item_id: string;
   conversation_id: number;
@@ -70,6 +88,24 @@ type ObservedWorkRow = {
   first_seen_at: string;
   last_seen_at: string;
   completed_at: string | null;
+  evidence_count: number;
+};
+
+type ObservedWorkStateRow = {
+  conversation_id: number;
+  last_processed_summary_created_at: string | null;
+  last_processed_summary_id: string | null;
+  last_processed_summary_rowid: number | null;
+  pending_rebuild: number;
+  updated_at: string;
+};
+
+type ObservedWorkItemSnapshotRow = {
+  work_item_id: string;
+  observed_status: ObservedWorkStatus;
+  confidence: number;
+  first_seen_at: string;
+  last_seen_at: string;
   evidence_count: number;
 };
 
@@ -175,12 +211,26 @@ function placeholders(values: readonly unknown[]): string {
 export class ObservedWorkStore {
   constructor(private readonly db: DatabaseSync) {}
 
+  getItem(workItemId: string): ObservedWorkItemSnapshot | null {
+    const row = this.db.prepare(
+      `SELECT work_item_id, observed_status, confidence, first_seen_at, last_seen_at, evidence_count
+       FROM lcm_observed_work_items
+       WHERE work_item_id = ?`,
+    ).get(workItemId) as ObservedWorkItemSnapshotRow | undefined;
+    if (!row) {
+      return null;
+    }
+    return {
+      workItemId: row.work_item_id,
+      observedStatus: row.observed_status,
+      confidence: row.confidence,
+      firstSeenAt: row.first_seen_at,
+      lastSeenAt: row.last_seen_at,
+      evidenceCount: row.evidence_count,
+    };
+  }
+
   upsertItem(item: ObservedWorkItemInput): void {
-    // Optional fields (those marked `?` on ObservedWorkItemInput) are bound as
-    // SQL NULL when the caller omits them. The DO UPDATE clauses use
-    // COALESCE(excluded.<col>, existing) so partial updates never destructively
-    // wipe previously-extracted data (owner_id, rationale, topic_key, counters,
-    // etc.). Required and bookkeeping columns are always overwritten.
     this.db.prepare(
       `INSERT INTO lcm_observed_work_items (
         work_item_id, conversation_id, owner_id, title, description, observed_status, kind,
@@ -188,38 +238,49 @@ export class ObservedWorkStore {
         completed_at, completion_confidence, evidence_count, source_message_count,
         source_token_count, authority_source, sensitivity, visibility, fingerprint,
         fingerprint_version, updated_at
-      ) VALUES (
-        ?, ?, ?, ?, ?, ?, ?,
-        COALESCE(?, 0.5), COALESCE(?, 'medium'), ?, ?, ?, ?,
-        ?, ?, COALESCE(?, 0), COALESCE(?, 0),
-        COALESCE(?, 0), COALESCE(?, 'lcm_observed'), ?, ?, ?,
-        COALESCE(?, 1), datetime('now')
-      )
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
       ON CONFLICT(work_item_id) DO UPDATE SET
-        conversation_id = excluded.conversation_id,
+        -- conversation_id is intentionally omitted from the update set: the
+        -- work_item_id fingerprint already encodes conversation_id, so a
+        -- conflicting reuse must keep the original conversation. Letting it
+        -- be overwritten allowed silent cross-conversation moves on collision
+        -- (matches PR #20 commit 71ba5c0 hardening).
+        -- Preserve previously-stored optional/provenance fields when the
+        -- incoming row omits them (otherwise partial reprocessing erases data).
         owner_id = COALESCE(excluded.owner_id, lcm_observed_work_items.owner_id),
         title = excluded.title,
         description = COALESCE(excluded.description, lcm_observed_work_items.description),
-        observed_status = excluded.observed_status,
+        -- observed_status conservatively transitions: once an item is marked
+        -- observed_completed, decision_recorded, or dismissed, weaker cues
+        -- (ambiguous/unfinished) must not regress it. Higher-tier states or
+        -- explicit dismissed override anything below.
+        observed_status = CASE
+          WHEN lcm_observed_work_items.observed_status = 'dismissed' THEN excluded.observed_status
+          WHEN excluded.observed_status = 'dismissed' THEN excluded.observed_status
+          WHEN lcm_observed_work_items.observed_status IN ('observed_completed', 'decision_recorded')
+            AND excluded.observed_status IN ('observed_unfinished', 'observed_ambiguous')
+            THEN lcm_observed_work_items.observed_status
+          ELSE excluded.observed_status
+        END,
         kind = excluded.kind,
-        confidence = COALESCE(excluded.confidence, lcm_observed_work_items.confidence),
-        confidence_band = COALESCE(excluded.confidence_band, lcm_observed_work_items.confidence_band),
+        confidence = excluded.confidence,
+        confidence_band = excluded.confidence_band,
         rationale = COALESCE(excluded.rationale, lcm_observed_work_items.rationale),
         topic_key = COALESCE(excluded.topic_key, lcm_observed_work_items.topic_key),
         first_seen_at = CASE
-          WHEN julianday(excluded.first_seen_at) < julianday(lcm_observed_work_items.first_seen_at)
+          WHEN excluded.first_seen_at < lcm_observed_work_items.first_seen_at
             THEN excluded.first_seen_at
           ELSE lcm_observed_work_items.first_seen_at
         END,
         last_seen_at = CASE
-          WHEN julianday(excluded.last_seen_at) > julianday(lcm_observed_work_items.last_seen_at)
+          WHEN excluded.last_seen_at > lcm_observed_work_items.last_seen_at
             THEN excluded.last_seen_at
           ELSE lcm_observed_work_items.last_seen_at
         END,
         completed_at = CASE
           WHEN lcm_observed_work_items.completed_at IS NULL THEN excluded.completed_at
           WHEN excluded.completed_at IS NULL THEN lcm_observed_work_items.completed_at
-          WHEN julianday(excluded.completed_at) < julianday(lcm_observed_work_items.completed_at)
+          WHEN excluded.completed_at < lcm_observed_work_items.completed_at
             THEN excluded.completed_at
           ELSE lcm_observed_work_items.completed_at
         END,
@@ -230,14 +291,14 @@ export class ObservedWorkStore {
             THEN excluded.completion_confidence
           ELSE lcm_observed_work_items.completion_confidence
         END,
-        evidence_count = MAX(excluded.evidence_count, lcm_observed_work_items.evidence_count),
-        source_message_count = MAX(excluded.source_message_count, lcm_observed_work_items.source_message_count),
-        source_token_count = MAX(excluded.source_token_count, lcm_observed_work_items.source_token_count),
-        authority_source = excluded.authority_source,
+        evidence_count = COALESCE(excluded.evidence_count, lcm_observed_work_items.evidence_count),
+        source_message_count = COALESCE(excluded.source_message_count, lcm_observed_work_items.source_message_count),
+        source_token_count = COALESCE(excluded.source_token_count, lcm_observed_work_items.source_token_count),
+        authority_source = COALESCE(excluded.authority_source, lcm_observed_work_items.authority_source),
         sensitivity = COALESCE(excluded.sensitivity, lcm_observed_work_items.sensitivity),
         visibility = COALESCE(excluded.visibility, lcm_observed_work_items.visibility),
         fingerprint = excluded.fingerprint,
-        fingerprint_version = excluded.fingerprint_version,
+        fingerprint_version = COALESCE(excluded.fingerprint_version, lcm_observed_work_items.fingerprint_version),
         updated_at = datetime('now')`,
     ).run(
       item.workItemId,
@@ -247,22 +308,25 @@ export class ObservedWorkStore {
       item.description ?? null,
       item.observedStatus,
       item.kind,
-      item.confidence ?? null,
-      item.confidenceBand ?? null,
+      item.confidence ?? 0.5,
+      item.confidenceBand ?? "medium",
       item.rationale ?? null,
       item.topicKey ?? null,
       item.firstSeenAt,
       item.lastSeenAt,
       item.completedAt ?? null,
       item.completionConfidence ?? null,
-      item.evidenceCount ?? null,
-      item.sourceMessageCount ?? null,
-      item.sourceTokenCount ?? null,
-      item.authoritySource ?? null,
+      // For NOT-NULL count/provenance columns, fall back to the schema
+      // defaults on initial INSERT; the ON CONFLICT update preserves any
+      // previously-stored larger/non-default value via COALESCE.
+      item.evidenceCount ?? 0,
+      item.sourceMessageCount ?? 0,
+      item.sourceTokenCount ?? 0,
+      item.authoritySource ?? "lcm_observed",
       item.sensitivity ?? null,
       item.visibility ?? null,
       item.fingerprint,
-      item.fingerprintVersion ?? null,
+      item.fingerprintVersion ?? 1,
     );
   }
 
@@ -282,10 +346,27 @@ export class ObservedWorkStore {
     ).run(input.workItemId, input.sourceType, input.sourceId, input.ordinal, input.evidenceKind);
   }
 
+  hasSource(input: {
+    workItemId: string;
+    sourceType: "summary" | "rollup" | "message";
+    sourceId: string;
+  }): boolean {
+    const row = this.db.prepare(
+      `SELECT 1 AS found
+       FROM lcm_observed_work_sources
+       WHERE work_item_id = ?
+         AND source_type = ?
+         AND source_id = ?
+       LIMIT 1`,
+    ).get(input.workItemId, input.sourceType, input.sourceId);
+    return row != null;
+  }
+
   upsertState(input: {
     conversationId: number;
     lastProcessedSummaryCreatedAt?: string;
     lastProcessedSummaryId?: string;
+    lastProcessedSummaryRowid?: number;
     pendingRebuild?: boolean;
   }): void {
     const pendingRebuild =
@@ -293,8 +374,8 @@ export class ObservedWorkStore {
     this.db.prepare(
       `INSERT INTO lcm_observed_work_state (
         conversation_id, last_processed_summary_created_at, last_processed_summary_id,
-        pending_rebuild, updated_at
-      ) VALUES (?, ?, ?, COALESCE(?, 0), datetime('now'))
+        last_processed_summary_rowid, pending_rebuild, updated_at
+      ) VALUES (?, ?, ?, ?, COALESCE(?, 0), datetime('now'))
       ON CONFLICT(conversation_id) DO UPDATE SET
         last_processed_summary_created_at = CASE
           WHEN ? IS NULL THEN lcm_observed_work_state.last_processed_summary_created_at
@@ -303,6 +384,10 @@ export class ObservedWorkStore {
         last_processed_summary_id = CASE
           WHEN ? IS NULL THEN lcm_observed_work_state.last_processed_summary_id
           ELSE excluded.last_processed_summary_id
+        END,
+        last_processed_summary_rowid = CASE
+          WHEN ? IS NULL THEN lcm_observed_work_state.last_processed_summary_rowid
+          ELSE excluded.last_processed_summary_rowid
         END,
         pending_rebuild = CASE
           WHEN ? IS NULL THEN lcm_observed_work_state.pending_rebuild
@@ -313,35 +398,54 @@ export class ObservedWorkStore {
       input.conversationId,
       input.lastProcessedSummaryCreatedAt ?? null,
       input.lastProcessedSummaryId ?? null,
+      input.lastProcessedSummaryRowid ?? null,
       pendingRebuild,
       input.lastProcessedSummaryCreatedAt ?? null,
       input.lastProcessedSummaryId ?? null,
+      input.lastProcessedSummaryRowid ?? null,
       pendingRebuild,
     );
   }
 
+  getState(conversationId: number): ObservedWorkProcessingState | null {
+    const row = this.db.prepare(
+      `SELECT conversation_id, last_processed_summary_created_at, last_processed_summary_id,
+              last_processed_summary_rowid, pending_rebuild, updated_at
+       FROM lcm_observed_work_state
+       WHERE conversation_id = ?`,
+    ).get(conversationId) as ObservedWorkStateRow | undefined;
+    if (!row) {
+      return null;
+    }
+    return {
+      conversationId: row.conversation_id,
+      ...(row.last_processed_summary_created_at
+        ? { lastProcessedSummaryCreatedAt: row.last_processed_summary_created_at }
+        : {}),
+      ...(row.last_processed_summary_id
+        ? { lastProcessedSummaryId: row.last_processed_summary_id }
+        : {}),
+      ...(row.last_processed_summary_rowid != null
+        ? { lastProcessedSummaryRowid: row.last_processed_summary_rowid }
+        : {}),
+      pendingRebuild: row.pending_rebuild === 1,
+      updatedAt: row.updated_at,
+    };
+  }
+
   getDensity(query: ObservedWorkDensityQuery): ObservedWorkDensityResult {
-    const where: string[] = [
-      `EXISTS (
-        SELECT 1
-        FROM lcm_observed_work_sources src
-        WHERE src.work_item_id = lcm_observed_work_items.work_item_id
-      )`,
-    ];
+    const where: string[] = [];
     const args: SQLInputValue[] = [];
     if (query.conversationId != null) {
       where.push("conversation_id = ?");
       args.push(query.conversationId);
     }
     if (query.since) {
-      // ISO-8601 timestamps sort lexicographically; avoid julianday() so we
-      // stay index-friendly and consistent with the rest of the LCM cursor
-      // comparators (Wave 2 fix).
-      where.push("last_seen_at >= ?");
+      where.push("julianday(last_seen_at) >= julianday(?)");
       args.push(query.since);
     }
     if (query.before) {
-      where.push("first_seen_at < ?");
+      where.push("julianday(first_seen_at) < julianday(?)");
       args.push(query.before);
     }
     if (query.statuses?.length) {
@@ -356,23 +460,13 @@ export class ObservedWorkStore {
       where.push("topic_key = ?");
       args.push(query.topic);
     }
-    if (
-      query.minConfidence != null &&
-      typeof query.minConfidence === "number" &&
-      Number.isFinite(query.minConfidence)
-    ) {
+    if (query.minConfidence != null) {
       where.push("confidence >= ?");
       args.push(query.minConfidence);
     }
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
-    // Defense-in-depth: TypeBox schemas are not runtime-enforced in this repo,
-    // so guard against NaN/Infinity slipping into LIMIT bindings.
-    const requestedLimit =
-      typeof query.limit === "number" && Number.isFinite(query.limit)
-        ? Math.trunc(query.limit)
-        : 10;
-    const limit = Math.max(1, Math.min(requestedLimit, 50));
-    const ambiguousLimit = limit;
+    const limit = Math.max(1, Math.min(query.limit ?? 10, 50));
+    const ambiguousLimit = Math.min(limit, 10);
     const counts = this.db.prepare(
       `SELECT
          COUNT(*) AS total_observed,
@@ -451,11 +545,7 @@ export class ObservedWorkStore {
     if (workItemIds.length === 0) {
       return new Map();
     }
-    const truncated =
-      typeof perItemLimit === "number" && Number.isFinite(perItemLimit)
-        ? Math.trunc(perItemLimit)
-        : 20;
-    const sourceLimit = Math.max(1, Math.min(truncated, 50));
+    const sourceLimit = Math.max(1, Math.min(Math.trunc(perItemLimit), 50));
     const rows = this.db
       .prepare(
         `WITH ranked_sources AS (

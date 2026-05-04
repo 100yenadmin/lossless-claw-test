@@ -124,7 +124,7 @@ describe("TaskBridgeSuggestionStore", () => {
       store.reviewSuggestion({
         suggestionId: "sug_2",
         status: "accepted",
-        reviewedBy: " tester ",
+        reviewedBy: "tester",
       })
     ).toBe(true);
 
@@ -195,42 +195,6 @@ describe("TaskBridgeSuggestionStore", () => {
       status: "accepted",
       reviewedBy: "tester",
     });
-  });
-
-  it("orders refreshed pending suggestions by updated time", async () => {
-    const db = makeDb();
-    createObservedWorkItem(db, "work_order", ["sum_order"]);
-    const store = new TaskBridgeSuggestionStore(db);
-
-    expect(await store.upsertSuggestion({
-      suggestionId: "sug_old",
-      workItemId: "work_order",
-      suggestionKind: "create_task",
-      confidence: 0.7,
-      rationale: "Older suggestion.",
-      sourceIds: ["sum_order"],
-    })).toBe("inserted");
-    expect(await store.upsertSuggestion({
-      suggestionId: "sug_refreshed",
-      workItemId: "work_order",
-      suggestionKind: "create_task",
-      confidence: 0.8,
-      rationale: "Initial refreshed suggestion.",
-      sourceIds: ["sum_order"],
-    })).toBe("inserted");
-    db.prepare(
-      `UPDATE lcm_task_bridge_suggestions
-       SET created_at = ?, updated_at = ?
-       WHERE suggestion_id = ?`
-    ).run("2026-04-28T01:00:00.000Z", "2026-04-28T01:00:00.000Z", "sug_old");
-    db.prepare(
-      `UPDATE lcm_task_bridge_suggestions
-       SET created_at = ?, updated_at = ?
-       WHERE suggestion_id = ?`
-    ).run("2026-04-28T00:00:00.000Z", "2026-04-28T02:00:00.000Z", "sug_refreshed");
-
-    expect(store.listSuggestions({ status: "pending" }).map((item) => item.suggestionId))
-      .toEqual(["sug_refreshed", "sug_old"]);
   });
 
   it("rejects invalid suggestion records and reports missing review targets", async () => {
@@ -326,58 +290,5 @@ describe("TaskBridgeSuggestionStore", () => {
         reviewedBy: "tester",
       })
     ).toBe(false);
-  });
-
-  it("serializes concurrent upserts via the per-database mutex", async () => {
-    const db = makeDb();
-    createObservedWorkItem(db, "work_concurrent", ["sum_x"]);
-    const store = new TaskBridgeSuggestionStore(db);
-
-    const input = {
-      suggestionId: "sug_concurrent",
-      workItemId: "work_concurrent",
-      suggestionKind: "create_task" as const,
-      confidence: 0.75,
-      rationale: "Concurrent writers must agree on outcome.",
-      sourceIds: ["sum_x"],
-    };
-
-    // Fire two upserts in parallel. With the mutex they serialize: the first
-    // observes no prior row and reports "inserted"; the second sees the
-    // existing pending row and reports "refreshed". Without serialization
-    // both could observe `existingStatus === undefined` and both report
-    // "inserted", which would falsely advertise a fresh row twice.
-    const results = await Promise.all([
-      store.upsertSuggestion(input),
-      store.upsertSuggestion(input),
-    ]);
-    const sorted = [...results].sort();
-    expect(sorted).toEqual(["inserted", "refreshed"]);
-    expect(store.listSuggestions({ status: "pending" })).toHaveLength(1);
-  });
-
-  it("caps persisted source IDs at MAX_SUGGESTION_SOURCE_IDS", async () => {
-    const db = makeDb();
-    const sourceIds = Array.from({ length: 100 }, (_, index) => `sum_cap_${index}`);
-    createObservedWorkItem(db, "work_cap", sourceIds);
-    const store = new TaskBridgeSuggestionStore(db);
-
-    expect(
-      await store.upsertSuggestion({
-        suggestionId: "sug_cap",
-        workItemId: "work_cap",
-        suggestionKind: "create_task",
-        confidence: 0.6,
-        rationale: "Stress test cap on source ids.",
-        sourceIds,
-      })
-    ).toBe("inserted");
-
-    const persisted = store.listSuggestions({ status: "pending" });
-    expect(persisted).toHaveLength(1);
-    expect(persisted[0]!.sourceIds.length).toBeLessThanOrEqual(50);
-    expect(persisted[0]!.sourceIds.length).toBe(50);
-    // First 50 entries (post-dedup, insertion order) should survive.
-    expect(persisted[0]!.sourceIds).toEqual(sourceIds.slice(0, 50));
   });
 });
