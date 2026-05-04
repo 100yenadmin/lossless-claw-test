@@ -1,4 +1,14 @@
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
+import { withDatabaseTransaction } from "../transaction-mutex.js";
+
+/**
+ * Hard cap on source IDs persisted per suggestion. Bounds the per-row JSON
+ * payload so a pathological caller cannot stuff thousands of IDs into a
+ * single `source_ids` column. Truncation is silent (deterministic by
+ * insertion order after dedup) — callers that exceed the cap get the most
+ * recent N evidence pointers, which is the useful subset.
+ */
+const MAX_SUGGESTION_SOURCE_IDS = 50;
 
 export type TaskBridgeSuggestionKind =
   | "create_task"
@@ -78,13 +88,18 @@ const TASK_TARGETING_KINDS = new Set<TaskBridgeSuggestionKind>([
 ]);
 
 function normalizeSourceIds(sourceIds: string[]): string[] {
-  return [
+  const deduped = [
     ...new Set(
       sourceIds
         .map((sourceId) => sourceId.trim())
         .filter((sourceId) => sourceId.length > 0)
     ),
   ];
+  // Cap before serialization so the persisted `source_ids` JSON column stays
+  // bounded regardless of caller behavior.
+  return deduped.length > MAX_SUGGESTION_SOURCE_IDS
+    ? deduped.slice(0, MAX_SUGGESTION_SOURCE_IDS)
+    : deduped;
 }
 
 function rowToSuggestion(row: TaskBridgeSuggestionRow): TaskBridgeSuggestion {
@@ -159,7 +174,9 @@ export class TaskBridgeSuggestionStore {
     }
   }
 
-  upsertSuggestion(input: TaskBridgeSuggestionInput): TaskBridgeSuggestionUpsertResult {
+  async upsertSuggestion(
+    input: TaskBridgeSuggestionInput,
+  ): Promise<TaskBridgeSuggestionUpsertResult> {
     const suggestionId = input.suggestionId.trim();
     if (suggestionId.length === 0) {
       throw new Error("suggestionId is required.");
@@ -184,68 +201,71 @@ export class TaskBridgeSuggestionStore {
     if (TASK_TARGETING_KINDS.has(input.suggestionKind) && !taskId) {
       throw new Error(`${input.suggestionKind} suggestions require taskId.`);
     }
-    const existingStatus = this.getSuggestionStatus(suggestionId);
-    if (existingStatus && existingStatus !== "pending") {
-      return "preserved_reviewed";
-    }
     const sourceIds = normalizeSourceIds(input.sourceIds);
     if (sourceIds.length === 0) {
       throw new Error("at least one source ID is required.");
     }
-    const MAX_SOURCE_IDS = 1000;
-    if (sourceIds.length > MAX_SOURCE_IDS) {
-      throw new Error(
-        `at most ${MAX_SOURCE_IDS} source IDs are allowed per suggestion (got ${sourceIds.length}).`
+    // Wrap the read-then-write (status check + INSERT … ON CONFLICT DO UPDATE)
+    // in a single transaction. Without it, two concurrent upserts can both
+    // observe `existingStatus === undefined`, both report "inserted", and
+    // race on the conflict resolution. Route through `withDatabaseTransaction`
+    // so we participate in the per-DB async mutex (issue #260) — a raw
+    // BEGIN IMMEDIATE here would throw if a future caller invoked us from
+    // inside an enclosing transaction on the same shared DatabaseSync handle.
+    return withDatabaseTransaction(this.db, "BEGIN IMMEDIATE", () => {
+      const existingStatus = this.getSuggestionStatus(suggestionId);
+      if (existingStatus && existingStatus !== "pending") {
+        return "preserved_reviewed" as TaskBridgeSuggestionUpsertResult;
+      }
+      this.assertSourceIdsBelongToWorkItem(workItemId, sourceIds);
+      this.db.prepare(
+        `INSERT INTO lcm_task_bridge_suggestions (
+          suggestion_id, work_item_id, task_id, suggestion_kind, status, confidence,
+          rationale, source_ids, created_by, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(suggestion_id) DO UPDATE SET
+          work_item_id = CASE
+            WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.work_item_id
+            ELSE lcm_task_bridge_suggestions.work_item_id
+          END,
+          task_id = CASE
+            WHEN lcm_task_bridge_suggestions.status = 'pending'
+              THEN COALESCE(excluded.task_id, lcm_task_bridge_suggestions.task_id)
+            ELSE lcm_task_bridge_suggestions.task_id
+          END,
+          suggestion_kind = CASE
+            WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.suggestion_kind
+            ELSE lcm_task_bridge_suggestions.suggestion_kind
+          END,
+          confidence = CASE
+            WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.confidence
+            ELSE lcm_task_bridge_suggestions.confidence
+          END,
+          rationale = CASE
+            WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.rationale
+            ELSE lcm_task_bridge_suggestions.rationale
+          END,
+          source_ids = CASE
+            WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.source_ids
+            ELSE lcm_task_bridge_suggestions.source_ids
+          END,
+          updated_at = CASE
+            WHEN lcm_task_bridge_suggestions.status = 'pending' THEN datetime('now')
+            ELSE lcm_task_bridge_suggestions.updated_at
+          END`,
+      ).run(
+        suggestionId,
+        workItemId,
+        taskId ?? null,
+        input.suggestionKind,
+        "pending",
+        input.confidence,
+        input.rationale.trim(),
+        JSON.stringify(sourceIds),
+        input.createdBy?.trim() || "lcm_observed",
       );
-    }
-    this.assertSourceIdsBelongToWorkItem(workItemId, sourceIds);
-    this.db.prepare(
-      `INSERT INTO lcm_task_bridge_suggestions (
-        suggestion_id, work_item_id, task_id, suggestion_kind, status, confidence,
-        rationale, source_ids, created_by, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-      ON CONFLICT(suggestion_id) DO UPDATE SET
-        work_item_id = CASE
-          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.work_item_id
-          ELSE lcm_task_bridge_suggestions.work_item_id
-        END,
-        task_id = CASE
-          WHEN lcm_task_bridge_suggestions.status = 'pending'
-            THEN COALESCE(excluded.task_id, lcm_task_bridge_suggestions.task_id)
-          ELSE lcm_task_bridge_suggestions.task_id
-        END,
-        suggestion_kind = CASE
-          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.suggestion_kind
-          ELSE lcm_task_bridge_suggestions.suggestion_kind
-        END,
-        confidence = CASE
-          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.confidence
-          ELSE lcm_task_bridge_suggestions.confidence
-        END,
-        rationale = CASE
-          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.rationale
-          ELSE lcm_task_bridge_suggestions.rationale
-        END,
-        source_ids = CASE
-          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.source_ids
-          ELSE lcm_task_bridge_suggestions.source_ids
-        END,
-        updated_at = CASE
-          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN datetime('now')
-          ELSE lcm_task_bridge_suggestions.updated_at
-        END`,
-    ).run(
-      suggestionId,
-      workItemId,
-      taskId ?? null,
-      input.suggestionKind,
-      "pending",
-      input.confidence,
-      input.rationale.trim(),
-      JSON.stringify(sourceIds),
-      input.createdBy?.trim() || "lcm_observed",
-    );
-    return existingStatus === "pending" ? "refreshed" : "inserted";
+      return existingStatus === "pending" ? "refreshed" : "inserted";
+    });
   }
 
   listSuggestions(input?: {

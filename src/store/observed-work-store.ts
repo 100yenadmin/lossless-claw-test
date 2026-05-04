@@ -334,11 +334,14 @@ export class ObservedWorkStore {
       args.push(query.conversationId);
     }
     if (query.since) {
-      where.push("julianday(last_seen_at) >= julianday(?)");
+      // ISO-8601 timestamps sort lexicographically; avoid julianday() so we
+      // stay index-friendly and consistent with the rest of the LCM cursor
+      // comparators (Wave 2 fix).
+      where.push("last_seen_at >= ?");
       args.push(query.since);
     }
     if (query.before) {
-      where.push("julianday(first_seen_at) < julianday(?)");
+      where.push("first_seen_at < ?");
       args.push(query.before);
     }
     if (query.statuses?.length) {
