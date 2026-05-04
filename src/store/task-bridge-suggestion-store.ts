@@ -132,16 +132,25 @@ export class TaskBridgeSuggestionStore {
     workItemId: string,
     sourceIds: string[]
   ): void {
-    const placeholders = sourceIds.map(() => "?").join(", ");
-    const rows = this.db
-      .prepare(
-        `SELECT DISTINCT source_id
-         FROM lcm_observed_work_sources
-         WHERE work_item_id = ?
-           AND source_id IN (${placeholders})`
-      )
-      .all(workItemId, ...sourceIds) as Array<{ source_id: string }>;
-    const found = new Set(rows.map((row) => row.source_id));
+    // Chunk the IN(...) lookup to stay safely under SQLite's bind-parameter
+    // ceiling (default 999, plus the leading workItemId binding).
+    const CHUNK_SIZE = 500;
+    const found = new Set<string>();
+    for (let offset = 0; offset < sourceIds.length; offset += CHUNK_SIZE) {
+      const chunk = sourceIds.slice(offset, offset + CHUNK_SIZE);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const rows = this.db
+        .prepare(
+          `SELECT DISTINCT source_id
+           FROM lcm_observed_work_sources
+           WHERE work_item_id = ?
+             AND source_id IN (${placeholders})`
+        )
+        .all(workItemId, ...chunk) as Array<{ source_id: string }>;
+      for (const row of rows) {
+        found.add(row.source_id);
+      }
+    }
     const missing = sourceIds.filter((sourceId) => !found.has(sourceId));
     if (missing.length > 0) {
       throw new Error(
@@ -182,6 +191,12 @@ export class TaskBridgeSuggestionStore {
     const sourceIds = normalizeSourceIds(input.sourceIds);
     if (sourceIds.length === 0) {
       throw new Error("at least one source ID is required.");
+    }
+    const MAX_SOURCE_IDS = 1000;
+    if (sourceIds.length > MAX_SOURCE_IDS) {
+      throw new Error(
+        `at most ${MAX_SOURCE_IDS} source IDs are allowed per suggestion (got ${sourceIds.length}).`
+      );
     }
     this.assertSourceIdsBelongToWorkItem(workItemId, sourceIds);
     this.db.prepare(
@@ -258,7 +273,11 @@ export class TaskBridgeSuggestionStore {
       where.push("task_id = ?");
       args.push(input.taskId);
     }
-    const limit = Math.max(1, Math.min(input?.limit ?? 20, 100));
+    const requestedLimit =
+      typeof input?.limit === "number" && Number.isFinite(input.limit)
+        ? Math.trunc(input.limit)
+        : 20;
+    const limit = Math.max(1, Math.min(requestedLimit, 100));
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db.prepare(
       `SELECT suggestion_id, work_item_id, task_id, suggestion_kind, status,

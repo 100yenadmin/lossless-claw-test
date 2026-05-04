@@ -7,6 +7,10 @@ import type { LcmDependencies } from "../src/types.js";
 
 function makeDb(): DatabaseSync {
   const db = new DatabaseSync(":memory:");
+  // Match the rest of the suite: enforce FK constraints during inserts so the
+  // observed-work FK wiring (work_item_id -> conversations) is actually
+  // exercised by the fixture.
+  db.exec("PRAGMA foreign_keys = ON");
   runLcmMigrations(db, { fts5Available: false });
   return db;
 }
@@ -405,6 +409,7 @@ describe("ObservedWorkStore", () => {
     };
     const deps = {
       resolveSessionIdFromSessionKey: async () => undefined,
+      clock: { now: () => new Date() },
     } as unknown as LcmDependencies;
     const tool = createLcmWorkDensityTool({
       deps,
@@ -514,6 +519,7 @@ describe("ObservedWorkStore", () => {
     };
     const deps = {
       resolveSessionIdFromSessionKey: async () => undefined,
+      clock: { now: () => new Date() },
     } as unknown as LcmDependencies;
     const tool = createLcmWorkDensityTool({
       deps,

@@ -176,6 +176,11 @@ export class ObservedWorkStore {
   constructor(private readonly db: DatabaseSync) {}
 
   upsertItem(item: ObservedWorkItemInput): void {
+    // Optional fields (those marked `?` on ObservedWorkItemInput) are bound as
+    // SQL NULL when the caller omits them. The DO UPDATE clauses use
+    // COALESCE(excluded.<col>, existing) so partial updates never destructively
+    // wipe previously-extracted data (owner_id, rationale, topic_key, counters,
+    // etc.). Required and bookkeeping columns are always overwritten.
     this.db.prepare(
       `INSERT INTO lcm_observed_work_items (
         work_item_id, conversation_id, owner_id, title, description, observed_status, kind,
@@ -183,18 +188,24 @@ export class ObservedWorkStore {
         completed_at, completion_confidence, evidence_count, source_message_count,
         source_token_count, authority_source, sensitivity, visibility, fingerprint,
         fingerprint_version, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      ) VALUES (
+        ?, ?, ?, ?, ?, ?, ?,
+        COALESCE(?, 0.5), COALESCE(?, 'medium'), ?, ?, ?, ?,
+        ?, ?, COALESCE(?, 0), COALESCE(?, 0),
+        COALESCE(?, 0), COALESCE(?, 'lcm_observed'), ?, ?, ?,
+        COALESCE(?, 1), datetime('now')
+      )
       ON CONFLICT(work_item_id) DO UPDATE SET
         conversation_id = excluded.conversation_id,
-        owner_id = excluded.owner_id,
+        owner_id = COALESCE(excluded.owner_id, lcm_observed_work_items.owner_id),
         title = excluded.title,
-        description = excluded.description,
+        description = COALESCE(excluded.description, lcm_observed_work_items.description),
         observed_status = excluded.observed_status,
         kind = excluded.kind,
-        confidence = excluded.confidence,
-        confidence_band = excluded.confidence_band,
-        rationale = excluded.rationale,
-        topic_key = excluded.topic_key,
+        confidence = COALESCE(excluded.confidence, lcm_observed_work_items.confidence),
+        confidence_band = COALESCE(excluded.confidence_band, lcm_observed_work_items.confidence_band),
+        rationale = COALESCE(excluded.rationale, lcm_observed_work_items.rationale),
+        topic_key = COALESCE(excluded.topic_key, lcm_observed_work_items.topic_key),
         first_seen_at = CASE
           WHEN julianday(excluded.first_seen_at) < julianday(lcm_observed_work_items.first_seen_at)
             THEN excluded.first_seen_at
@@ -219,12 +230,12 @@ export class ObservedWorkStore {
             THEN excluded.completion_confidence
           ELSE lcm_observed_work_items.completion_confidence
         END,
-        evidence_count = excluded.evidence_count,
-        source_message_count = excluded.source_message_count,
-        source_token_count = excluded.source_token_count,
+        evidence_count = MAX(excluded.evidence_count, lcm_observed_work_items.evidence_count),
+        source_message_count = MAX(excluded.source_message_count, lcm_observed_work_items.source_message_count),
+        source_token_count = MAX(excluded.source_token_count, lcm_observed_work_items.source_token_count),
         authority_source = excluded.authority_source,
-        sensitivity = excluded.sensitivity,
-        visibility = excluded.visibility,
+        sensitivity = COALESCE(excluded.sensitivity, lcm_observed_work_items.sensitivity),
+        visibility = COALESCE(excluded.visibility, lcm_observed_work_items.visibility),
         fingerprint = excluded.fingerprint,
         fingerprint_version = excluded.fingerprint_version,
         updated_at = datetime('now')`,
@@ -236,22 +247,22 @@ export class ObservedWorkStore {
       item.description ?? null,
       item.observedStatus,
       item.kind,
-      item.confidence ?? 0.5,
-      item.confidenceBand ?? "medium",
+      item.confidence ?? null,
+      item.confidenceBand ?? null,
       item.rationale ?? null,
       item.topicKey ?? null,
       item.firstSeenAt,
       item.lastSeenAt,
       item.completedAt ?? null,
       item.completionConfidence ?? null,
-      item.evidenceCount ?? 0,
-      item.sourceMessageCount ?? 0,
-      item.sourceTokenCount ?? 0,
-      item.authoritySource ?? "lcm_observed",
+      item.evidenceCount ?? null,
+      item.sourceMessageCount ?? null,
+      item.sourceTokenCount ?? null,
+      item.authoritySource ?? null,
       item.sensitivity ?? null,
       item.visibility ?? null,
       item.fingerprint,
-      item.fingerprintVersion ?? 1,
+      item.fingerprintVersion ?? null,
     );
   }
 
@@ -342,12 +353,22 @@ export class ObservedWorkStore {
       where.push("topic_key = ?");
       args.push(query.topic);
     }
-    if (query.minConfidence != null) {
+    if (
+      query.minConfidence != null &&
+      typeof query.minConfidence === "number" &&
+      Number.isFinite(query.minConfidence)
+    ) {
       where.push("confidence >= ?");
       args.push(query.minConfidence);
     }
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
-    const limit = Math.max(1, Math.min(query.limit ?? 10, 50));
+    // Defense-in-depth: TypeBox schemas are not runtime-enforced in this repo,
+    // so guard against NaN/Infinity slipping into LIMIT bindings.
+    const requestedLimit =
+      typeof query.limit === "number" && Number.isFinite(query.limit)
+        ? Math.trunc(query.limit)
+        : 10;
+    const limit = Math.max(1, Math.min(requestedLimit, 50));
     const ambiguousLimit = limit;
     const counts = this.db.prepare(
       `SELECT
@@ -427,7 +448,11 @@ export class ObservedWorkStore {
     if (workItemIds.length === 0) {
       return new Map();
     }
-    const sourceLimit = Math.max(1, Math.min(Math.trunc(perItemLimit), 50));
+    const truncated =
+      typeof perItemLimit === "number" && Number.isFinite(perItemLimit)
+        ? Math.trunc(perItemLimit)
+        : 20;
+    const sourceLimit = Math.max(1, Math.min(truncated, 50));
     const rows = this.db
       .prepare(
         `WITH ranked_sources AS (

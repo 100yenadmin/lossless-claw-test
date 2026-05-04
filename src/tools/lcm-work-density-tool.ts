@@ -61,13 +61,14 @@ const LcmWorkDensitySchema = Type.Object({
 
 function resolvePeriodBounds(
   period: unknown,
-  timezone: string
+  timezone: string,
+  now: Date
 ): { label?: string; since?: string; before?: string } {
   if (typeof period !== "string" || period.trim().length === 0) {
     return {};
   }
   const normalized = period.trim().toLowerCase().replace(/\s+/g, " ");
-  const today = getZonedDayString(new Date(), timezone);
+  const today = getZonedDayString(now, timezone);
   if (normalized === "today") {
     return dayBounds("today", today, timezone);
   }
@@ -288,8 +289,12 @@ export function createLcmWorkDensityTool(input: {
       let statuses: ObservedWorkStatus[] | undefined;
       let kinds: ObservedWorkKind[] | undefined;
       let periodLabel: string | undefined;
+      // Capture wall-clock once at tool entry through the dependency contract so
+      // period windows are deterministic for tests/replay and don't straddle
+      // midnight inconsistently between resolve calls.
+      const now = input.deps.clock.now();
       try {
-        const periodBounds = resolvePeriodBounds(p.period, lcm.timezone);
+        const periodBounds = resolvePeriodBounds(p.period, lcm.timezone, now);
         periodLabel = periodBounds.label;
         since = parseIsoTimestampParam(p, "since")?.toISOString() ?? periodBounds.since;
         before = parseIsoTimestampParam(p, "before")?.toISOString() ?? periodBounds.before;
@@ -301,10 +306,23 @@ export function createLcmWorkDensityTool(input: {
       if (since && before && since >= before) {
         return jsonResult({ error: "since must be earlier than before." });
       }
-      const limit = typeof p.limit === "number" ? Math.trunc(p.limit) : 5;
-      const detailLevel = typeof p.detailLevel === "number" ? Math.trunc(p.detailLevel) : 1;
+      // TypeBox schemas in this repo are not runtime-enforced, so validate
+      // numeric params with Number.isFinite, clamp into the documented ranges,
+      // and fall back to defaults on invalid values rather than letting NaN /
+      // Infinity propagate into LIMIT or filter bindings downstream.
+      const limit =
+        typeof p.limit === "number" && Number.isFinite(p.limit)
+          ? Math.max(1, Math.min(Math.trunc(p.limit), 50))
+          : 5;
+      const detailLevel =
+        typeof p.detailLevel === "number" && Number.isFinite(p.detailLevel)
+          ? Math.max(0, Math.min(Math.trunc(p.detailLevel), 2))
+          : 1;
       const topic = typeof p.topic === "string" && p.topic.trim() ? p.topic.trim() : undefined;
-      const minConfidence = typeof p.minConfidence === "number" ? p.minConfidence : undefined;
+      const minConfidence =
+        typeof p.minConfidence === "number" && Number.isFinite(p.minConfidence)
+          ? Math.max(0, Math.min(p.minConfidence, 1))
+          : undefined;
       const store = lcm.getObservedWorkStore();
       const includeSources = p.includeSources === true;
       const result = store.getDensity({

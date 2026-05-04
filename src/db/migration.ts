@@ -1353,6 +1353,12 @@ export function runLcmMigrations(
 
         CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_task_idx
           ON lcm_task_bridge_suggestions(task_id, status);
+
+        -- Aligns with listSuggestions() ORDER BY updated_at DESC, created_at DESC
+        -- when filtering by status (and optionally suggestion_kind), avoiding an
+        -- extra sort for the common review/triage workflow.
+        CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_status_kind_updated_idx
+          ON lcm_task_bridge_suggestions(status, suggestion_kind, updated_at DESC, created_at DESC);
       `);
     });
 

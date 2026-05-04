@@ -109,7 +109,7 @@ Normalize provenance:
 ```sql
 CREATE TABLE lcm_observed_work_sources (
   work_item_id TEXT NOT NULL,
-  source_type TEXT NOT NULL, -- summary | rollup
+  source_type TEXT NOT NULL, -- summary | rollup | message
   source_id TEXT NOT NULL,
   ordinal INTEGER NOT NULL,
   evidence_kind TEXT NOT NULL, -- created | reinforced | possible_completion | completed | contradicted | dismissed
