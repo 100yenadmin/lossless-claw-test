@@ -100,6 +100,14 @@ export type ParseAgentSessionKeyFn = (sessionKey: string) => {
 
 export type IsSubagentSessionKeyFn = (sessionKey: string) => boolean;
 
+export type StartupSessionFileCandidate = {
+  sessionId: string;
+  sessionKey: string;
+  sessionFile: string;
+  agentId?: string;
+  storePath?: string;
+};
+
 /**
  * Clock service injected through LcmDependencies. Every read-path wall-clock
  * read in the LCM engine and tools MUST go through this — never `new Date()`
@@ -184,6 +192,9 @@ export interface LcmDependencies {
     sessionId: string;
     sessionKey?: string;
   }) => Promise<string | undefined>;
+
+  /** List OpenClaw-indexed session files that startup recovery may enumerate. */
+  listStartupSessionFileCandidates?: () => Promise<StartupSessionFileCandidate[]>;
 
   /** Agent lane constant for subagents */
   agentLaneSubagent: string;
