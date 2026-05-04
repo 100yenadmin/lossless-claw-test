@@ -196,7 +196,7 @@ The scaffold exists so future maintainers can reason about the persistence bound
 - The table is created in a separate idempotent migration step after the observed-work tables.
 - `work_item_id` is a foreign key to `lcm_observed_work_items`, making this PR explicitly dependent on Option B.
 - Suggestion writes normalize duplicate/empty source IDs and reject source-free suggestions.
-- Review updates return whether a suggestion existed, so callers do not confuse a missing record with a successful review.
+- Review updates return `true` only when they transition a `pending` row to a reviewed status, and `false` otherwise — both for missing suggestions and for already-reviewed ones. Callers that need to distinguish "no such suggestion" from "already reviewed" should query `listSuggestions({ workItemId })` first.
 
 ### Explicitly not implemented
 

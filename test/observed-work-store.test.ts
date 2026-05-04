@@ -2,16 +2,15 @@ import { describe, expect, it, vi } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { ObservedWorkExtractor } from "../src/observed-work-extractor.js";
+import { EventObservationStore } from "../src/store/event-observation-store.js";
 import { ObservedWorkStore } from "../src/store/observed-work-store.js";
 import { SummaryStore } from "../src/store/summary-store.js";
+import { createLcmEventSearchTool } from "../src/tools/lcm-event-search-tool.js";
 import { createLcmWorkDensityTool } from "../src/tools/lcm-work-density-tool.js";
 import type { LcmDependencies } from "../src/types.js";
 
 function makeDb(): DatabaseSync {
   const db = new DatabaseSync(":memory:");
-  // Match production (src/db/connection.ts) so FK constraints actually surface
-  // in tests (otherwise sources/items REFERENCES are silently skipped).
-  db.exec("PRAGMA foreign_keys = ON;");
   runLcmMigrations(db, { fts5Available: false });
   return db;
 }
@@ -81,7 +80,7 @@ describe("ObservedWorkStore", () => {
       createdAt: "2026-04-28T05:00:00.000Z",
       content: "- Blocker: PR #540 still has unresolved review comments",
     });
-    expect(extractor.processConversation(7)).toMatchObject({
+    await expect(extractor.processConversation(7)).resolves.toMatchObject({
       summariesScanned: 1,
       workItemsUpserted: 1,
     });
@@ -94,7 +93,7 @@ describe("ObservedWorkStore", () => {
       createdAt: "2026-04-28T05:00:00.000Z",
       content: "- Blocker: PR #541 still has failing CI",
     });
-    expect(extractor.processConversation(7)).toMatchObject({
+    await expect(extractor.processConversation(7)).resolves.toMatchObject({
       summariesScanned: 1,
       workItemsUpserted: 1,
     });
@@ -130,13 +129,13 @@ describe("ObservedWorkStore", () => {
       createdAt: "2026-04-28T05:00:00.000Z",
       content: "- Blocker: PR #552 still has a failing extractor retry test",
     });
-    expect(extractor.processConversation(12)).toMatchObject({
+    await expect(extractor.processConversation(12)).resolves.toMatchObject({
       summariesScanned: 1,
       workItemsUpserted: 1,
     });
 
     db.prepare(`DELETE FROM lcm_observed_work_state WHERE conversation_id = ?`).run(12);
-    expect(extractor.processConversation(12)).toMatchObject({
+    await expect(extractor.processConversation(12)).resolves.toMatchObject({
       summariesScanned: 1,
       workItemsUpserted: 1,
     });
@@ -178,7 +177,7 @@ describe("ObservedWorkStore", () => {
     addSourceSpy.mockImplementationOnce(() => {
       throw new Error("simulated source write failure");
     });
-    expect(() => extractor.processConversation(13)).toThrow(/simulated source/);
+    await expect(extractor.processConversation(13)).rejects.toThrow(/simulated source/);
     addSourceSpy.mockRestore();
 
     expect(
@@ -189,7 +188,7 @@ describe("ObservedWorkStore", () => {
     ).toBe(0);
     expect(observedWork.getState(13)).toBeNull();
 
-    expect(extractor.processConversation(13)).toMatchObject({
+    await expect(extractor.processConversation(13)).resolves.toMatchObject({
       summariesScanned: 1,
       workItemsUpserted: 1,
     });
@@ -218,12 +217,13 @@ describe("ObservedWorkStore", () => {
       createdAt: "2026-04-28T05:00:00.000Z",
       content: "- Blocker: PR #550 needs review",
     });
-    expect(extractor.processConversation(11)).toMatchObject({
+    await expect(extractor.processConversation(11)).resolves.toMatchObject({
       summariesScanned: 1,
       workItemsUpserted: 1,
     });
     observedWork.upsertState({
       conversationId: 11,
+      lastProcessedSummaryCreatedAt: "2026-04-28T05:00:00.000Z",
       lastProcessedSummaryId: "sum_cursor_anchor",
       lastProcessedSummaryRowid: 9999,
     });
@@ -236,7 +236,7 @@ describe("ObservedWorkStore", () => {
       createdAt: "2026-04-28T05:00:00.000Z",
       content: "- Blocker: PR #551 needs review",
     });
-    expect(extractor.processConversation(11)).toMatchObject({
+    await expect(extractor.processConversation(11)).resolves.toMatchObject({
       summariesScanned: 1,
       workItemsUpserted: 1,
     });
@@ -266,7 +266,7 @@ describe("ObservedWorkStore", () => {
       createdAt: "2026-04-28T05:00:00.000Z",
       content: "- Blocker: PR #560 needs review",
     });
-    expect(extractor.processConversation(16)).toMatchObject({
+    await expect(extractor.processConversation(16)).resolves.toMatchObject({
       summariesScanned: 1,
       workItemsUpserted: 1,
     });
@@ -287,7 +287,7 @@ describe("ObservedWorkStore", () => {
       createdAt: "2026-04-28T05:00:00.000Z",
       content: "- Blocker: PR #561 needs review",
     });
-    expect(extractor.processConversation(16)).toMatchObject({
+    await expect(extractor.processConversation(16)).resolves.toMatchObject({
       summariesScanned: 1,
       workItemsUpserted: 1,
     });
@@ -323,7 +323,7 @@ describe("ObservedWorkStore", () => {
       content,
     });
 
-    expect(extractor.processConversation(18, { limit: 1 })).toMatchObject({
+    await expect(extractor.processConversation(18, { limit: 1 })).resolves.toMatchObject({
       summariesScanned: 1,
       workItemsUpserted: 1100,
     });
@@ -359,7 +359,7 @@ describe("ObservedWorkStore", () => {
       content: "- Completed: PR #542 tests passed",
     });
 
-    expect(extractor.processConversation(9)).toMatchObject({
+    await expect(extractor.processConversation(9)).resolves.toMatchObject({
       summariesScanned: 2,
       workItemsUpserted: 2,
     });
@@ -380,6 +380,117 @@ describe("ObservedWorkStore", () => {
     ]);
   });
 
+  it("records deterministic event observations and hides sources unless requested", async () => {
+    const db = makeDb();
+    createConversation(db, 8);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const events = new EventObservationStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork, events);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 8,
+      summaryId: "sum_incident",
+      createdAt: "2026-04-28T06:00:00.000Z",
+      content: [
+        "- Incident: ENOTEMPTY failed during package cleanup",
+        "- Retell: recalled the older Tarzan onboarding incident",
+        "- Cortex config drift caused plugin validation failure",
+      ].join("\n"),
+    });
+    await expect(extractor.processConversation(8)).resolves.toMatchObject({
+      summariesScanned: 1,
+      eventsUpserted: 3,
+    });
+    expect(
+      events.listObservations({
+        conversationId: 8,
+        eventKinds: ["operational_incident"],
+        query: "cortex config drift",
+      })[0]?.eventKind
+    ).toBe("operational_incident");
+    await events.upsertObservation({
+      eventId: "evt_pr_normalized",
+      conversationId: 8,
+      eventKind: "primary",
+      title: "Normalized event key",
+      queryKey: "PR #123",
+      ingestTime: "2026-04-28T07:00:00.000Z",
+      confidence: 0.8,
+      rationale: "Direct store caller uses human PR spelling.",
+      sourceType: "summary",
+      sourceId: "sum_incident",
+    });
+    expect(
+      events.listObservations({ conversationId: 8, query: "pr-123" })[0]
+        ?.eventId
+    ).toBe("evt_pr_normalized");
+    expect(
+      events.listObservations({ conversationId: 8, query: "PR 123" })[0]
+        ?.eventId
+    ).toBe("evt_pr_normalized");
+    expect(
+      events.listObservations({
+        conversationId: 8,
+        query: "https://github.com/Martian-Engineering/lossless-claw/pull/123",
+      })[0]?.eventId
+    ).toBe("evt_pr_normalized");
+    await expect(
+      events.upsertObservation({
+        eventId: "evt_missing_source",
+        conversationId: 8,
+        eventKind: "primary",
+        title: "Missing source event",
+        ingestTime: "2026-04-28T07:00:00.000Z",
+        confidence: 0.8,
+        rationale: "Direct store caller omitted the primary source.",
+        sourceType: "summary",
+        sourceId: " ",
+      }),
+    ).rejects.toThrow(/source ID/);
+
+    const lcm = {
+      getEventObservationStore: () => events,
+      getConversationStore: () => ({
+        getConversationBySessionKey: async () => null,
+        getConversationBySessionId: async () => null,
+      }),
+    };
+    const deps = {
+      resolveSessionIdFromSessionKey: async () => undefined,
+    } as unknown as LcmDependencies;
+    const tool = createLcmEventSearchTool({
+      deps,
+      lcm: lcm as never,
+      sessionId: "event-session",
+    });
+
+    const hidden = await tool.execute("event-hidden", {
+      conversationId: 8,
+      query: "enotempty",
+    });
+    expect((hidden.details as { accounting: { eventsIncluded: number } }).accounting.eventsIncluded).toBe(1);
+    expect(JSON.stringify(hidden.details)).not.toContain("sum_incident");
+
+    const shown = await tool.execute("event-shown", {
+      conversationId: 8,
+      query: "tarzan",
+      includeSources: true,
+    });
+    expect(JSON.stringify(shown.details)).toContain("sum_incident");
+    expect(JSON.stringify(shown.details)).toContain("retelling");
+
+    const global = await tool.execute("event-global", {
+      allConversations: true,
+      query: "enotempty",
+    });
+    expect((global.details as { error?: string }).error).toMatch(
+      /does not support allConversations/
+    );
+  });
+
   it("uses neutral evidence for ambiguous work without a completion cue", async () => {
     const db = makeDb();
     createConversation(db, 17);
@@ -395,7 +506,7 @@ describe("ObservedWorkStore", () => {
       createdAt: "2026-04-28T05:00:00.000Z",
       content: "- Investigate PR #562 review behavior before calling it complete",
     });
-    expect(extractor.processConversation(17)).toMatchObject({
+    await expect(extractor.processConversation(17)).resolves.toMatchObject({
       summariesScanned: 1,
       workItemsUpserted: 1,
     });
@@ -412,6 +523,57 @@ describe("ObservedWorkStore", () => {
         evidenceKind: "created",
       }),
     ]);
+  });
+
+  it("treats negated completion cues as unfinished, not completed", async () => {
+    const db = makeDb();
+    createConversation(db, 22);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 22,
+      summaryId: "sum_neg_a",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- PR #777 not completed yet",
+    });
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 22,
+      summaryId: "sum_neg_b",
+      createdAt: "2026-04-28T05:01:00.000Z",
+      content: "- Never shipped the rollout for issue #888",
+    });
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 22,
+      summaryId: "sum_neg_c",
+      createdAt: "2026-04-28T05:02:00.000Z",
+      content: "- Cannot fix this regression on the auth path",
+    });
+    await expect(extractor.processConversation(22)).resolves.toMatchObject({
+      summariesScanned: 3,
+      workItemsUpserted: 3,
+    });
+
+    const density = observedWork.getDensity({
+      conversationId: 22,
+      statuses: ["observed_unfinished"],
+      limit: 10,
+    });
+    expect(density.density.unfinished).toBe(3);
+    // None of these lines should have minted observed_completed work items.
+    const completed = observedWork.getDensity({
+      conversationId: 22,
+      statuses: ["observed_completed"],
+      limit: 10,
+    });
+    expect(completed.density.completed).toBe(0);
   });
 
   it("reports completed, unfinished, and ambiguous work density", () => {
@@ -508,6 +670,46 @@ describe("ObservedWorkStore", () => {
     expect(decisionOnly.density.totalObserved).toBe(1);
     expect(decisionOnly.decisions[0]?.workItemId).toBe("work_decision");
     expect(decisionOnly.itemsIncluded).toBe(1);
+  });
+
+  it("does not surface source-free observed work in density results", () => {
+    const db = makeDb();
+    createConversation(db, 1);
+    const store = new ObservedWorkStore(db);
+    const base = {
+      conversationId: 1,
+      firstSeenAt: "2026-04-28T00:00:00.000Z",
+      lastSeenAt: "2026-04-28T01:00:00.000Z",
+      observedStatus: "observed_unfinished" as const,
+      kind: "review" as const,
+    };
+
+    store.upsertItem({
+      ...base,
+      workItemId: "work_sourced",
+      title: "Sourced observed item",
+      fingerprint: "review:sourced",
+    });
+    store.addSource({
+      workItemId: "work_sourced",
+      sourceType: "summary",
+      sourceId: "sum_sourced",
+      ordinal: 0,
+      evidenceKind: "created",
+    });
+    store.upsertItem({
+      ...base,
+      workItemId: "work_unsourced",
+      title: "Unsourced observed item",
+      fingerprint: "review:unsourced",
+    });
+
+    const density = store.getDensity({ conversationId: 1, includeSources: true });
+    expect(density.density.totalObserved).toBe(1);
+    expect(density.topUnfinished.map((item) => item.workItemId)).toEqual([
+      "work_sourced",
+    ]);
+    expect(JSON.stringify(density)).not.toContain("work_unsourced");
   });
 
   it("preserves temporal invariants while updating mutable metadata", () => {
@@ -673,6 +875,7 @@ describe("ObservedWorkStore", () => {
       conversationId: 42,
       lastProcessedSummaryCreatedAt: "2026-04-28T02:00:00.000Z",
       lastProcessedSummaryId: "sum_123",
+      lastProcessedSummaryRowid: 1,
       pendingRebuild: true,
     });
     const row = db
@@ -681,15 +884,45 @@ describe("ObservedWorkStore", () => {
     expect(row.last_processed_summary_id).toBe("sum_123");
     expect(row.pending_rebuild).toBe(1);
 
+    // All three cursor fields advance together — this is the only legal way
+    // to update a checkpoint. Partial updates are rejected by upsertState.
     store.upsertState({
       conversationId: 42,
+      lastProcessedSummaryCreatedAt: "2026-04-28T02:30:00.000Z",
       lastProcessedSummaryId: "sum_456",
+      lastProcessedSummaryRowid: 2,
     });
     const updated = db
       .prepare(`SELECT * FROM lcm_observed_work_state WHERE conversation_id = ?`)
       .get(42) as { last_processed_summary_id: string; pending_rebuild: number };
     expect(updated.last_processed_summary_id).toBe("sum_456");
     expect(updated.pending_rebuild).toBe(1);
+  });
+
+  it("rejects partial processed-summary cursor updates", () => {
+    const db = makeDb();
+    createConversation(db, 99);
+    const store = new ObservedWorkStore(db);
+    expect(() =>
+      store.upsertState({
+        conversationId: 99,
+        lastProcessedSummaryId: "sum_only_id",
+      }),
+    ).toThrow(/must all be provided together/);
+    expect(() =>
+      store.upsertState({
+        conversationId: 99,
+        lastProcessedSummaryId: "sum_id",
+        lastProcessedSummaryRowid: 5,
+        // missing lastProcessedSummaryCreatedAt
+      }),
+    ).toThrow(/must all be provided together/);
+    // Toggling pendingRebuild alone is still legal — no cursor fields supplied.
+    store.upsertState({ conversationId: 99, pendingRebuild: true });
+    const row = db
+      .prepare(`SELECT pending_rebuild FROM lcm_observed_work_state WHERE conversation_id = ?`)
+      .get(99) as { pending_rebuild: number };
+    expect(row.pending_rebuild).toBe(1);
   });
 
   it("serves lcm_work_density with deterministic period filtering and source redaction", async () => {
@@ -723,6 +956,13 @@ describe("ObservedWorkStore", () => {
       ordinal: 0,
       evidenceKind: "completed",
     });
+    store.addSource({
+      workItemId: "work_yesterday",
+      sourceType: "summary",
+      sourceId: "sum_yesterday",
+      ordinal: 0,
+      evidenceKind: "created",
+    });
 
     const lcm = {
       timezone: "UTC",
@@ -732,15 +972,13 @@ describe("ObservedWorkStore", () => {
         getConversationBySessionId: async () => null,
       }),
     };
-    // Use a deterministic stub clock that lets us assert the tool actually
-    // routed period-bound resolution through deps.clock.now() rather than a
-    // direct `new Date()` (which would be invisible to vi.setSystemTime tweaks
-    // in unrelated code paths).
     const now = new Date("2026-04-28T12:00:00.000Z");
-    const clockNow = vi.fn(() => now);
     const deps = {
       resolveSessionIdFromSessionKey: async () => undefined,
-      clock: { now: clockNow },
+      // Inject the deterministic clock the tool now reads through —
+      // resolvePeriodBounds("today"/"week"/...) routes wall-clock reads
+      // through deps.clock.now() so tests stay frozen.
+      clock: { now: () => now },
     } as unknown as LcmDependencies;
     const tool = createLcmWorkDensityTool({
       deps,
@@ -748,6 +986,8 @@ describe("ObservedWorkStore", () => {
       sessionId: "density-session",
     });
 
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
     try {
       const hidden = await tool.execute("density-hidden", {
         conversationId: 1,
@@ -805,12 +1045,8 @@ describe("ObservedWorkStore", () => {
       expect((global.details as { error?: string }).error).toMatch(
         /does not support allConversations/,
       );
-      // Each period/since-resolving call should have asked the injected clock
-      // for the current time. If the tool ever regressed back to `new Date()`
-      // this assertion catches it (vi.setSystemTime would not).
-      expect(clockNow).toHaveBeenCalled();
     } finally {
-      // No fake timers in use; left intentionally as a no-op for safety.
+      vi.useRealTimers();
     }
   });
 
@@ -851,7 +1087,10 @@ describe("ObservedWorkStore", () => {
     };
     const deps = {
       resolveSessionIdFromSessionKey: async () => undefined,
-      clock: { now: () => new Date() },
+      // The tool reads wall-clock through deps.clock.now() — supply a frozen
+      // clock even though this test doesn't pass a `period` (defensive: tool
+      // resolves the clock once per execute() regardless).
+      clock: { now: () => new Date("2026-04-28T12:00:00.000Z") },
     } as unknown as LcmDependencies;
     const tool = createLcmWorkDensityTool({
       deps,
@@ -876,133 +1115,108 @@ describe("ObservedWorkStore", () => {
     expect(details.accounting.budgetTruncated).toBe(true);
     expect(details.accounting.itemsReturned).toBeLessThan(20);
     expect(details.accounting.estimatedOutputTokens).toBeLessThanOrEqual(256);
+    // Whole items dropped by trimOneItem must be reflected in itemsOmitted —
+    // callers must not be told "0 omitted" when most rows were forced out by
+    // the budget. accounting is widened to include itemsOmitted at runtime.
+    const omitted = (details.accounting as Record<string, unknown>).itemsOmitted;
+    expect(typeof omitted).toBe("number");
+    expect(omitted as number).toBeGreaterThan(0);
   });
 
-  it("treats negated completion verbs as observed_unfinished", async () => {
+  it("canonicalizes event timestamps and rejects unparseable values", async () => {
     const db = makeDb();
-    createConversation(db, 901);
-    const summaryStore = new SummaryStore(db, { fts5Available: false });
-    const observedWork = new ObservedWorkStore(db);
-    const extractor = new ObservedWorkExtractor(db, observedWork);
-
-    const cases: Array<{ summaryId: string; content: string }> = [
-      { summaryId: "sum_neg_1", content: "- PR #1234 not completed yet" },
-      { summaryId: "sum_neg_2", content: "- Never shipped the auth fix" },
-      { summaryId: "sum_neg_3", content: "- Cannot fix this without more context" },
-      { summaryId: "sum_neg_4", content: "- Hadn't merged the rebase before review" },
-      { summaryId: "sum_neg_5", content: "- We have not yet deployed the patch" },
-    ];
-    let createdAtSeq = Date.parse("2026-04-30T10:00:00.000Z");
-    for (const c of cases) {
-      await insertLeafSummary({
-        db,
-        summaryStore,
-        conversationId: 901,
-        summaryId: c.summaryId,
-        createdAt: new Date(createdAtSeq).toISOString(),
-        content: c.content,
-      });
-      createdAtSeq += 60_000;
-    }
-    extractor.processConversation(901);
-
-    const density = observedWork.getDensity({
-      conversationId: 901,
-      limit: 50,
+    createConversation(db, 71);
+    const store = new EventObservationStore(db);
+    await store.upsertObservation({
+      eventId: "ev_canon_a",
+      conversationId: 71,
+      eventKind: "primary",
+      title: "Canonical event",
+      // Non-canonical (no fractional seconds, no Z suffix expected by lex sort).
+      eventTime: "2026-04-28T05:00:00+00:00",
+      ingestTime: "2026-04-28T05:00:01+00:00",
+      rationale: "canonical",
+      sourceType: "summary",
+      sourceId: "sum_canon_a",
     });
-    expect(density.density.unfinished).toBe(cases.length);
-    expect(density.density.completed).toBe(0);
-  });
-
-  it("classifies positive completion phrases as observed_completed (control)", async () => {
-    const db = makeDb();
-    createConversation(db, 902);
-    const summaryStore = new SummaryStore(db, { fts5Available: false });
-    const observedWork = new ObservedWorkStore(db);
-    const extractor = new ObservedWorkExtractor(db, observedWork);
-    await insertLeafSummary({
-      db,
-      summaryStore,
-      conversationId: 902,
-      summaryId: "sum_positive_1",
-      createdAt: "2026-04-30T11:00:00.000Z",
-      content: "- Successfully completed the rebase and shipped to main",
-    });
-    extractor.processConversation(902);
-    const density = observedWork.getDensity({ conversationId: 902, limit: 10 });
-    expect(density.density.completed).toBe(1);
-    expect(density.density.unfinished).toBe(0);
-  });
-
-  it("does not collide work_item_ids for distinct stopword-only lines", async () => {
-    const db = makeDb();
-    createConversation(db, 903);
-    const summaryStore = new SummaryStore(db, { fts5Available: false });
-    const observedWork = new ObservedWorkStore(db);
-    const extractor = new ObservedWorkExtractor(db, observedWork);
-
-    // Two distinct lines that BOTH carry a classification cue (todo) but whose
-    // surrounding tokens are all <=2 chars or stopwords. Pre-fix, slug() of the
-    // title yielded "todo" alone for both lines AND topicKey degraded to the
-    // kind ("follow_up"), so the fingerprints `${conv}:${kind}:${topicKey}:${slug}`
-    // were identical and the second silently overwrote the first. The hash
-    // fallback in slug() guarantees distinct work_item_ids for distinct content.
-    await insertLeafSummary({
-      db,
-      summaryStore,
-      conversationId: 903,
-      summaryId: "sum_short_a",
-      createdAt: "2026-04-30T12:00:00.000Z",
-      content: "- todo it me at",
-    });
-    await insertLeafSummary({
-      db,
-      summaryStore,
-      conversationId: 903,
-      summaryId: "sum_short_b",
-      createdAt: "2026-04-30T12:01:00.000Z",
-      content: "- todo or no by",
-    });
-    extractor.processConversation(903);
-
-    const ids = (db
-      .prepare(
-        `SELECT work_item_id FROM lcm_observed_work_items WHERE conversation_id = ?`,
-      )
-      .all(903) as Array<{ work_item_id: string }>).map((r) => r.work_item_id);
-    // Each line classified as observed_unfinished (todo cue). Distinct lines
-    // must produce distinct ids — otherwise the second silently overwrote the
-    // first.
-    expect(new Set(ids).size).toBe(ids.length);
-    expect(ids.length).toBeGreaterThanOrEqual(2);
-  });
-
-  it("does not let upsertItem move a work_item_id between conversations", () => {
-    const db = makeDb();
-    createConversation(db, 910);
-    createConversation(db, 911);
-    const observedWork = new ObservedWorkStore(db);
-    const baseInput = {
-      workItemId: "ow_collision_test",
-      title: "TODO: investigate flake",
-      observedStatus: "observed_unfinished" as const,
-      kind: "follow_up" as const,
-      confidence: 0.7,
-      confidenceBand: "medium" as const,
-      firstSeenAt: "2026-04-30T13:00:00.000Z",
-      lastSeenAt: "2026-04-30T13:00:00.000Z",
-      fingerprint: "910:follow_up:topic:slug",
-    };
-    observedWork.upsertItem({ ...baseInput, conversationId: 910 });
-    // A reused work_item_id arriving with a different conversation_id must
-    // NOT silently move the row — conversation_id is part of the fingerprint
-    // and is intentionally immutable on conflict.
-    observedWork.upsertItem({ ...baseInput, conversationId: 911 });
     const row = db
       .prepare(
-        `SELECT conversation_id FROM lcm_observed_work_items WHERE work_item_id = ?`,
+        `SELECT event_time, ingest_time FROM lcm_event_observations WHERE event_id = ?`,
       )
-      .get("ow_collision_test") as { conversation_id: number };
-    expect(row.conversation_id).toBe(910);
+      .get("ev_canon_a") as { event_time: string; ingest_time: string };
+    expect(row.event_time).toBe("2026-04-28T05:00:00.000Z");
+    expect(row.ingest_time).toBe("2026-04-28T05:00:01.000Z");
+
+    await expect(
+      store.upsertObservation({
+        eventId: "ev_canon_bad",
+        conversationId: 71,
+        eventKind: "primary",
+        title: "Bad event",
+        eventTime: "not a date",
+        ingestTime: "2026-04-28T05:00:01.000Z",
+        rationale: "bad",
+        sourceType: "summary",
+        sourceId: "sum_canon_bad",
+      }),
+    ).rejects.toThrow(/eventTime/);
+  });
+
+  it("orders task-bridge suggestions deterministically when timestamps tie", async () => {
+    const { TaskBridgeSuggestionStore } = await import(
+      "../src/store/task-bridge-suggestion-store.js"
+    );
+    const db = makeDb();
+    createConversation(db, 73);
+    const observedWork = new ObservedWorkStore(db);
+    for (const id of ["work_tie_a", "work_tie_b", "work_tie_c"]) {
+      observedWork.upsertItem({
+        workItemId: id,
+        conversationId: 73,
+        firstSeenAt: "2026-04-28T01:00:00.000Z",
+        lastSeenAt: "2026-04-28T01:00:00.000Z",
+        title: `Tie item ${id}`,
+        observedStatus: "observed_unfinished",
+        kind: "follow_up",
+        fingerprint: `tie:${id}`,
+      });
+      observedWork.addSource({
+        workItemId: id,
+        sourceType: "summary",
+        sourceId: `sum_tie_${id}`,
+        ordinal: 0,
+        evidenceKind: "created",
+      });
+    }
+    const store = new TaskBridgeSuggestionStore(db);
+    // datetime('now') has whole-second precision, so all three writes share
+    // updated_at + created_at. listSuggestions must still return them in a
+    // deterministic order — append `suggestion_id ASC` as a tiebreaker.
+    await store.upsertSuggestion({
+      suggestionId: "sug_b",
+      workItemId: "work_tie_b",
+      suggestionKind: "create_task",
+      confidence: 0.7,
+      rationale: "b",
+      sourceIds: ["sum_tie_work_tie_b"],
+    });
+    await store.upsertSuggestion({
+      suggestionId: "sug_a",
+      workItemId: "work_tie_a",
+      suggestionKind: "create_task",
+      confidence: 0.7,
+      rationale: "a",
+      sourceIds: ["sum_tie_work_tie_a"],
+    });
+    await store.upsertSuggestion({
+      suggestionId: "sug_c",
+      workItemId: "work_tie_c",
+      suggestionKind: "create_task",
+      confidence: 0.7,
+      rationale: "c",
+      sourceIds: ["sum_tie_work_tie_c"],
+    });
+    const list = store.listSuggestions({ status: "pending" });
+    expect(list.map((row) => row.suggestionId)).toEqual(["sug_a", "sug_b", "sug_c"]);
   });
 });

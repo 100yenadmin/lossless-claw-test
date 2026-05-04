@@ -82,7 +82,7 @@ CREATE TABLE lcm_observed_work_items (
   title TEXT NOT NULL,
   description TEXT,
   observed_status TEXT NOT NULL, -- observed_completed | observed_unfinished | observed_ambiguous | decision_recorded | dismissed
-  kind TEXT NOT NULL, -- implementation | review | blocker | decision | question | follow_up | test | deploy | research | other
+  kind TEXT NOT NULL, -- implementation | review | blocker | decision | question | follow_up | test | deploy | research
   confidence REAL NOT NULL DEFAULT 0.5,
   confidence_band TEXT NOT NULL DEFAULT 'medium',
   rationale TEXT,
@@ -109,7 +109,7 @@ Normalize provenance:
 ```sql
 CREATE TABLE lcm_observed_work_sources (
   work_item_id TEXT NOT NULL,
-  source_type TEXT NOT NULL, -- summary | rollup | message
+  source_type TEXT NOT NULL, -- summary | rollup
   source_id TEXT NOT NULL,
   ordinal INTEGER NOT NULL,
   evidence_kind TEXT NOT NULL, -- created | reinforced | possible_completion | completed | contradicted | dismissed
@@ -137,12 +137,10 @@ Recommended tool: `lcm_work_density`.
 ```ts
 lcm_work_density({
   conversationId?,
-  period?: "today" | "yesterday" | "7d" | "30d" | "week" | "month" | "date:YYYY-MM-DD",
-  since?: string, // explicit ISO timestamp; wins over period
-  before?: string, // explicit ISO timestamp; wins over period
+  period?: "today" | "yesterday" | "7d" | "30d" | "date:YYYY-MM-DD" | string,
   topic?,
-  statuses?: Array<"observed_completed" | "observed_unfinished" | "observed_ambiguous" | "decision_recorded" | "dismissed">,
-  kinds?: Array<"implementation" | "review" | "blocker" | "decision" | "question" | "follow_up" | "test" | "deploy" | "research" | "other">,
+  statuses?: ["observed_completed", "observed_unfinished", "observed_ambiguous", "decision_recorded", "dismissed"],
+  kinds?: string[],
   includeSources?: boolean,
   detailLevel?: 0 | 1 | 2,
   maxOutputTokens?,
@@ -156,28 +154,26 @@ lcm_work_density({
 ```json
 {
   "period": "yesterday",
-  "window": { "since": "2026-04-26T00:00:00.000Z", "before": "2026-04-27T00:00:00.000Z", "timezone": "UTC" },
-  "conversationScope": 12,
   "density": {
     "totalObserved": 18,
     "completed": 11,
     "unfinished": 5,
     "ambiguous": 2,
-    "dismissed": 0,
-    "decisionRecorded": 1
+    "dismissed": 0
   },
   "topUnfinished": [],
   "completedHighlights": [],
   "ambiguous": [],
-  "decisions": [],
-  "dismissedItems": [],
   "accounting": {
+    "outputTokens": 6000,
+    "sourceSummaryTokens": 42000,
+    "sourceMessageTokens": 180000,
     "itemsIncluded": 18,
     "itemsOmitted": 0,
     "truncated": false
   },
-  "confidence": "observed-unrefined",
-  "disclaimer": "Observed from LCM evidence; not authoritative task state.",
+  "confidence": "medium-high",
+  "disclaimer": "Observed from LCM summaries; not authoritative task state.",
   "recommendedDives": []
 }
 ```
@@ -221,19 +217,21 @@ PR16 should implement Option B as the default path:
 
 ---
 
-## Implementation scaffold added in this draft
+## Implementation in this branch
 
-This draft now includes minimal code scaffolding so reviewers can evaluate the proposed shape in-repo instead of reading the architecture in isolation.
+This branch now includes the persistence/read-model, the deterministic extractor, the read-only tool, and supporting test coverage.
 
 Added files:
 
-- `src/store/observed-work-store.ts`
-- `src/tools/lcm-work-density-tool.ts`
-- `test/observed-work-store.test.ts`
+- `src/store/observed-work-store.ts` — persistence + read model
+- `src/store/event-observation-store.ts` — sibling event observation store used by the extractor
+- `src/observed-work-extractor.ts` — deterministic regex/heuristic extractor that fingerprints work items on `(conversation, kind, topic_key)` and writes per-source evidence rows
+- `src/tools/lcm-work-density-tool.ts` — read-only `lcm_work_density` tool
+- `test/observed-work-store.test.ts` — store + extractor + tool coverage
 
-The scaffold intentionally keeps extraction out of scope. It defines the persistence/read-model and the read-only tool contract first. Extraction can be added in a follow-up once maintain-time watermarks and classifier quality are reviewed.
+The extractor runs after each successful leaf-compaction pass (`LcmContextEngine.runObservedWorkExtraction`) on a best-effort basis: failures are logged and swallowed so a flaky extraction pass never aborts a compaction round.
 
-### Current scaffold behavior
+### Current behavior
 
 - Creates observed-work tables idempotently during migration.
 - Stores observed work items, source links, and per-conversation processing state.
@@ -261,9 +259,8 @@ The scaffold intentionally keeps extraction out of scope. It defines the persist
 
 ### Explicitly not implemented yet
 
-- automatic extraction from summaries
-- LLM classification
-- live current-day refresh
-- OpenClaw task bridge writes
+- LLM classification (extraction is regex/heuristic only)
+- live current-day refresh outside compaction passes
+- OpenClaw task bridge writes (suggestions only — see option C)
 - Cortex commitments/open-loop sync
 - cross-conversation default retrieval

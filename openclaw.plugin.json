@@ -12,7 +12,8 @@
       "lcm_expand_query",
       "lcm_recent",
       "lcm_rollup_debug",
-      "lcm_work_density"
+      "lcm_work_density",
+      "lcm_event_search"
     ]
   },
   "uiHints": {
@@ -22,7 +23,7 @@
     },
     "contextThreshold": {
       "label": "Context Threshold",
-      "help": "Fraction of context window that triggers compaction (0.0\u20131.0)"
+      "help": "Fraction of context window that triggers compaction (0.0–1.0)"
     },
     "incrementalMaxDepth": {
       "label": "Incremental Max Depth",
@@ -142,7 +143,7 @@
     },
     "maxAssemblyTokenBudget": {
       "label": "Max Assembly Token Budget",
-      "help": "Hard ceiling for assembly token budget \u2014 caps runtime-provided and fallback budgets. Set for smaller context-window models (e.g., 30000 for 32k models)"
+      "help": "Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. Set for smaller context-window models (e.g., 30000 for 32k models)"
     },
     "summaryMaxOverageFactor": {
       "label": "Summary Max Overage Factor",
@@ -186,7 +187,7 @@
     },
     "cacheAwareCompaction.criticalBudgetPressureRatio": {
       "label": "Critical Budget Pressure Ratio",
-      "help": "Fraction of token budget at which deferred compaction fires regardless of prompt-cache state. Defaults to 0.70 \u2014 set to 1 to disable the override and let cache-aware throttling fully control deferral."
+      "help": "Fraction of token budget at which deferred compaction fires regardless of prompt-cache state. Defaults to 0.70 — set to 1 to disable the override and let cache-aware throttling fully control deferral."
     },
     "dynamicLeafChunkTokens.enabled": {
       "label": "Dynamic Leaf Chunk Tokens",
@@ -218,11 +219,11 @@
     },
     "rollupWeeklyMaxTokens": {
       "label": "Rollup Weekly Max Tokens",
-      "help": "Maximum tokens for weekly rollup content. Default 140000 (\u224820K avg/day \u00d7 7 days)."
+      "help": "Maximum tokens for weekly rollup content. Default 140000 (≈20K avg/day × 7 days)."
     },
     "rollupMonthlyMaxTokens": {
       "label": "Rollup Monthly Max Tokens",
-      "help": "Maximum tokens for monthly rollup content. Default 560000 (\u22484 weeks \u00d7 140K)."
+      "help": "Maximum tokens for monthly rollup content. Default 560000 (≈4 weeks × 140K)."
     },
     "proactiveThresholdCompactionMode": {
       "label": "Proactive Threshold Compaction Mode",
@@ -459,17 +460,10 @@
         "items": {
           "type": "object",
           "properties": {
-            "provider": {
-              "type": "string"
-            },
-            "model": {
-              "type": "string"
-            }
+            "provider": { "type": "string" },
+            "model": { "type": "string" }
           },
-          "required": [
-            "provider",
-            "model"
-          ],
+          "required": ["provider", "model"],
           "additionalProperties": false
         }
       }

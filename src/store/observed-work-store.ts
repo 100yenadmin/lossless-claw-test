@@ -245,20 +245,15 @@ export class ObservedWorkStore {
         -- conflicting reuse must keep the original conversation. Letting it
         -- be overwritten allowed silent cross-conversation moves on collision
         -- (matches PR #20 commit 71ba5c0 hardening).
-        -- Preserve previously-stored optional/provenance fields when the
-        -- incoming row omits them (otherwise partial reprocessing erases data).
+        -- COALESCE for optional/provenance fields preserves prior values when
+        -- partial reprocessing emits NULL. observed_status uses a regression
+        -- CASE so weaker cues (ambiguous/unfinished) cannot regress an item
+        -- that already reached a terminal state.
         owner_id = COALESCE(excluded.owner_id, lcm_observed_work_items.owner_id),
         title = excluded.title,
         description = COALESCE(excluded.description, lcm_observed_work_items.description),
-        -- observed_status conservatively transitions: once an item is marked
-        -- observed_completed, decision_recorded, or dismissed, weaker cues
-        -- (ambiguous/unfinished) must not regress it. Higher-tier states or
-        -- explicit dismissed override anything below.
         observed_status = CASE
-          WHEN lcm_observed_work_items.observed_status = 'dismissed' THEN excluded.observed_status
-          WHEN excluded.observed_status = 'dismissed' THEN excluded.observed_status
-          WHEN lcm_observed_work_items.observed_status IN ('observed_completed', 'decision_recorded')
-            AND excluded.observed_status IN ('observed_unfinished', 'observed_ambiguous')
+          WHEN lcm_observed_work_items.observed_status IN ('observed_completed', 'decision_recorded', 'dismissed')
             THEN lcm_observed_work_items.observed_status
           ELSE excluded.observed_status
         END,
@@ -267,6 +262,9 @@ export class ObservedWorkStore {
         confidence_band = excluded.confidence_band,
         rationale = COALESCE(excluded.rationale, lcm_observed_work_items.rationale),
         topic_key = COALESCE(excluded.topic_key, lcm_observed_work_items.topic_key),
+        -- ISO-8601 Z timestamps sort lexicographically — direct comparisons
+        -- are index-friendly (composite idx on conversation_id, observed_status,
+        -- kind, last_seen_at DESC). julianday() wrappers would force a scan.
         first_seen_at = CASE
           WHEN excluded.first_seen_at < lcm_observed_work_items.first_seen_at
             THEN excluded.first_seen_at
@@ -291,9 +289,11 @@ export class ObservedWorkStore {
             THEN excluded.completion_confidence
           ELSE lcm_observed_work_items.completion_confidence
         END,
-        evidence_count = COALESCE(excluded.evidence_count, lcm_observed_work_items.evidence_count),
-        source_message_count = COALESCE(excluded.source_message_count, lcm_observed_work_items.source_message_count),
-        source_token_count = COALESCE(excluded.source_token_count, lcm_observed_work_items.source_token_count),
+        -- MAX() for monotonically-growing counters: a partial reprocess emitting
+        -- a smaller count must not erase prior accumulation.
+        evidence_count = MAX(excluded.evidence_count, lcm_observed_work_items.evidence_count),
+        source_message_count = MAX(excluded.source_message_count, lcm_observed_work_items.source_message_count),
+        source_token_count = MAX(excluded.source_token_count, lcm_observed_work_items.source_token_count),
         authority_source = COALESCE(excluded.authority_source, lcm_observed_work_items.authority_source),
         sensitivity = COALESCE(excluded.sensitivity, lcm_observed_work_items.sensitivity),
         visibility = COALESCE(excluded.visibility, lcm_observed_work_items.visibility),
@@ -308,7 +308,10 @@ export class ObservedWorkStore {
       item.description ?? null,
       item.observedStatus,
       item.kind,
-      item.confidence ?? 0.5,
+      // Clamp confidence into [0, 1] — DB CHECK constraint would otherwise
+      // throw on out-of-range floats from buggy callers and corrupt the
+      // upsert savepoint mid-batch.
+      Math.min(1, Math.max(0, item.confidence ?? 0.5)),
       item.confidenceBand ?? "medium",
       item.rationale ?? null,
       item.topicKey ?? null,
@@ -316,9 +319,6 @@ export class ObservedWorkStore {
       item.lastSeenAt,
       item.completedAt ?? null,
       item.completionConfidence ?? null,
-      // For NOT-NULL count/provenance columns, fall back to the schema
-      // defaults on initial INSERT; the ON CONFLICT update preserves any
-      // previously-stored larger/non-default value via COALESCE.
       item.evidenceCount ?? 0,
       item.sourceMessageCount ?? 0,
       item.sourceTokenCount ?? 0,
@@ -346,7 +346,14 @@ export class ObservedWorkStore {
     ).run(input.workItemId, input.sourceType, input.sourceId, input.ordinal, input.evidenceKind);
   }
 
-  hasSource(input: {
+  /**
+   * Return true if any row exists for the given (workItem, source) pair,
+   * regardless of evidenceKind. Use this to detect a same-source replay
+   * (e.g. extractor retry on the same summary) so callers can skip
+   * incrementing evidence counts. Intentionally looser than `hasSource`
+   * — `addSource` permits multiple evidenceKind rows per source.
+   */
+  hasSourceFromAnyEvidence(input: {
     workItemId: string;
     sourceType: "summary" | "rollup" | "message";
     sourceId: string;
@@ -362,6 +369,36 @@ export class ObservedWorkStore {
     return row != null;
   }
 
+  hasSource(input: {
+    workItemId: string;
+    sourceType: "summary" | "rollup" | "message";
+    sourceId: string;
+    evidenceKind:
+      | "created"
+      | "reinforced"
+      | "possible_completion"
+      | "completed"
+      | "contradicted"
+      | "dismissed";
+  }): boolean {
+    // Match the (work_item_id, source_type, source_id, evidence_kind) primary
+    // key of `lcm_observed_work_sources` — addSource() permits multiple rows
+    // for the same source when evidenceKind differs (e.g. "created" later
+    // promoted to "completed"), so a duplicate-guard that ignored evidence_kind
+    // would silently drop later completed/contradicted evidence from the same
+    // source.
+    const row = this.db.prepare(
+      `SELECT 1 AS found
+       FROM lcm_observed_work_sources
+       WHERE work_item_id = ?
+         AND source_type = ?
+         AND source_id = ?
+         AND evidence_kind = ?
+       LIMIT 1`,
+    ).get(input.workItemId, input.sourceType, input.sourceId, input.evidenceKind);
+    return row != null;
+  }
+
   upsertState(input: {
     conversationId: number;
     lastProcessedSummaryCreatedAt?: string;
@@ -369,6 +406,23 @@ export class ObservedWorkStore {
     lastProcessedSummaryRowid?: number;
     pendingRebuild?: boolean;
   }): void {
+    // The processed-summary cursor is one logical checkpoint composed of
+    // (createdAt, id, rowid). Persisting any subset risks a mixed cursor
+    // referencing two different summaries, which silently breaks incremental
+    // resume — the next pass would skip rows belonging to the partially-
+    // updated summary or replay rows from the older one. Fail fast unless
+    // all three are supplied together (or none, when only `pendingRebuild`
+    // is being toggled).
+    const cursorFieldsProvided = [
+      input.lastProcessedSummaryCreatedAt,
+      input.lastProcessedSummaryId,
+      input.lastProcessedSummaryRowid,
+    ].filter((value) => value != null).length;
+    if (cursorFieldsProvided !== 0 && cursorFieldsProvided !== 3) {
+      throw new Error(
+        "lastProcessedSummaryCreatedAt, lastProcessedSummaryId, and lastProcessedSummaryRowid must all be provided together or all omitted.",
+      );
+    }
     const pendingRebuild =
       input.pendingRebuild == null ? null : input.pendingRebuild ? 1 : 0;
     this.db.prepare(
@@ -434,18 +488,28 @@ export class ObservedWorkStore {
   }
 
   getDensity(query: ObservedWorkDensityQuery): ObservedWorkDensityResult {
-    const where: string[] = [];
+    const where: string[] = [
+      `EXISTS (
+        SELECT 1
+        FROM lcm_observed_work_sources src
+        WHERE src.work_item_id = lcm_observed_work_items.work_item_id
+      )`,
+    ];
     const args: SQLInputValue[] = [];
     if (query.conversationId != null) {
       where.push("conversation_id = ?");
       args.push(query.conversationId);
     }
     if (query.since) {
-      where.push("julianday(last_seen_at) >= julianday(?)");
+      // Direct ISO 8601 comparison — sorts lexicographically and uses indexes
+      // on last_seen_at; julianday() wrappers would force a full scan.
+      where.push("last_seen_at >= ?");
       args.push(query.since);
     }
     if (query.before) {
-      where.push("julianday(first_seen_at) < julianday(?)");
+      // Direct ISO 8601 comparison — sortable lexicographically; avoids
+      // wrapping first_seen_at in julianday() which would defeat the index.
+      where.push("first_seen_at < ?");
       args.push(query.before);
     }
     if (query.statuses?.length) {
@@ -466,7 +530,7 @@ export class ObservedWorkStore {
     }
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const limit = Math.max(1, Math.min(query.limit ?? 10, 50));
-    const ambiguousLimit = Math.min(limit, 10);
+    const ambiguousLimit = limit;
     const counts = this.db.prepare(
       `SELECT
          COUNT(*) AS total_observed,

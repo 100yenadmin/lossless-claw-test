@@ -70,6 +70,8 @@ import {
   type MessagePartRecord,
   type MessagePartType,
 } from "./store/conversation-store.js";
+import { ObservedWorkExtractor } from "./observed-work-extractor.js";
+import { EventObservationStore } from "./store/event-observation-store.js";
 import { ObservedWorkStore } from "./store/observed-work-store.js";
 import { RollupStore } from "./store/rollup-store.js";
 import { SummaryStore } from "./store/summary-store.js";
@@ -1825,6 +1827,7 @@ function messageContentCoveredBySummary(params: {
   return false;
 }
 
+
 const MAX_ROLLUP_MAINTENANCE_DAYS_BACK = 30;
 
 function computeRollupMaintenanceDaysBack(
@@ -1869,7 +1872,9 @@ export class LcmContextEngine implements ContextEngine {
   private summaryStore: SummaryStore;
   private compactionTelemetryStore: CompactionTelemetryStore;
   private compactionMaintenanceStore: CompactionMaintenanceStore;
+  private eventObservationStore: EventObservationStore;
   private observedWorkStore: ObservedWorkStore;
+  private observedWorkExtractor: ObservedWorkExtractor;
   private rollupStore: RollupStore;
   private rollupBuilder: RollupBuilder;
   private assembler: ContextAssembler;
@@ -1996,7 +2001,13 @@ export class LcmContextEngine implements ContextEngine {
     this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
     this.compactionTelemetryStore = new CompactionTelemetryStore(this.db);
     this.compactionMaintenanceStore = new CompactionMaintenanceStore(this.db);
+    this.eventObservationStore = new EventObservationStore(this.db);
     this.observedWorkStore = new ObservedWorkStore(this.db);
+    this.observedWorkExtractor = new ObservedWorkExtractor(
+      this.db,
+      this.observedWorkStore,
+      this.eventObservationStore,
+    );
     this.rollupStore = new RollupStore(this.db);
     this.rollupBuilder = new RollupBuilder(this.rollupStore, {
       timezone: this.timezone,
@@ -2004,7 +2015,6 @@ export class LcmContextEngine implements ContextEngine {
       weeklyMaxTokens: this.config.rollupWeeklyMaxTokens,
       monthlyMaxTokens: this.config.rollupMonthlyMaxTokens,
     });
-    this.observedWorkStore = new ObservedWorkStore(this.db);
 
     if (!this.fts5Available) {
       this.deps.log.warn(
@@ -7187,6 +7197,12 @@ export class LcmContextEngine implements ContextEngine {
         activityBand: params.activityBand,
       });
       this.clearStableOrphanStrippingOrdinal(params.conversationId);
+      // Run observed-work + event-observation extraction immediately after
+      // each successful leaf-compaction pass so the read tools (lcm_work_density,
+      // lcm_event_search) reflect newly-persisted summaries. Failures here are
+      // logged and swallowed: extraction is best-effort and must never block the
+      // compaction round-trip.
+      await this.runObservedWorkExtraction(params.conversationId);
     }
 
     const tokensBefore = observedTokens ?? storedTokensBefore;
@@ -8018,6 +8034,30 @@ export class LcmContextEngine implements ContextEngine {
   getObservedWorkStore(): ObservedWorkStore {
     return this.observedWorkStore;
   }
+
+  /**
+   * Run observed-work + event-observation extraction over any newly-persisted
+   * leaf summaries. Best-effort — errors are logged and swallowed so a flaky
+   * extraction pass never aborts a compaction round.
+   */
+  private async runObservedWorkExtraction(conversationId: number): Promise<void> {
+    try {
+      await this.observedWorkExtractor.processConversation(conversationId);
+    } catch (error) {
+      this.deps.log.warn(
+        `[lcm] observed-work extraction failed for conversation ${conversationId}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  getObservedWorkExtractor(): ObservedWorkExtractor {
+    return this.observedWorkExtractor;
+  }
+
+  getEventObservationStore(): EventObservationStore {
+    return this.eventObservationStore;
+  }
+
 
   getRollupStore(): RollupStore {
     return this.rollupStore;

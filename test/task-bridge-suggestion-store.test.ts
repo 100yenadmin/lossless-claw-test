@@ -124,7 +124,7 @@ describe("TaskBridgeSuggestionStore", () => {
       store.reviewSuggestion({
         suggestionId: "sug_2",
         status: "accepted",
-        reviewedBy: "tester",
+        reviewedBy: " tester ",
       })
     ).toBe(true);
 
@@ -195,6 +195,42 @@ describe("TaskBridgeSuggestionStore", () => {
       status: "accepted",
       reviewedBy: "tester",
     });
+  });
+
+  it("orders refreshed pending suggestions by updated time", async () => {
+    const db = makeDb();
+    createObservedWorkItem(db, "work_order", ["sum_order"]);
+    const store = new TaskBridgeSuggestionStore(db);
+
+    expect(await store.upsertSuggestion({
+      suggestionId: "sug_old",
+      workItemId: "work_order",
+      suggestionKind: "create_task",
+      confidence: 0.7,
+      rationale: "Older suggestion.",
+      sourceIds: ["sum_order"],
+    })).toBe("inserted");
+    expect(await store.upsertSuggestion({
+      suggestionId: "sug_refreshed",
+      workItemId: "work_order",
+      suggestionKind: "create_task",
+      confidence: 0.8,
+      rationale: "Initial refreshed suggestion.",
+      sourceIds: ["sum_order"],
+    })).toBe("inserted");
+    db.prepare(
+      `UPDATE lcm_task_bridge_suggestions
+       SET created_at = ?, updated_at = ?
+       WHERE suggestion_id = ?`
+    ).run("2026-04-28T01:00:00.000Z", "2026-04-28T01:00:00.000Z", "sug_old");
+    db.prepare(
+      `UPDATE lcm_task_bridge_suggestions
+       SET created_at = ?, updated_at = ?
+       WHERE suggestion_id = ?`
+    ).run("2026-04-28T00:00:00.000Z", "2026-04-28T02:00:00.000Z", "sug_refreshed");
+
+    expect(store.listSuggestions({ status: "pending" }).map((item) => item.suggestionId))
+      .toEqual(["sug_refreshed", "sug_old"]);
   });
 
   it("rejects invalid suggestion records and reports missing review targets", async () => {
@@ -290,5 +326,43 @@ describe("TaskBridgeSuggestionStore", () => {
         reviewedBy: "tester",
       })
     ).toBe(false);
+  });
+
+  it("clears task_id when a refresh changes a pending suggestion to a non-task-targeting kind", async () => {
+    const db = makeDb();
+    createObservedWorkItem(db, "work_clear_task_id", ["sum_clear_1"]);
+    const store = new TaskBridgeSuggestionStore(db);
+
+    // First write — task-targeting kind, task_id required.
+    await store.upsertSuggestion({
+      suggestionId: "sug_change_kind",
+      workItemId: "work_clear_task_id",
+      taskId: "task_orig",
+      suggestionKind: "link_task",
+      confidence: 0.8,
+      rationale: "link to task",
+      sourceIds: ["sum_clear_1"],
+    });
+    const beforeRows = store.listSuggestions({ workItemId: "work_clear_task_id" });
+    expect(beforeRows[0]?.taskId).toBe("task_orig");
+
+    // Refresh as create_task — must clear task_id, not COALESCE the old value.
+    // Otherwise listSuggestions({ taskId: "task_orig" }) would still surface
+    // this row even though the refreshed kind no longer targets that task.
+    await store.upsertSuggestion({
+      suggestionId: "sug_change_kind",
+      workItemId: "work_clear_task_id",
+      suggestionKind: "create_task",
+      confidence: 0.85,
+      rationale: "now a create-task suggestion",
+      sourceIds: ["sum_clear_1"],
+    });
+    const afterRows = store.listSuggestions({ workItemId: "work_clear_task_id" });
+    expect(afterRows[0]?.suggestionKind).toBe("create_task");
+    expect(afterRows[0]?.taskId).toBeUndefined();
+
+    // Listing by the original taskId no longer returns this suggestion.
+    const byOldTask = store.listSuggestions({ taskId: "task_orig" });
+    expect(byOldTask.find((row) => row.suggestionId === "sug_change_kind")).toBeUndefined();
   });
 });

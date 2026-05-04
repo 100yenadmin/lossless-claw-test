@@ -1,11 +1,16 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
+import { withDatabaseTransaction } from "./transaction-mutex.js";
 import type {
   ObservedWorkKind,
   ObservedWorkItemSnapshot,
   ObservedWorkStatus,
   ObservedWorkStore,
 } from "./store/observed-work-store.js";
+import type {
+  EventObservationKind,
+  EventObservationStore,
+} from "./store/event-observation-store.js";
 
 type LeafSummaryRow = {
   summary_rowid: number;
@@ -22,6 +27,7 @@ type LeafSummaryRow = {
 export type ObservedWorkExtractionResult = {
   summariesScanned: number;
   workItemsUpserted: number;
+  eventsUpserted: number;
 };
 
 type WorkCandidate = {
@@ -36,6 +42,14 @@ type WorkCandidate = {
   completed: boolean;
 };
 
+type EventCandidate = {
+  eventKind: EventObservationKind;
+  title: string;
+  queryKey: string;
+  confidence: number;
+  rationale: string;
+};
+
 type PendingObservedWork = {
   row: LeafSummaryRow;
   observedAt: string;
@@ -45,16 +59,26 @@ type PendingObservedWork = {
   workItemId: string;
 };
 
+type PendingEventObservation = {
+  eventId: string;
+  row: LeafSummaryRow;
+  observedAt: string;
+  createdAt: string;
+  event: EventCandidate;
+};
+
 const COMPLETED_RE = /\b(completed|done|fixed|implemented|merged|shipped|landed|passed|green|resolved|closed|deployed|released|built|integrated)\b/i;
 const UNFINISHED_RE = /\b(todo|follow[- ]?up|needs?|remaining|blocked|blocker|failing|failed|pending|unresolved|changes requested|not done|regression|risk)\b/i;
+const DECISION_RE = /\b(decision|decided|agreed|settled|approved|chose)\b/i;
+const AMBIGUOUS_RE = /\b(unclear|ambiguous|maybe|suspect|investigate|verify|question|unknown|possibly)\b/i;
 // Detects a negation token immediately preceding a completion verb (with optional
 // adverb/auxiliary in between, e.g. "not yet completed", "have not merged").
 // Without this, COMPLETED_RE matches "PR not completed yet" and classifyWork
 // would record observed_completed for the OPPOSITE meaning.
 const NEGATED_COMPLETION_RE = /\b(not|never|no\s+longer|hasn't|haven't|hadn't|isn't|aren't|wasn't|weren't|doesn't|don't|didn't|cannot|can't|won't|wouldn't|shouldn't|couldn't|stopped|aborted|abandoned|cancelled|canceled)\b(?:\s+(?:yet|been|have|has|had|ever|able\s+to|going\s+to|managed\s+to|quite|fully|really|just))*\s+(completed|complete|done|fixed|fix|implemented|implement|merged|merge|shipped|ship|landed|land|passed|pass|resolved|resolve|closed|close|deployed|deploy|released|release|built|build|integrated|integrate)\b/i;
-const DECISION_RE = /\b(decision|decided|agreed|settled|approved|chose)\b/i;
+// Same pattern for decisions: "not yet decided", "haven't agreed".
 const NEGATED_DECISION_RE = /\b(not|never|no\s+longer|hasn't|haven't|hadn't|isn't|aren't|wasn't|weren't|doesn't|don't|didn't|cannot|can't|won't|wouldn't|shouldn't|couldn't)\b(?:\s+(?:yet|been|have|has|had|ever))*\s+(decided|agreed|settled|approved|chose)\b/i;
-const AMBIGUOUS_RE = /\b(unclear|ambiguous|maybe|suspect|investigate|verify|question|unknown|possibly)\b/i;
+const EVENT_RE = /\b(first occurrence|original event|started|created|opened|reported|incident|restart|deploy|error|failed|merged|shipped|decision|retell|recalled|cortex|memory injection|imported|backfill|historical|echo)\b/i;
 
 function hashId(prefix: string, value: string): string {
   return `${prefix}_${createHash("sha256").update(value).digest("hex").slice(0, 24)}`;
@@ -194,6 +218,39 @@ function classifyWork(line: string): WorkCandidate | null {
   };
 }
 
+function classifyEvent(line: string): EventCandidate | null {
+  if (!EVENT_RE.test(line)) {
+    return null;
+  }
+  // Negation guard: "deploy not started", "never shipped", "didn't fail" should
+  // not fabricate a primary/incident event. Only the explicit retelling/memory
+  // cues survive negation (a negated retelling is still a retelling event).
+  if (NEGATED_COMPLETION_RE.test(line)) {
+    return null;
+  }
+  let eventKind: EventObservationKind = "primary";
+  if (/\b(retell|retold|recalled|mentioned again)\b/i.test(line)) eventKind = "retelling";
+  else if (/\b(memory injection|injected memory)\b/i.test(line)) eventKind = "memory_injection";
+  else if (/\b(imported|backfill|historical)\b/i.test(line)) eventKind = "imported";
+  else if (/\b(echo|dream|reference)\b/i.test(line)) eventKind = "echo";
+  else if (/\b(incident|root cause|restart|error|failed|failure|failing|outage|blocked)\b/i.test(line)) eventKind = "operational_incident";
+  else if (/\bcortex\b/i.test(line)) eventKind = "memory_injection";
+  else if (DECISION_RE.test(line)) eventKind = "decision";
+  const confidence =
+    eventKind === "primary" || eventKind === "decision"
+      ? 0.72
+      : eventKind === "operational_incident"
+        ? 0.76
+        : 0.62;
+  return {
+    eventKind,
+    title: truncate(line, 140),
+    queryKey: topicKeyFor(line, eventKind === "decision" ? "decision" : "other"),
+    confidence,
+    rationale: "Observed event cue from a leaf summary; event time is evidence time, not necessarily original occurrence time.",
+  };
+}
+
 function extractLines(content: string): string[] {
   const lines = content
     .split(/\r?\n/)
@@ -212,30 +269,43 @@ export class ObservedWorkExtractor {
   constructor(
     private readonly db: DatabaseSync,
     private readonly observedWorkStore: ObservedWorkStore,
+    private readonly eventObservationStore?: EventObservationStore,
   ) {}
 
-  processConversation(
+  async processConversation(
     conversationId: number,
     options?: { limit?: number },
-  ): ObservedWorkExtractionResult {
+  ): Promise<ObservedWorkExtractionResult> {
     const state = this.observedWorkStore.getState(conversationId);
     const limit = Math.max(1, Math.min(options?.limit ?? 200, 1000));
     const rows = this.listUnprocessedLeafSummaries(conversationId, state, limit);
     let workItemsUpserted = 0;
+    let eventsUpserted = 0;
     const pendingRows: Array<{
       row: LeafSummaryRow;
       entries: PendingObservedWork[];
+      events: PendingEventObservation[];
     }> = [];
     const workItemIds = new Set<string>();
 
     for (const row of rows) {
       const observedAt = toIso(row.effective_at ?? row.created_at);
+      const createdAt = toIso(row.created_at);
       const entries: PendingObservedWork[] = [];
+      const events: PendingEventObservation[] = [];
       let ordinal = 0;
       for (const line of extractLines(row.content)) {
         const work = classifyWork(line);
         if (work) {
-          const fingerprint = `${conversationId}:${work.kind}:${work.topicKey}:${slug(work.title)}`;
+          // Fingerprint on (conversation, kind, topicKey) only. Earlier drafts
+          // also folded `slug(work.title)` into the key, but that fragmented
+          // the same underlying item whenever later summaries rephrased it
+          // (e.g. two summaries about the same PR with different wording
+          // would mint two work_item_ids and inflate density counts). The
+          // topicKey already carries the discriminating signal — PR number,
+          // file path, or a stable line slug as fallback — so identical
+          // (conversation, kind, topicKey) tuples should reinforce one row.
+          const fingerprint = `${conversationId}:${work.kind}:${work.topicKey}`;
           const workItemId = hashId("ow", fingerprint);
           entries.push({
             row,
@@ -247,9 +317,20 @@ export class ObservedWorkExtractor {
           });
           workItemIds.add(workItemId);
         }
+        const event = classifyEvent(line);
+        if (event && this.eventObservationStore) {
+          const eventId = hashId("ev", `${conversationId}:${row.summary_id}:${ordinal}:${event.eventKind}:${event.title}`);
+          events.push({
+            eventId,
+            row,
+            observedAt,
+            createdAt,
+            event,
+          });
+        }
         ordinal += 1;
       }
-      pendingRows.push({ row, entries });
+      pendingRows.push({ row, entries, events });
     }
 
     const existingByWorkItemId = this.loadExistingItems([...workItemIds]);
@@ -261,13 +342,52 @@ export class ObservedWorkExtractor {
 
     for (const pendingRow of pendingRows) {
       let rowWorkItemsUpserted = 0;
-      this.withSummarySavepoint(pendingRow.row.summary_rowid, () => {
+      let rowEventsUpserted = 0;
+      // Wrap the per-summary savepoint in `withDatabaseTransaction` so a
+      // nested `eventObservationStore.upsertObservation` (which also routes
+      // through `withDatabaseTransaction`) reuses the held lock and isolates
+      // its work via a savepoint instead of attempting a fresh BEGIN
+      // (which would throw "cannot start a transaction within a transaction").
+      await withDatabaseTransaction(this.db, "BEGIN IMMEDIATE", async () => {
+        for (const entry of pendingRow.events) {
+          await this.eventObservationStore?.upsertObservation({
+            eventId: entry.eventId,
+            conversationId,
+            eventKind: entry.event.eventKind,
+            title: entry.event.title,
+            queryKey: entry.event.queryKey,
+            eventTime: entry.observedAt,
+            ingestTime: entry.createdAt,
+            confidence: entry.event.confidence,
+            rationale: entry.event.rationale,
+            sourceType: "summary",
+            sourceId: entry.row.summary_id,
+            sourceIds: [entry.row.summary_id],
+          });
+          rowEventsUpserted += 1;
+        }
         for (const entry of pendingRow.entries) {
           const existing = existingByWorkItemId.get(entry.workItemId);
-          const sourceAlreadyRecorded = this.observedWorkStore.hasSource({
+          const evidenceKind = evidenceKindFor(existing, entry.work);
+          // For same-source replay detection (extractor retry on the same
+          // summary) we want a loose match — any prior evidence row for
+          // (workItem, summary) means we already counted this source and
+          // must not increment evidenceCount even if `evidenceKindFor`
+          // would promote "created" → "reinforced" the second time.
+          const sourceAlreadyRecorded = this.observedWorkStore.hasSourceFromAnyEvidence({
             workItemId: entry.workItemId,
             sourceType: "summary",
             sourceId: entry.row.summary_id,
+          });
+          // The strict (workItem, source, evidenceKind) check decides whether
+          // we should write an additional evidence row for a NEW evidenceKind
+          // on the same source — e.g. a later summary completes a previously
+          // "created" item from the same source row.
+          const exactEvidenceAlreadyRecorded = this.observedWorkStore.hasSource({
+            workItemId: entry.workItemId,
+            sourceType: "summary",
+            sourceId: entry.row.summary_id,
+            evidenceKind,
           });
           const evidenceCount =
             (existing?.evidenceCount ?? 0) + (sourceAlreadyRecorded ? 0 : 1);
@@ -297,13 +417,19 @@ export class ObservedWorkExtractor {
             fingerprint: entry.fingerprint,
             fingerprintVersion: 3,
           });
-          if (!sourceAlreadyRecorded) {
+          // Same-source replay (extractor retry on the same summary) is
+          // idempotent — if any evidence row already exists for this
+          // (workItem, source), skip the write even when evidenceKindFor()
+          // would have promoted "created" to "reinforced". Two evidence
+          // rows for the same source would over-state how much independent
+          // evidence we have for this item.
+          if (!sourceAlreadyRecorded && !exactEvidenceAlreadyRecorded) {
             this.observedWorkStore.addSource({
               workItemId: entry.workItemId,
               sourceType: "summary",
               sourceId: entry.row.summary_id,
               ordinal: entry.ordinal,
-              evidenceKind: evidenceKindFor(existing, entry.work),
+              evidenceKind,
             });
           }
           existingByWorkItemId.set(entry.workItemId, {
@@ -325,10 +451,12 @@ export class ObservedWorkExtractor {
         });
       });
       workItemsUpserted += rowWorkItemsUpserted;
+      eventsUpserted += rowEventsUpserted;
     }
     return {
       summariesScanned: rows.length,
       workItemsUpserted,
+      eventsUpserted,
     };
   }
 
@@ -386,8 +514,11 @@ export class ObservedWorkExtractor {
       where.push("s.rowid > ?");
       args.push(cursorRowid);
     } else if (state?.lastProcessedSummaryCreatedAt) {
+      // ISO-8601 timestamps sort lexicographically; avoid julianday() so we
+      // keep the (created_at, summary_id) index-friendly and consistent with
+      // the rest of the LCM cursor comparators (Wave 1 fix).
       where.push(
-        `(julianday(s.created_at) > julianday(?) OR (julianday(s.created_at) = julianday(?) AND s.summary_id > ?))`,
+        `(s.created_at > ? OR (s.created_at = ? AND s.summary_id > ?))`,
       );
       args.push(
         state.lastProcessedSummaryCreatedAt,
@@ -427,17 +558,4 @@ export class ObservedWorkExtractor {
     return row?.summary_rowid;
   }
 
-  private withSummarySavepoint<T>(summaryRowid: number, fn: () => T): T {
-    const savepoint = `lcm_observed_work_summary_${Math.max(0, Math.trunc(summaryRowid))}`;
-    this.db.exec(`SAVEPOINT ${savepoint}`);
-    try {
-      const result = fn();
-      this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
-      return result;
-    } catch (error) {
-      this.db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
-      this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
-      throw error;
-    }
-  }
 }

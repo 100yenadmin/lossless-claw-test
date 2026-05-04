@@ -1,0 +1,282 @@
+import type { DatabaseSync } from "node:sqlite";
+import { withDatabaseTransaction } from "../transaction-mutex.js";
+
+export type EventObservationKind =
+  | "primary"
+  | "retelling"
+  | "memory_injection"
+  | "echo"
+  | "imported"
+  | "operational_incident"
+  | "decision";
+
+export type EventObservationInput = {
+  eventId: string;
+  conversationId: number;
+  eventKind: EventObservationKind;
+  title: string;
+  description?: string;
+  queryKey?: string;
+  eventTime?: string;
+  ingestTime: string;
+  confidence?: number;
+  rationale: string;
+  sourceType: "summary" | "rollup" | "message";
+  sourceId: string;
+  sourceIds?: string[];
+};
+
+export type EventObservation = {
+  eventId: string;
+  conversationId: number;
+  eventKind: EventObservationKind;
+  title: string;
+  description?: string;
+  queryKey?: string;
+  eventTime?: string;
+  ingestTime: string;
+  confidence: number;
+  rationale: string;
+  sources?: Array<{ sourceType: "summary" | "rollup" | "message"; sourceId: string }>;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type EventObservationRow = {
+  event_id: string;
+  conversation_id: number;
+  event_kind: EventObservationKind;
+  title: string;
+  description: string | null;
+  query_key: string | null;
+  event_time: string | null;
+  ingest_time: string;
+  confidence: number;
+  rationale: string;
+  source_type: "summary" | "rollup" | "message";
+  source_id: string;
+  source_ids: string;
+  created_at: string;
+  updated_at: string;
+};
+
+function placeholders(values: readonly unknown[]): string {
+  return values.map(() => "?").join(", ");
+}
+
+function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, (part) => `\\${part}`);
+}
+
+const MAX_EVENT_SOURCE_IDS = 50;
+
+function normalizeSourceIds(sourceIds: string[] | undefined, fallbackSourceId: string): string[] {
+  return [
+    ...new Set(
+      [fallbackSourceId, ...(sourceIds ?? [])]
+        .map((sourceId) => sourceId.trim())
+        .filter((sourceId) => sourceId.length > 0)
+    ),
+  ];
+}
+
+function canonicalizeIsoTimestamp(value: string | undefined, field: string): string | null {
+  if (value == null) {
+    return null;
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error(`${field} must be a valid ISO-8601 timestamp.`);
+  }
+  return parsed.toISOString();
+}
+
+function normalizeQueryKey(value: string | undefined): string | null {
+  const normalized = value?.trim().toLowerCase().replace(/\s+/g, " ");
+  if (!normalized) {
+    return null;
+  }
+  const pr =
+    /^(?:pr|pull request)\s*#?\s*(\d{1,6})$/.exec(normalized) ??
+    /^pr[-\s#]*(\d{1,6})$/.exec(normalized) ??
+    /(?:^|\/)pull\/(\d{1,6})(?:\b|$)/.exec(normalized);
+  if (pr?.[1]) {
+    return `pr-${pr[1]}`;
+  }
+  return normalized;
+}
+
+function parseSourceIds(raw: string, sourceType: "summary" | "rollup" | "message"): Array<{
+  sourceType: "summary" | "rollup" | "message";
+  sourceId: string;
+}> {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed
+      .filter((sourceId): sourceId is string => typeof sourceId === "string" && sourceId.trim().length > 0)
+      .map((sourceId) => ({ sourceType, sourceId }));
+  } catch {
+    return [];
+  }
+}
+
+function rowToEvent(row: EventObservationRow, includeSources: boolean): EventObservation {
+  return {
+    eventId: row.event_id,
+    conversationId: row.conversation_id,
+    eventKind: row.event_kind,
+    title: row.title,
+    ...(row.description ? { description: row.description } : {}),
+    ...(row.query_key ? { queryKey: row.query_key } : {}),
+    ...(row.event_time ? { eventTime: row.event_time } : {}),
+    ingestTime: row.ingest_time,
+    confidence: row.confidence,
+    rationale: row.rationale,
+    ...(includeSources
+      ? { sources: parseSourceIds(row.source_ids, row.source_type) }
+      : {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export class EventObservationStore {
+  constructor(private readonly db: DatabaseSync) {}
+
+  async upsertObservation(input: EventObservationInput): Promise<void> {
+    if (!Number.isFinite(input.confidence ?? 0.5) || (input.confidence ?? 0.5) < 0 || (input.confidence ?? 0.5) > 1) {
+      throw new Error("confidence must be between 0 and 1.");
+    }
+    if (input.title.trim().length === 0) {
+      throw new Error("event title is required.");
+    }
+    if (input.rationale.trim().length === 0) {
+      throw new Error("event rationale is required.");
+    }
+    const sourceId = input.sourceId.trim();
+    if (sourceId.length === 0) {
+      throw new Error("event source ID is required.");
+    }
+    const sourceIds = normalizeSourceIds(input.sourceIds, sourceId);
+    if (sourceIds.length > MAX_EVENT_SOURCE_IDS) {
+      throw new Error(
+        `sourceIds must not exceed ${MAX_EVENT_SOURCE_IDS} entries (received ${sourceIds.length}).`
+      );
+    }
+    // Range filtering and ordering downstream use lexicographic comparisons on
+    // `coalesce(event_time, ingest_time)`. Persist canonical ISO-8601 UTC so
+    // a non-canonical caller can't sort outside its real window or evade
+    // since/before filters; reject unparseable timestamps loudly.
+    const eventTime = canonicalizeIsoTimestamp(input.eventTime, "eventTime");
+    const ingestTime = canonicalizeIsoTimestamp(input.ingestTime, "ingestTime");
+    if (ingestTime == null) {
+      throw new Error("ingestTime is required.");
+    }
+    // Route through `withDatabaseTransaction` so concurrent callers serialize
+    // on the per-DB async mutex (issue #260). When invoked from inside an
+    // outer transaction (e.g. ObservedWorkExtractor's processConversation),
+    // this function reuses the held lock and wraps the upsert in a savepoint
+    // — which is required because a raw `BEGIN IMMEDIATE` here would throw
+    // with "cannot start a transaction within a transaction".
+    await withDatabaseTransaction(this.db, "BEGIN IMMEDIATE", () => {
+      this.db.prepare(
+        `INSERT INTO lcm_event_observations (
+          event_id, conversation_id, event_kind, title, description, query_key,
+          event_time, ingest_time, confidence, rationale, source_type, source_id,
+          source_ids, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(event_id) DO UPDATE SET
+          conversation_id = excluded.conversation_id,
+          event_kind = excluded.event_kind,
+          title = excluded.title,
+          description = excluded.description,
+          query_key = excluded.query_key,
+          event_time = excluded.event_time,
+          ingest_time = excluded.ingest_time,
+          confidence = excluded.confidence,
+          rationale = excluded.rationale,
+          source_type = excluded.source_type,
+          source_id = excluded.source_id,
+          source_ids = excluded.source_ids,
+          updated_at = datetime('now')`,
+      ).run(
+        input.eventId,
+        input.conversationId,
+        input.eventKind,
+        input.title.trim(),
+        input.description?.trim() || null,
+        normalizeQueryKey(input.queryKey),
+        eventTime,
+        ingestTime,
+        input.confidence ?? 0.5,
+        input.rationale.trim(),
+        input.sourceType,
+        sourceId,
+        JSON.stringify(sourceIds),
+      );
+    });
+  }
+
+  listObservations(input?: {
+    conversationId?: number;
+    eventKinds?: EventObservationKind[];
+    query?: string;
+    since?: string;
+    before?: string;
+    first?: boolean;
+    includeSources?: boolean;
+    limit?: number;
+  }): EventObservation[] {
+    const where: string[] = [];
+    const args: Array<string | number> = [];
+    if (input?.conversationId != null) {
+      where.push("conversation_id = ?");
+      args.push(input.conversationId);
+    }
+    if (input?.eventKinds?.length) {
+      where.push(`event_kind IN (${placeholders(input.eventKinds)})`);
+      args.push(...input.eventKinds);
+    }
+    const query = normalizeQueryKey(input?.query);
+    if (query) {
+      const likeQuery = `%${escapeLikePattern(query)}%`;
+      // INVARIANT: query_key is stored already lowercased+normalized via
+      // normalizeQueryKey() at insert time (see insertObservation). So we
+      // compare directly against the column rather than wrapping in
+      // lower(coalesce(...)) — that wrapper would prevent SQLite from
+      // using lcm_event_observations_query_time_idx and force a scan.
+      //
+      // The title/description LIKE clauses are inherently full-scan, but
+      // their cost is bounded by the time-window filters (since/before)
+      // appended below, which select on (event_time, ingest_time).
+      where.push(
+        "(query_key = ? OR lower(title) LIKE ? ESCAPE '\\' OR lower(coalesce(description, '')) LIKE ? ESCAPE '\\')"
+      );
+      args.push(query, likeQuery, likeQuery);
+    }
+    if (input?.since) {
+      where.push("coalesce(event_time, ingest_time) >= ?");
+      args.push(input.since);
+    }
+    if (input?.before) {
+      where.push("coalesce(event_time, ingest_time) < ?");
+      args.push(input.before);
+    }
+    const limit = Math.max(1, Math.min(input?.limit ?? 20, 100));
+    const order = input?.first ? "ASC" : "DESC";
+    const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    const rows = this.db.prepare(
+      `SELECT event_id, conversation_id, event_kind, title, description, query_key,
+              event_time, ingest_time, confidence, rationale, source_type, source_id,
+              source_ids, created_at, updated_at
+       FROM lcm_event_observations
+       ${whereSql}
+       ORDER BY coalesce(event_time, ingest_time) ${order}, confidence DESC, event_id ASC
+       LIMIT ?`,
+    ).all(...args, limit) as EventObservationRow[];
+    return rows.map((row) => rowToEvent(row, input?.includeSources === true));
+  }
+}
