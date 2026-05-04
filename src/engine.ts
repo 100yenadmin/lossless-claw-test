@@ -21,6 +21,7 @@ import {
   blockFromPart,
   contentFromParts,
   ContextAssembler,
+  type AssembleContextResult,
   pickToolCallId,
   pickToolIsError,
   pickToolName,
@@ -330,6 +331,139 @@ function describeAssembledPrefixChange(
     currentDivergenceMessage: previousWasPrefix
       ? "none"
       : (currentSnapshot.messageSummaries[commonPrefixCount] ?? "(end)"),
+  };
+}
+
+type AssemblyTraceReason =
+  | "assembled"
+  | "no-context-items"
+  | "raw-context-incomplete"
+  | "empty-assembled-output"
+  | "no-user-turns";
+
+const ASSEMBLY_TRACE_SECRET_PATTERN =
+  /\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{12,}|xox[baprs]-[A-Za-z0-9-]{10,}|[A-Za-z0-9+/]{32,}={0,2})\b/g;
+const ASSEMBLY_TRACE_EMAIL_PATTERN = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
+
+function shortHash(value: unknown): string {
+  const encoded = JSON.stringify(value);
+  return createHash("sha256").update(encoded ?? String(value)).digest("hex").slice(0, 16);
+}
+
+function compactRefList(values: string[], maxItems = 16): string[] {
+  if (values.length <= maxItems) {
+    return values;
+  }
+  return [...values.slice(0, maxItems), `(+${values.length - maxItems} more)`];
+}
+
+function summarizeContextItemRef(item: ContextItemRecord): string {
+  return item.itemType === "summary"
+    ? `${item.ordinal}:summary:${item.summaryId ?? "missing"}`
+    : `${item.ordinal}:message:${item.messageId ?? "missing"}`;
+}
+
+function summarizeContextItemsForTrace(items: ContextItemRecord[]): Record<string, unknown> {
+  const ordinals = items.map((item) => item.ordinal).sort((a, b) => a - b);
+  const gaps: string[] = [];
+  for (let index = 1; index < ordinals.length; index += 1) {
+    const previous = ordinals[index - 1]!;
+    const current = ordinals[index]!;
+    if (current !== previous + 1) {
+      gaps.push(`${previous}->${current}`);
+    }
+  }
+  const summaryIds = items
+    .filter((item) => item.itemType === "summary" && item.summaryId)
+    .map((item) => item.summaryId!)
+    .sort();
+  const messageIds = items
+    .filter((item) => item.itemType === "message" && item.messageId !== null)
+    .map((item) => String(item.messageId))
+    .sort((a, b) => Number(a) - Number(b));
+  const refs = items.map(summarizeContextItemRef);
+  return {
+    count: items.length,
+    messageCount: items.filter((item) => item.itemType === "message").length,
+    summaryCount: items.filter((item) => item.itemType === "summary").length,
+    ordinalMin: ordinals[0] ?? null,
+    ordinalMax: ordinals[ordinals.length - 1] ?? null,
+    ordinalGapCount: gaps.length,
+    ordinalGaps: compactRefList(gaps, 12),
+    firstRefs: refs.slice(0, 8),
+    lastRefs: refs.slice(-8),
+    summaryIds: compactRefList(summaryIds, 24),
+    messageIds: compactRefList(messageIds, 24),
+    refHash: shortHash(refs),
+  };
+}
+
+function summarizeMessageForAssemblyTrace(
+  message: AgentMessage,
+  includeRedactedSample: boolean,
+): Record<string, unknown> {
+  const record = message as Record<string, unknown>;
+  const content = record.content;
+  const text = includeRedactedSample ? extractStructuredText(content) : undefined;
+  const toolCallId = extractTranscriptToolCallId(message);
+  return {
+    role: safeString(record.role) ?? "unknown",
+    shape: summarizeMessageContentShape(content),
+    tokenEstimate: estimateTokens(JSON.stringify(message)),
+    hash: shortHash(message),
+    ...(toolCallId ? { toolCallId } : {}),
+    ...(includeRedactedSample && text
+      ? { sample: redactAssemblyTraceSample(text) }
+      : {}),
+  };
+}
+
+function redactAssemblyTraceSample(value: string): string {
+  const normalized = value
+    .replace(ASSEMBLY_TRACE_EMAIL_PATTERN, "[redacted-email]")
+    .replace(ASSEMBLY_TRACE_SECRET_PATTERN, "[redacted-secret]")
+    .replace(/\s+/g, " ")
+    .trim();
+  return normalized.length <= 160 ? normalized : `${normalized.slice(0, 160)}...`;
+}
+
+function summarizeAssembledMessagesForTrace(params: {
+  messages: AgentMessage[];
+  includeRedactedSample: boolean;
+  sampleMessages: number;
+}): Record<string, unknown> {
+  const roles = new Map<string, number>();
+  for (const message of params.messages) {
+    const role = safeString((message as Record<string, unknown>).role) ?? "unknown";
+    roles.set(role, (roles.get(role) ?? 0) + 1);
+  }
+  const sampleCount = Math.max(0, Math.floor(params.sampleMessages));
+  const sampledMessages = sampleCount > 0
+    ? [
+        ...params.messages.slice(0, sampleCount),
+        ...params.messages.slice(Math.max(sampleCount, params.messages.length - sampleCount)),
+      ]
+    : [];
+  return {
+    count: params.messages.length,
+    roles: Object.fromEntries([...roles.entries()].sort((a, b) => a[0].localeCompare(b[0]))),
+    hash: shortHash(params.messages),
+    first: params.messages[0]
+      ? summarizeMessageForAssemblyTrace(params.messages[0], params.includeRedactedSample)
+      : null,
+    last: params.messages.length > 1
+      ? summarizeMessageForAssemblyTrace(
+          params.messages[params.messages.length - 1]!,
+          params.includeRedactedSample,
+        )
+      : null,
+    ...(params.includeRedactedSample && sampledMessages.length > 0
+      ? {
+          samples: sampledMessages.map((message) =>
+            summarizeMessageForAssemblyTrace(message, true),
+          ),
+        }
+      : {}),
   };
 }
 
@@ -4554,6 +4688,59 @@ export class LcmContextEngine implements ContextEngine {
     };
   }
 
+  private logAssemblyTrace(params: {
+    reason: AssemblyTraceReason;
+    conversation: ConversationRecord;
+    sessionId: string;
+    sessionKey?: string;
+    tokenBudget: number;
+    liveMessageCount: number;
+    liveContextTokens: number;
+    contextItems: ContextItemRecord[];
+    result: AssembleResult;
+    cacheAwareState?: CacheState;
+    estimatedTokens?: number;
+    debug?: AssembleContextResult["debug"];
+  }): void {
+    const traceConfig = this.config.assemblyTrace;
+    if (traceConfig?.enabled !== true) {
+      return;
+    }
+
+    const payload = {
+      reason: params.reason,
+      conversationId: params.conversation.conversationId,
+      sessionId: params.sessionId,
+      ...(params.sessionKey?.trim() ? { sessionKeyHash: shortHash(params.sessionKey.trim()) } : {}),
+      tokenBudget: params.tokenBudget,
+      liveMessageCount: params.liveMessageCount,
+      liveContextTokens: params.liveContextTokens,
+      outputMessages: params.result.messages.length,
+      estimatedTokens: params.estimatedTokens ?? params.result.estimatedTokens,
+      cacheAwareState: params.cacheAwareState ?? null,
+      contextItems: summarizeContextItemsForTrace(params.contextItems),
+      assembled: summarizeAssembledMessagesForTrace({
+        messages: params.result.messages,
+        includeRedactedSample: traceConfig.includeRedactedSample,
+        sampleMessages: traceConfig.sampleMessages,
+      }),
+      debug: params.debug
+        ? {
+            finalMessagesHash: params.debug.finalMessagesHash,
+            preSanitizeMessagesHash: params.debug.preSanitizeMessagesHash,
+            preSanitizeEvictableCount: params.debug.preSanitizeEvictableCount,
+            preSanitizeFreshTailCount: params.debug.preSanitizeFreshTailCount,
+            freshTailOrdinal: params.debug.freshTailOrdinal,
+            orphanStrippingOrdinal: params.debug.orphanStrippingOrdinal,
+            selectionMode: params.debug.selectionMode,
+            promotedOrdinals: params.debug.promotedOrdinals,
+          }
+        : null,
+    };
+
+    this.deps.log.info(`[lcm] assembly-trace ${JSON.stringify(payload)}`);
+  }
+
   // ── ContextEngine interface ─────────────────────────────────────────────
 
   /**
@@ -6537,7 +6724,20 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.info(
           `[lcm] assemble: no context items conversation=${conversation.conversationId} ${sessionLabel} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
-        return safeFallback();
+        const fallback = safeFallback();
+        this.logAssemblyTrace({
+          reason: "no-context-items",
+          conversation,
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          tokenBudget,
+          liveMessageCount: params.messages.length,
+          liveContextTokens,
+          contextItems,
+          result: fallback,
+          cacheAwareState,
+        });
+        return fallback;
       }
 
       // Guard against incomplete bootstrap/coverage: if the DB only has
@@ -6548,7 +6748,20 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.info(
           `[lcm] assemble: falling back to live context conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} liveMessages=${params.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
-        return safeFallback();
+        const fallback = safeFallback();
+        this.logAssemblyTrace({
+          reason: "raw-context-incomplete",
+          conversation,
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          tokenBudget,
+          liveMessageCount: params.messages.length,
+          liveContextTokens,
+          contextItems,
+          result: fallback,
+          cacheAwareState,
+        });
+        return fallback;
       }
 
       const assembled = await this.assembler.assemble({
@@ -6573,7 +6786,22 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.info(
           `[lcm] assemble: empty assembled output, using live context conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} tokenBudget=${tokenBudget} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
-        return safeFallback();
+        const fallback = safeFallback();
+        this.logAssemblyTrace({
+          reason: "empty-assembled-output",
+          conversation,
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          tokenBudget,
+          liveMessageCount: params.messages.length,
+          liveContextTokens,
+          contextItems,
+          result: fallback,
+          cacheAwareState,
+          estimatedTokens: assembled.estimatedTokens,
+          debug: assembled.debug,
+        });
+        return fallback;
       }
 
       // Guard: if assembled context contains no user turns at all (e.g. a new session
@@ -6591,7 +6819,22 @@ export class LcmContextEngine implements ContextEngine {
         // check falls through to raw sourceMessages (still ending in assistant)
         // and re-introduces the prefill-rejection bug fixed by safeFallback in
         // the other early-return paths.
-        return safeFallback();
+        const fallback = safeFallback();
+        this.logAssemblyTrace({
+          reason: "no-user-turns",
+          conversation,
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          tokenBudget,
+          liveMessageCount: params.messages.length,
+          liveContextTokens,
+          contextItems,
+          result: fallback,
+          cacheAwareState,
+          estimatedTokens: assembled.estimatedTokens,
+          debug: assembled.debug,
+        });
+        return fallback;
       }
 
       this.deps.log.info(
@@ -6631,6 +6874,20 @@ export class LcmContextEngine implements ContextEngine {
         messages: assembled.messages,
         estimatedTokens: assembled.estimatedTokens,
       };
+      this.logAssemblyTrace({
+        reason: "assembled",
+        conversation,
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        tokenBudget,
+        liveMessageCount: params.messages.length,
+        liveContextTokens,
+        contextItems,
+        result,
+        cacheAwareState,
+        estimatedTokens: assembled.estimatedTokens,
+        debug: assembled.debug,
+      });
       return result;
     } catch (err) {
       this.deps.log.info(

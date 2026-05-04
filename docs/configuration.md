@@ -65,6 +65,11 @@ Most installations only need to override a handful of keys. If you want a comple
   "dynamicLeafChunkTokens": {
     "enabled": true,
     "max": 40000
+  },
+  "assemblyTrace": {
+    "enabled": false,
+    "includeRedactedSample": false,
+    "sampleMessages": 4
   }
 }
 ```
@@ -164,6 +169,14 @@ openclaw plugins install --link /path/to/lossless-claw
 | `fallbackProviders` | `Array<{ provider: string; model: string }>` | `[]` | `LCM_FALLBACK_PROVIDERS` | Explicit provider/model fallback chain for compaction summarization. Format for env vars is `provider/model,provider/model`. |
 | `circuitBreakerThreshold` | `integer` | `5` | `LCM_CIRCUIT_BREAKER_THRESHOLD` | Consecutive auth failures before the summarization circuit breaker trips. |
 | `circuitBreakerCooldownMs` | `integer` | `1800000` | `LCM_CIRCUIT_BREAKER_COOLDOWN_MS` | Cooldown before the summarization circuit breaker resets automatically. |
+
+### Diagnostics
+
+| Key | Type | Default | Env override | Purpose |
+| --- | --- | --- | --- | --- |
+| `assemblyTrace.enabled` | `boolean` | `false` | `LCM_ASSEMBLY_TRACE_ENABLED` | Opt-in assembled-context boundary diagnostics before the provider/model request. Logs metadata, hashes, sizes, context item IDs, ordinal gaps, and message shapes. Message bodies are not logged by default. |
+| `assemblyTrace.includeRedactedSample` | `boolean` | `false` | `LCM_ASSEMBLY_TRACE_INCLUDE_REDACTED_SAMPLE` | When tracing is enabled, include short redacted text samples from assembled messages. Secrets and emails are redacted; keep disabled unless actively debugging. |
+| `assemblyTrace.sampleMessages` | `integer` | `4` | `LCM_ASSEMBLY_TRACE_SAMPLE_MESSAGES` | Maximum first/last assembled messages to sample when redacted samples are enabled. |
 
 ### Nested objects
 

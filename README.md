@@ -191,9 +191,14 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | `LCM_ROLLUP_DEBUG_ENABLED` | `false` | Register the operator-facing `lcm_rollup_debug` inspection tool |
 | `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` | `deferred` | Choose whether proactive threshold compaction is deferred into maintenance debt or kept inline for legacy behavior |
 | `LCM_CACHE_TTL_SECONDS` | `300` | Cache TTL used by cache-aware deferred compaction when provider/runtime telemetry does not supply a more specific retention window |
+| `LCM_ASSEMBLY_TRACE_ENABLED` | `false` | Opt-in assembled-context boundary diagnostics before provider/model dispatch; logs metadata, hashes, sizes, item IDs, and message shapes, not bodies by default |
+| `LCM_ASSEMBLY_TRACE_INCLUDE_REDACTED_SAMPLE` | `false` | Include short redacted text samples in assembly trace logs; keep disabled unless actively debugging |
+| `LCM_ASSEMBLY_TRACE_SAMPLE_MESSAGES` | `4` | Maximum first/last assembled messages sampled when redacted samples are enabled |
 
 Transcript GC rewrites are disabled by default. Set `transcriptGcEnabled` or `LCM_TRANSCRIPT_GC_ENABLED` to turn them on explicitly.
 Deferred proactive compaction is also the default. Set `proactiveThresholdCompactionMode` or `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` to `inline` only if you need legacy foreground compaction behavior. In deferred mode, lossless-claw records one coalesced prompt-mutating debt item after the turn, leaves background `maintain()` to process only non-prompt-mutating work while Anthropic cache is still hot, and then consumes that debt pre-assembly once the cache is cold or the prompt is approaching overflow.
+
+Assembly tracing is disabled by default and intended for short diagnostic windows. Enable `assemblyTrace.enabled` or `LCM_ASSEMBLY_TRACE_ENABLED=true` to log the LCM payload boundary immediately before OpenClaw hands assembled context to the provider/model request path. Default trace logs are metadata-first and privacy-safe; set `assemblyTrace.includeRedactedSample` only when a short redacted text sample is needed.
 
 ### Expansion model override requirements
 
