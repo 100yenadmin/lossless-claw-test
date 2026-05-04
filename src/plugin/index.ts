@@ -2324,9 +2324,11 @@ function wirePluginHandlers(
         sessionKey: ctx.sessionKey,
       }),
     );
-    api.registerTool(() =>
+    api.registerTool((ctx) =>
       createLcmTaskSuggestionReviewTool({
+        deps,
         getLcm: shared.waitForEngine,
+        sessionKey: ctx.sessionKey,
       }),
     );
   }

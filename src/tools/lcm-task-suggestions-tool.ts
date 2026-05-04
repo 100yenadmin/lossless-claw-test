@@ -279,8 +279,11 @@ export function createLcmTaskSuggestionsTool(input: {
 }
 
 export function createLcmTaskSuggestionReviewTool(input: {
+  deps?: LcmDependencies;
   lcm?: LcmContextEngine;
   getLcm?: () => Promise<LcmContextEngine>;
+  sessionId?: string;
+  sessionKey?: string;
 }): AnyAgentTool {
   return {
     name: "lcm_task_suggestion_review",
@@ -305,7 +308,49 @@ export function createLcmTaskSuggestionReviewTool(input: {
       const reviewedBy = typeof p.reviewedBy === "string" && p.reviewedBy.trim()
         ? p.reviewedBy.trim()
         : undefined;
-      const changed = lcm.getTaskBridgeSuggestionStore().reviewSuggestion({
+      const store = lcm.getTaskBridgeSuggestionStore();
+      // Gate cross-conversation review updates: when a session context is
+      // available, resolve the caller's conversation scope and verify the
+      // suggestion's underlying observed-work item belongs to that scope.
+      // Without this, a leaked/guessed suggestionId could be reviewed from any
+      // session. Best-effort — silently fall through if scope resolution fails
+      // (eg. tooling without sessionKey wiring), and let the existing
+      // status='pending' WHERE clause continue to guard the update.
+      if (input.deps && (input.sessionKey || input.sessionId)) {
+        try {
+          const scope = await resolveLcmConversationScope({
+            lcm,
+            deps: input.deps,
+            sessionId: input.sessionId,
+            sessionKey: input.sessionKey,
+            params: {},
+          });
+          if (scope.conversationId != null) {
+            const ownerConversationId = store.getSuggestionConversationId(suggestionId);
+            if (ownerConversationId == null) {
+              return jsonResult({
+                suggestionId,
+                status,
+                changed: false,
+                disclaimer:
+                  "Suggestion not found (it may have already been reviewed or its observed-work item removed). No external task mutation was attempted.",
+              });
+            }
+            const allowed = new Set<number>([
+              scope.conversationId,
+              ...scope.relatedConversationIds,
+            ]);
+            if (!allowed.has(ownerConversationId)) {
+              return jsonResult({
+                error: "suggestion does not belong to this conversation; review refused.",
+              });
+            }
+          }
+        } catch {
+          // best-effort scope check; fall through to the normal update.
+        }
+      }
+      const changed = store.reviewSuggestion({
         suggestionId,
         status: status as Exclude<TaskBridgeSuggestionStatus, "pending">,
         reviewedBy,

@@ -372,6 +372,10 @@ export class TaskBridgeSuggestionStore {
     if (!REVIEW_STATUSES.has(input.status)) {
       throw new Error("review status must be accepted, rejected, dismissed, or expired.");
     }
+    const suggestionId = input.suggestionId?.trim();
+    if (!suggestionId) {
+      throw new Error("suggestionId is required.");
+    }
     const reviewedBy = input.reviewedBy?.trim() || null;
     const result = this.db.prepare(
       `UPDATE lcm_task_bridge_suggestions
@@ -380,7 +384,30 @@ export class TaskBridgeSuggestionStore {
            reviewed_at = datetime('now'),
            updated_at = datetime('now')
        WHERE suggestion_id = ? AND status = 'pending'`,
-    ).run(input.status, reviewedBy, input.suggestionId);
+    ).run(input.status, reviewedBy, suggestionId);
     return result.changes > 0;
+  }
+
+  /**
+   * Returns the observed-work conversation_id for the given suggestion (joined
+   * via work_item_id), or undefined if the suggestion does not exist or its
+   * underlying observed-work item has been deleted. Used by the review tool to
+   * gate cross-conversation review updates.
+   */
+  getSuggestionConversationId(suggestionId: string): number | undefined {
+    const trimmed = suggestionId?.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    const row = this.db
+      .prepare(
+        `SELECT owi.conversation_id AS conversation_id
+         FROM lcm_task_bridge_suggestions AS s
+         JOIN lcm_observed_work_items AS owi
+           ON owi.work_item_id = s.work_item_id
+         WHERE s.suggestion_id = ?`
+      )
+      .get(trimmed) as { conversation_id: number } | undefined;
+    return row?.conversation_id;
   }
 }

@@ -61,13 +61,14 @@ const LcmWorkDensitySchema = Type.Object({
 
 function resolvePeriodBounds(
   period: unknown,
-  timezone: string
+  timezone: string,
+  callTime: Date
 ): { label?: string; since?: string; before?: string } {
   if (typeof period !== "string" || period.trim().length === 0) {
     return {};
   }
   const normalized = period.trim().toLowerCase().replace(/\s+/g, " ");
-  const today = getZonedDayString(new Date(), timezone);
+  const today = getZonedDayString(callTime, timezone);
   if (normalized === "today") {
     return dayBounds("today", today, timezone);
   }
@@ -243,8 +244,26 @@ function applyOutputBudget(
   accounting.itemsReturned = countReturnedItems(next);
   accounting.budgetTruncated = budgetTruncated;
   accounting.truncated = Boolean(accounting.truncated) || budgetTruncated;
+  // Bake estimatedOutputTokens into the payload BEFORE the final size check so
+  // adding the field cannot push us back over budget. Iterate to a fixpoint
+  // because adding the integer can in turn change its own width by 1-2 chars.
+  let estimateGuard = 0;
+  while (estimateGuard < 8) {
+    estimateGuard += 1;
+    accounting.estimatedOutputTokens = estimateJsonTokens({ ...next, accounting });
+    next.accounting = accounting;
+    if (estimateJsonTokens(next) <= budget) {
+      break;
+    }
+    if (!(trimOneSource(next) || trimOneItem(next))) {
+      break;
+    }
+    budgetTruncated = true;
+    accounting.itemsReturned = countReturnedItems(next);
+    accounting.budgetTruncated = budgetTruncated;
+    accounting.truncated = Boolean(accounting.truncated) || budgetTruncated;
+  }
   next.accounting = accounting;
-  accounting.estimatedOutputTokens = estimateJsonTokens(next);
   return next;
 }
 
@@ -288,8 +307,9 @@ export function createLcmWorkDensityTool(input: {
       let statuses: ObservedWorkStatus[] | undefined;
       let kinds: ObservedWorkKind[] | undefined;
       let periodLabel: string | undefined;
+      const callTime = input.deps.clock?.now() ?? new Date();
       try {
-        const periodBounds = resolvePeriodBounds(p.period, lcm.timezone);
+        const periodBounds = resolvePeriodBounds(p.period, lcm.timezone, callTime);
         periodLabel = periodBounds.label;
         since = parseIsoTimestampParam(p, "since")?.toISOString() ?? periodBounds.since;
         before = parseIsoTimestampParam(p, "before")?.toISOString() ?? periodBounds.before;
@@ -304,7 +324,16 @@ export function createLcmWorkDensityTool(input: {
       const limit = typeof p.limit === "number" ? Math.trunc(p.limit) : 5;
       const detailLevel = typeof p.detailLevel === "number" ? Math.trunc(p.detailLevel) : 1;
       const topic = typeof p.topic === "string" && p.topic.trim() ? p.topic.trim() : undefined;
-      const minConfidence = typeof p.minConfidence === "number" ? p.minConfidence : undefined;
+      let minConfidence: number | undefined;
+      if (p.minConfidence !== undefined) {
+        if (typeof p.minConfidence !== "number" || !Number.isFinite(p.minConfidence)) {
+          return jsonResult({ error: "minConfidence must be a finite number between 0 and 1." });
+        }
+        if (p.minConfidence < 0 || p.minConfidence > 1) {
+          return jsonResult({ error: "minConfidence must be between 0 and 1." });
+        }
+        minConfidence = p.minConfidence;
+      }
       const store = lcm.getObservedWorkStore();
       const includeSources = p.includeSources === true;
       const result = store.getDensity({
