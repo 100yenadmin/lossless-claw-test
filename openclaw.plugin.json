@@ -229,11 +229,7 @@
     },
     "observedWorkMaintenanceEnabled": {
       "label": "Observed Work Maintenance",
-      "help": "When enabled, maintain() runs observed-work and event extraction over summaries; required to register lcm_work_density and lcm_event_search."
-    },
-    "taskBridgeToolsEnabled": {
-      "label": "Task Bridge Suggestion Tools",
-      "help": "Register opt-in inert LCM task suggestion tools; they write only to the LCM suggestion ledger and never mutate external tasks"
+      "help": "Allow maintain() to run observed-work and event extraction over LCM summaries; disabled by default"
     },
     "proactiveThresholdCompactionMode": {
       "label": "Proactive Threshold Compaction Mode",
@@ -453,9 +449,6 @@
       "rollupMonthlyMaxTokens": {
         "type": "integer",
         "minimum": 1
-      },
-      "taskBridgeToolsEnabled": {
-        "type": "boolean"
       },
       "observedWorkMaintenanceEnabled": {
         "type": "boolean"

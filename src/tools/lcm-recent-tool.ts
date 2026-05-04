@@ -10,7 +10,6 @@ import {
   getUtcDateForZonedLocalTime,
   getUtcDateForZonedMidnight,
   getZonedDayString,
-  startOfWeekDayString,
 } from "../timezone-windows.js";
 import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
@@ -265,6 +264,13 @@ function getLcmRollupStore(
   throw new Error("LCM rollup database is unavailable.");
 }
 
+function startOfWeekDayString(dayString: string): string {
+  const [year, month, day] = dayString.split("-").map((part) => Number(part));
+  const date = new Date(Date.UTC(year, month - 1, day, 0, 0, 0, 0));
+  const weekday = date.getUTCDay();
+  const mondayOffset = weekday === 0 ? -6 : 1 - weekday;
+  return addDays(dayString, mondayOffset);
+}
 
 function startOfMonthDayString(dayString: string): string {
   const [year, month] = dayString.split("-");
