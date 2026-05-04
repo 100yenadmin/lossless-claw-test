@@ -224,10 +224,13 @@ This draft now includes minimal code scaffolding so reviewers can evaluate the p
 Added files:
 
 - `src/store/observed-work-store.ts`
+- `src/store/event-observation-store.ts`
+- `src/observed-work-extractor.ts`
 - `src/tools/lcm-work-density-tool.ts`
+- `src/tools/lcm-event-search-tool.ts`
 - `test/observed-work-store.test.ts`
 
-The scaffold intentionally keeps extraction out of scope. It defines the persistence/read-model and the read-only tool contract first. Extraction can be added in a follow-up once maintain-time watermarks and classifier quality are reviewed.
+This branch ships extraction wired into `LcmContextEngine.maintain()`: leaf-summary extraction runs after each maintenance cycle to populate observed-work items and event observations from summary text. The persistence/read-model and read-only tool contract were defined first; extraction landed in the same branch once maintain-time watermarks and classifier quality were reviewed.
 
 ### Current scaffold behavior
 
@@ -257,9 +260,12 @@ The scaffold intentionally keeps extraction out of scope. It defines the persist
 
 ### Explicitly not implemented yet
 
-- automatic extraction from summaries
-- LLM classification
+- LLM classification (current extractor uses heuristic regex classifiers in `classifyWork` / `classifyEvent`)
 - live current-day refresh
-- OpenClaw task bridge writes
+- OpenClaw task bridge writes (storage scaffold landed via `lcm_task_bridge_suggestions`, but writers/triggers remain inert)
 - Cortex commitments/open-loop sync
 - cross-conversation default retrieval
+
+### Implemented in this branch
+
+- automatic extraction from leaf summaries via `src/observed-work-extractor.ts`, invoked from `LcmContextEngine.maintain()`
