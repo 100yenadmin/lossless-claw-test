@@ -138,6 +138,18 @@ export async function acquireTransactionLockWithTimeout(
  * Use this when the caller must wait for all in-flight transactions to finish
  * before performing work on the shared connection, but needs to control the
  * exact transaction boundaries manually.
+ *
+ * IMPORTANT — caller-issued BEGIN semantics:
+ *   The body runs WITHOUT an enclosing BEGIN. If the body invokes
+ *   `withDatabaseTransaction(db, "BEGIN IMMEDIATE", …)` it will follow the
+ *   nested-savepoint code path (because `heldLockContext` reports the lock
+ *   as held by issue #33's fix above). A SAVEPOINT in autocommit mode opens
+ *   an implicit DEFERRED transaction — NOT BEGIN IMMEDIATE — so multi-step
+ *   writes inside the savepoint won't pre-acquire the SQLite write lock.
+ *   For multi-step writes, the body should issue a raw `BEGIN IMMEDIATE`
+ *   itself (as `rotateSessionStorageWhileHoldingDatabaseLock` does at
+ *   `engine.ts:7905`), or wrap the work in `withDatabaseTransaction`
+ *   BEFORE the heldLockContext bump (i.e. outside this helper).
  */
 export async function withExclusiveDatabaseLock<T>(
   db: DatabaseSync,
