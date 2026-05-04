@@ -1241,9 +1241,9 @@ async function buildDoctorCleanersApplyText(params: {
     return lines.join("\n");
   }
 
-  let result: ReturnType<typeof applyDoctorCleaners>;
+  let result: Awaited<ReturnType<typeof applyDoctorCleaners>>;
   try {
-    result = applyDoctorCleaners(params.db, {
+    result = await applyDoctorCleaners(params.db, {
       databasePath: params.config.databasePath,
       filterIds,
       vacuum: params.vacuum,

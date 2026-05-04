@@ -138,6 +138,18 @@ export async function acquireTransactionLockWithTimeout(
  * Use this when the caller must wait for all in-flight transactions to finish
  * before performing work on the shared connection, but needs to control the
  * exact transaction boundaries manually.
+ *
+ * IMPORTANT — caller-issued BEGIN semantics:
+ *   The body runs WITHOUT an enclosing BEGIN. If the body invokes
+ *   `withDatabaseTransaction(db, "BEGIN IMMEDIATE", …)` it will follow the
+ *   nested-savepoint code path (because `heldLockContext` reports the lock
+ *   as held by issue #33's fix above). A SAVEPOINT in autocommit mode opens
+ *   an implicit DEFERRED transaction — NOT BEGIN IMMEDIATE — so multi-step
+ *   writes inside the savepoint won't pre-acquire the SQLite write lock.
+ *   For multi-step writes, the body should issue a raw `BEGIN IMMEDIATE`
+ *   itself (as `rotateSessionStorageWhileHoldingDatabaseLock` does at
+ *   `engine.ts:7905`), or wrap the work in `withDatabaseTransaction`
+ *   BEFORE the heldLockContext bump (i.e. outside this helper).
  */
 export async function withExclusiveDatabaseLock<T>(
   db: DatabaseSync,
@@ -146,7 +158,15 @@ export async function withExclusiveDatabaseLock<T>(
 ): Promise<T> {
   const release = await acquireTransactionLockWithTimeout(db, options.timeoutMs);
   try {
-    return await operation();
+    // Mirror `withDatabaseTransaction` and bump the held-lock depth in
+    // `heldLockContext` (issue #33). Without this, any nested
+    // `withDatabaseTransaction` call from inside the exclusive-lock body
+    // would not see that the lock is already held — it would call
+    // `acquireTransactionLock(db)` again, which deadlocks on the same
+    // mutex we are still holding.
+    const heldLocks = new Map(heldLockContext.getStore() ?? []);
+    heldLocks.set(db, (heldLocks.get(db) ?? 0) + 1);
+    return await heldLockContext.run(heldLocks, async () => operation());
   } finally {
     release();
   }

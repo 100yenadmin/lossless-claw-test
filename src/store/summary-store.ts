@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { escapeLikePattern } from "../db/sql-utils.js";
 import { withDatabaseTransaction } from "../transaction-mutex.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-text-fallback.js";
@@ -1179,8 +1180,10 @@ export class SummaryStore {
     return [...new Set(tokens.map((token) => token.toLowerCase()))];
   }
 
+  // `escapeLikeTerm` now delegates to the shared `escapeLikePattern` helper
+  // in sql-utils (issue #30).
   private escapeLikeTerm(term: string): string {
-    return term.replace(/([\\%_])/g, "\\$1");
+    return escapeLikePattern(term);
   }
 
   // ── CJK trigram FTS search ──────────────────────────────────────────────

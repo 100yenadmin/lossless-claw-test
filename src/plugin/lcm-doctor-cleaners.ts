@@ -1,5 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { getFileBackedDatabasePath } from "../db/connection.js";
+import { withDatabaseTransaction } from "../transaction-mutex.js";
 import { buildLcmDatabaseBackupPath, writeLcmDatabaseBackup } from "./lcm-db-backup.js";
 
 export type DoctorCleanerId =
@@ -564,14 +565,14 @@ function buildCleanerBackupPath(databasePath: string): string | null {
   return buildLcmDatabaseBackupPath(databasePath, "doctor-cleaners");
 }
 
-export function applyDoctorCleaners(
+export async function applyDoctorCleaners(
   db: DatabaseSync,
   options: {
     databasePath: string;
     filterIds?: DoctorCleanerId[];
     vacuum?: boolean;
   },
-): DoctorCleanerApplyResult {
+): Promise<DoctorCleanerApplyResult> {
   const definitions = getCleanerDefinitions(options.filterIds);
   if (definitions.length === 0) {
     return {
@@ -602,24 +603,19 @@ export function applyDoctorCleaners(
   let deletedConversations = 0;
   let deletedMessages = 0;
   let vacuumed = false;
-  let transactionActive = false;
 
   try {
-    db.exec("BEGIN IMMEDIATE");
-    transactionActive = true;
-    stageCleanerConversationIds(db, definitions);
-    const counts = readTempCleanerDeleteCounts(db);
-    deletedMessages = counts.messageCount;
-    if (counts.conversationCount > 0) {
-      deletedConversations = deleteTempCleanerCandidates(db);
-    }
-    db.exec("COMMIT");
-    transactionActive = false;
-  } catch (error) {
-    if (transactionActive) {
-      db.exec("ROLLBACK");
-    }
-    throw error;
+    // Route the cleaner deletion through `withDatabaseTransaction` so it
+    // serializes on the per-DB async mutex with other in-flight transactions
+    // on the same connection (issue #34).
+    await withDatabaseTransaction(db, "BEGIN IMMEDIATE", () => {
+      stageCleanerConversationIds(db, definitions);
+      const counts = readTempCleanerDeleteCounts(db);
+      deletedMessages = counts.messageCount;
+      if (counts.conversationCount > 0) {
+        deletedConversations = deleteTempCleanerCandidates(db);
+      }
+    });
   } finally {
     dropTempCleanerTables(db);
   }

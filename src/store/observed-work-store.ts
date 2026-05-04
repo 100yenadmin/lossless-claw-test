@@ -1,4 +1,5 @@
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
+import { placeholders } from "../db/sql-utils.js";
 
 export type ObservedWorkStatus =
   | "observed_completed"
@@ -260,9 +261,7 @@ function rowToItem(
   };
 }
 
-function placeholders(values: readonly unknown[]): string {
-  return values.map(() => "?").join(", ");
-}
+// `placeholders` is now shared from sql-utils (issue #30 — see import above).
 
 function rowToTransition(
   row: ObservedWorkTransitionRow,

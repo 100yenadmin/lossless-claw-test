@@ -82,6 +82,7 @@ import { estimateTokens } from "./estimate-tokens.js";
 import { createLcmDatabaseBackup } from "./plugin/lcm-db-backup.js";
 import {
   DatabaseTransactionTimeoutError,
+  withDatabaseTransaction,
   withExclusiveDatabaseLock,
 } from "./transaction-mutex.js";
 
@@ -6042,11 +6043,18 @@ export class LcmContextEngine implements ContextEngine {
                 // cursor in place would cause crashed batches to be silently
                 // skipped on the next pass. Nulling all three cursor fields
                 // forces a cursorless rescan from the conversation's first leaf.
-                this.observedWorkStore.upsertState({
-                  conversationId: conversation.conversationId,
-                  pendingRebuild: true,
+                //
+                // Wrap both writes in a single transaction (issue #35) so a
+                // crash between them cannot leave `pendingRebuild=true` with
+                // a stale cursor — which would silently skip the same batch
+                // on the next pass instead of restarting from scratch.
+                await withDatabaseTransaction(this.db, "BEGIN IMMEDIATE", () => {
+                  this.observedWorkStore.upsertState({
+                    conversationId: conversation.conversationId,
+                    pendingRebuild: true,
+                  });
+                  this.observedWorkStore.clearProcessingCursor(conversation.conversationId);
                 });
-                this.observedWorkStore.clearProcessingCursor(conversation.conversationId);
               } catch (stateError) {
                 this.deps.log.warn(
                   `[lcm] maintain: failed to preserve observed-work pending state conversation=${conversation.conversationId} ${sessionLabel}: ${describeLogError(stateError)}`,
@@ -7886,6 +7894,14 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
 
+    // NOTE (issue #34): This raw `BEGIN IMMEDIATE` is intentionally not
+    // wrapped in `withDatabaseTransaction`. The caller has already acquired
+    // exclusive DB access via `withExclusiveDatabaseLock` (see
+    // `rotateSessionStorageWhileHoldingDatabaseLock` callers), which holds
+    // the per-DB async mutex without opening a transaction. The
+    // `db.isTransaction` guard above turns any unexpected nested-tx
+    // condition into a clean "unavailable" result instead of a SQLite
+    // error, so the raw BEGIN/COMMIT pair is safe here.
     let transactionActive = false;
     try {
       this.db.exec("BEGIN IMMEDIATE");

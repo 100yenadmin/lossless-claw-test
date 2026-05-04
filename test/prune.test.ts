@@ -137,12 +137,12 @@ describe("pruneConversations", () => {
     return conversationId;
   }
 
-  it("returns empty candidates when no conversations exist", () => {
+  it("returns empty candidates when no conversations exist", async () => {
     const fixture = createPruneFixture();
     tempDirs.add(fixture.tempDir);
     dbPaths.add(fixture.dbPath);
 
-    const result = pruneConversations(fixture.db, {
+    const result = await pruneConversations(fixture.db, {
       before: "90d",
       now: "2025-06-01T00:00:00.000Z",
     });
@@ -152,7 +152,7 @@ describe("pruneConversations", () => {
     expect(result.vacuumed).toBe(false);
   });
 
-  it("identifies old conversations as candidates in dry-run mode", () => {
+  it("identifies old conversations as candidates in dry-run mode", async () => {
     const fixture = createPruneFixture();
     tempDirs.add(fixture.tempDir);
     dbPaths.add(fixture.dbPath);
@@ -171,7 +171,7 @@ describe("pruneConversations", () => {
       messageCreatedAt: "2025-05-22T00:00:00.000Z",
     });
 
-    const result = pruneConversations(fixture.db, {
+    const result = await pruneConversations(fixture.db, {
       before: "90d",
       now: "2025-06-01T00:00:00.000Z",
     });
@@ -189,7 +189,7 @@ describe("pruneConversations", () => {
     expect(remaining.cnt).toBe(2);
   });
 
-  it("compares SQLite and ISO timestamps chronologically instead of lexically", () => {
+  it("compares SQLite and ISO timestamps chronologically instead of lexically", async () => {
     const fixture = createPruneFixture();
     tempDirs.add(fixture.tempDir);
     dbPaths.add(fixture.dbPath);
@@ -202,7 +202,7 @@ describe("pruneConversations", () => {
       messageCreatedAt: "2025-03-03 23:59:59",
     });
 
-    const result = pruneConversations(fixture.db, {
+    const result = await pruneConversations(fixture.db, {
       before: "90d",
       now: "2025-06-01T00:00:00.000Z",
     });
@@ -210,7 +210,7 @@ describe("pruneConversations", () => {
     expect(result.candidates).toHaveLength(0);
   });
 
-  it("deletes conversations when confirm is true", () => {
+  it("deletes conversations when confirm is true", async () => {
     const fixture = createPruneFixture();
     tempDirs.add(fixture.tempDir);
     dbPaths.add(fixture.dbPath);
@@ -227,7 +227,7 @@ describe("pruneConversations", () => {
       messageCreatedAt: "2025-05-22T00:00:00.000Z",
     });
 
-    const result = pruneConversations(fixture.db, {
+    const result = await pruneConversations(fixture.db, {
       before: "90d",
       confirm: true,
       now: "2025-06-01T00:00:00.000Z",
@@ -248,7 +248,7 @@ describe("pruneConversations", () => {
     expect(messages.cnt).toBe(1);
   });
 
-  it("deletes eligible conversations across multiple batches", () => {
+  it("deletes eligible conversations across multiple batches", async () => {
     const fixture = createPruneFixture();
     tempDirs.add(fixture.tempDir);
     dbPaths.add(fixture.dbPath);
@@ -261,7 +261,7 @@ describe("pruneConversations", () => {
       });
     }
 
-    const result = pruneConversations(fixture.db, {
+    const result = await pruneConversations(fixture.db, {
       before: "90d",
       confirm: true,
       batchSize: 2,
@@ -275,7 +275,7 @@ describe("pruneConversations", () => {
     ).toEqual({ cnt: 0 });
   });
 
-  it("can stop after a bounded number of batches", () => {
+  it("can stop after a bounded number of batches", async () => {
     const fixture = createPruneFixture();
     tempDirs.add(fixture.tempDir);
     dbPaths.add(fixture.dbPath);
@@ -288,7 +288,7 @@ describe("pruneConversations", () => {
       });
     }
 
-    const result = pruneConversations(fixture.db, {
+    const result = await pruneConversations(fixture.db, {
       before: "90d",
       confirm: true,
       batchSize: 2,
@@ -313,7 +313,7 @@ describe("pruneConversations", () => {
       messageCreatedAt: "2025-02-01 00:00:00",
     });
 
-    const result = pruneConversations(fixture.db, {
+    const result = await pruneConversations(fixture.db, {
       before: "90d",
       confirm: true,
       now: "2025-06-01T00:00:00.000Z",
@@ -360,7 +360,7 @@ describe("pruneConversations", () => {
     });
     await summaryStore.appendContextSummary(retainedConversationId, `summary-${prunedConversationId}`);
 
-    const result = pruneConversations(fixture.db, {
+    const result = await pruneConversations(fixture.db, {
       before: "90d",
       confirm: true,
       batchSize: 10,
@@ -380,7 +380,7 @@ describe("pruneConversations", () => {
     ).toEqual({ cnt: 0 });
   });
 
-  it("runs VACUUM when vacuum option is set", () => {
+  it("runs VACUUM when vacuum option is set", async () => {
     const fixture = createPruneFixture();
     tempDirs.add(fixture.tempDir);
     dbPaths.add(fixture.dbPath);
@@ -390,7 +390,7 @@ describe("pruneConversations", () => {
       messageCreatedAt: "2025-02-01T00:00:00.000Z",
     });
 
-    const result = pruneConversations(fixture.db, {
+    const result = await pruneConversations(fixture.db, {
       before: "90d",
       confirm: true,
       vacuum: true,
@@ -412,7 +412,7 @@ describe("pruneConversations", () => {
     });
   });
 
-  it("treats conversations with no messages as candidates based on created_at", () => {
+  it("treats conversations with no messages as candidates based on created_at", async () => {
     const fixture = createPruneFixture();
     tempDirs.add(fixture.tempDir);
     dbPaths.add(fixture.dbPath);
@@ -425,7 +425,7 @@ describe("pruneConversations", () => {
       )
       .run("empty-old", "2025-01-01T00:00:00.000Z", "2025-01-01T00:00:00.000Z");
 
-    const result = pruneConversations(fixture.db, {
+    const result = await pruneConversations(fixture.db, {
       before: "90d",
       now: "2025-06-01T00:00:00.000Z",
     });
@@ -434,22 +434,22 @@ describe("pruneConversations", () => {
     expect(result.candidates[0]!.messageCount).toBe(0);
   });
 
-  it("throws on invalid duration", () => {
+  it("throws on invalid duration", async () => {
     const fixture = createPruneFixture();
     tempDirs.add(fixture.tempDir);
     dbPaths.add(fixture.dbPath);
 
-    expect(() =>
+    await expect(
       pruneConversations(fixture.db, { before: "invalid" }),
-    ).toThrow(/Invalid duration/);
+    ).rejects.toThrow(/Invalid duration/);
   });
 
-  it("includes cutoffDate in result", () => {
+  it("includes cutoffDate in result", async () => {
     const fixture = createPruneFixture();
     tempDirs.add(fixture.tempDir);
     dbPaths.add(fixture.dbPath);
 
-    const result = pruneConversations(fixture.db, {
+    const result = await pruneConversations(fixture.db, {
       before: "90d",
       now: "2025-06-01T00:00:00.000Z",
     });

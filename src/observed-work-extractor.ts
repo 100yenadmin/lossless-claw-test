@@ -389,8 +389,23 @@ export class ObservedWorkExtractor {
             sourceId: entry.row.summary_id,
             evidenceKind,
           });
+          // Re-read evidence_count INSIDE the per-row transaction (issue #32).
+          // `existing` was hydrated by `loadExistingItems()` before the tx
+          // began, so its `evidenceCount` can be stale if a concurrent
+          // extractor pass on the same conversation (possible when
+          // `withSessionQueue` falls back to sessionId for two distinct
+          // sessions sharing one conversation) committed an upsert in the
+          // meantime. The current row inside our held lock is the source of
+          // truth; if absent, fall back to the pre-tx snapshot.
+          const liveEvidenceCount = (
+            this.db.prepare(
+              `SELECT evidence_count
+               FROM lcm_observed_work_items
+               WHERE work_item_id = ?`,
+            ).get(entry.workItemId) as { evidence_count: number } | undefined
+          )?.evidence_count ?? existing?.evidenceCount ?? 0;
           const evidenceCount =
-            (existing?.evidenceCount ?? 0) + (sourceAlreadyRecorded ? 0 : 1);
+            liveEvidenceCount + (sourceAlreadyRecorded ? 0 : 1);
           const confidence = Math.min(
             0.98,
             sourceAlreadyRecorded && existing

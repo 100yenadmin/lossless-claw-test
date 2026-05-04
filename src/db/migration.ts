@@ -1075,6 +1075,9 @@ export function runLcmMigrations(
       ensureSummaryMetadataColumns(db),
     );
     runMigrationStep("ensureSummaryModelColumn", log, () => ensureSummaryModelColumn(db));
+    runMigrationStep("ensureSummaryFileIdsColumn", log, () =>
+      addColumnIfMissing(db, "summaries", "file_ids", "TEXT NOT NULL DEFAULT '[]'"),
+    );
     runMigrationStep("ensureMessageIdentityHashColumn", log, () =>
       ensureMessageIdentityHashColumn(db),
     );
