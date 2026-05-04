@@ -1152,6 +1152,10 @@ function getRecentSummaryFallback(
        WHERE ${messageScopeClause}
          julianday(m.created_at) < julianday(?)
          AND julianday(m.created_at) >= julianday(?)
+         AND m.role IN ('user', 'assistant')
+         AND instr(m.content, '<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>') = 0
+         AND instr(m.content, '<<<END_OPENCLAW_INTERNAL_CONTEXT>>>') = 0
+         AND instr(m.content, '[lossless-claw] missing tool result') = 0
          AND NOT EXISTS (
            SELECT 1
            FROM summary_messages sm
@@ -1495,24 +1499,20 @@ export function createLcmRecentTool(input: {
       const canUseStoredCurrentDay =
         resolution.periodKey == null || resolution.periodKey !== currentDayKey;
       const hasPendingRebuild = rollupState?.pending_rebuild === 1;
+      const pendingRebuildUnknown = hasPendingRebuild && lastPendingMessageAt == null;
       const pendingRebuildTouchesWindow =
-        hasPendingRebuild && (resolution.kind === "day" || pendingDayKey != null);
+        hasPendingRebuild && (pendingRebuildUnknown || pendingDayKey != null);
       const canUseStoredResolvedRollup =
-        canUseStoredCurrentDay &&
-        !pendingRebuildTouchesWindow &&
-        (resolution.kind === "day" || !hasPendingRebuild);
+        canUseStoredCurrentDay && !pendingRebuildTouchesWindow;
       if (!canUseStoredCurrentDay) {
         degradedReason =
           "Stored current-day rollups were bypassed so same-day recall uses bounded fresh sources.";
       } else if (pendingDayKey) {
         degradedReason =
           `Rollup rebuild is pending for ${pendingDayKey}, so stored rollups for that day were bypassed.`;
-      } else if (resolution.kind === "day" && hasPendingRebuild) {
+      } else if (pendingRebuildUnknown) {
         degradedReason =
-          "Rollup rebuild is pending, so stored day rollups were bypassed.";
-      } else if (resolution.kind && resolution.kind !== "day" && hasPendingRebuild) {
-        degradedReason =
-          "Rollup rebuild is pending, so stored aggregate rollups were bypassed.";
+          "Rollup rebuild is pending with unknown freshness bounds, so stored rollups were bypassed.";
       }
 
       if (
@@ -1585,7 +1585,7 @@ export function createLcmRecentTool(input: {
       } else if (
         resolution.kind &&
         !resolution.window &&
-        (resolution.kind === "day" || !hasPendingRebuild)
+        !pendingRebuildUnknown
       ) {
         // Cross-conversation: gather rollups across all conversations under
         // the same session_key, dedupe by period_key keeping the freshest.
@@ -1656,7 +1656,7 @@ export function createLcmRecentTool(input: {
         ) {
           if (pendingDayKey && expectedKeys.includes(pendingDayKey)) {
             liveFallbackKeys.add(pendingDayKey);
-          } else if (!pendingDayKey) {
+          } else if (pendingRebuildUnknown) {
             for (const expectedKey of expectedKeys) {
               liveFallbackKeys.add(expectedKey);
             }
