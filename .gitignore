@@ -1,4 +1,9 @@
 .pebbles
+# Match both directory and symlink-to-directory forms — local dev checkouts
+# sometimes symlink node_modules onto an external volume to keep scratch
+# worktrees thin, and a `node_modules/` rule alone does not ignore the
+# symlink (git treats the symlink itself as a file).
+node_modules
 node_modules/
 dist/
 *.tsbuildinfo

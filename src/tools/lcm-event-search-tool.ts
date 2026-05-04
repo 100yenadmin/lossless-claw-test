@@ -20,7 +20,12 @@ const LcmEventSearchSchema = Type.Object({
   conversationId: Type.Optional(Type.Number({ description: "Conversation ID to inspect. Defaults to the current session conversation." })),
   allConversations: Type.Optional(Type.Boolean({ description: "Not supported; event search is scoped to one conversation unless a future admin/debug surface is added." })),
   query: Type.Optional(Type.String({ description: "Deterministic query/topic filter over observed event titles and keys." })),
-  eventKinds: Type.Optional(Type.Array(Type.String({ enum: [...EVENT_KIND_VALUES] }), { description: "Event kinds to include." })),
+  eventKinds: Type.Optional(
+    Type.Array(
+      Type.Union(EVENT_KIND_VALUES.map((value) => Type.Literal(value))),
+      { description: "Event kinds to include." },
+    ),
+  ),
   since: Type.Optional(Type.String({ description: "Only include events at or after this ISO timestamp." })),
   before: Type.Optional(Type.String({ description: "Only include events before this ISO timestamp." })),
   first: Type.Optional(Type.Boolean({ description: "Return earliest matching events first. Defaults to latest first." })),
@@ -104,10 +109,6 @@ export function createLcmEventSearchTool(input: {
         return jsonResult({ error: "since must be earlier than before." });
       }
       const query = typeof p.query === "string" && p.query.trim() ? p.query.trim() : undefined;
-      const limit =
-        typeof p.limit === "number" && Number.isFinite(p.limit)
-          ? Math.max(1, Math.min(Math.trunc(p.limit), 100))
-          : 20;
       const observations = lcm.getEventObservationStore().listObservations({
         conversationId: scope.conversationId,
         eventKinds,
@@ -116,7 +117,7 @@ export function createLcmEventSearchTool(input: {
         before,
         first: p.first === true,
         includeSources: p.includeSources === true,
-        limit,
+        limit: typeof p.limit === "number" ? Math.trunc(p.limit) : 20,
       });
       return jsonResult({
         conversationScope: scope.allConversations ? "all" : scope.conversationId,

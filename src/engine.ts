@@ -6014,7 +6014,7 @@ export class LcmContextEngine implements ContextEngine {
           }
           if (this.config.observedWorkMaintenanceEnabled) {
             try {
-              const observedResult = this.observedWorkExtractor.processConversation(
+              const observedResult = await this.observedWorkExtractor.processConversation(
                 conversation.conversationId,
                 { limit: 500 },
               );
@@ -6032,10 +6032,18 @@ export class LcmContextEngine implements ContextEngine {
                 `[lcm] maintain: observed-work extraction failed conversation=${conversation.conversationId} ${sessionLabel}: ${describeLogError(error)}`,
               );
               try {
+                // Mark rebuild pending AND null the cursor so the next maintain()
+                // pass restarts from the beginning. `pendingRebuild` alone is
+                // write-only — the extractor's listUnprocessedLeafSummaries()
+                // only consults the (createdAt,id,rowid) cursor, so leaving the
+                // cursor in place would cause crashed batches to be silently
+                // skipped on the next pass. Nulling all three cursor fields
+                // forces a cursorless rescan from the conversation's first leaf.
                 this.observedWorkStore.upsertState({
                   conversationId: conversation.conversationId,
                   pendingRebuild: true,
                 });
+                this.observedWorkStore.clearProcessingCursor(conversation.conversationId);
               } catch (stateError) {
                 this.deps.log.warn(
                   `[lcm] maintain: failed to preserve observed-work pending state conversation=${conversation.conversationId} ${sessionLabel}: ${describeLogError(stateError)}`,

@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { withDatabaseTransaction } from "../transaction-mutex.js";
 
 export type EventObservationKind =
   | "primary"
@@ -67,6 +68,8 @@ function escapeLikePattern(value: string): string {
   return value.replace(/[\\%_]/g, (part) => `\\${part}`);
 }
 
+const MAX_EVENT_SOURCE_IDS = 50;
+
 function normalizeSourceIds(sourceIds: string[] | undefined, fallbackSourceId: string): string[] {
   return [
     ...new Set(
@@ -77,6 +80,17 @@ function normalizeSourceIds(sourceIds: string[] | undefined, fallbackSourceId: s
   ];
 }
 
+function canonicalizeIsoTimestamp(value: string | undefined, field: string): string | null {
+  if (value == null) {
+    return null;
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error(`${field} must be a valid ISO-8601 timestamp.`);
+  }
+  return parsed.toISOString();
+}
+
 function normalizeQueryKey(value: string | undefined): string | null {
   const normalized = value?.trim().toLowerCase().replace(/\s+/g, " ");
   if (!normalized) {
@@ -84,7 +98,8 @@ function normalizeQueryKey(value: string | undefined): string | null {
   }
   const pr =
     /^(?:pr|pull request)\s*#?\s*(\d{1,6})$/.exec(normalized) ??
-    /^pr[-\s#]*(\d{1,6})$/.exec(normalized);
+    /^pr[-\s#]*(\d{1,6})$/.exec(normalized) ??
+    /(?:^|\/)pull\/(\d{1,6})(?:\b|$)/.exec(normalized);
   if (pr?.[1]) {
     return `pr-${pr[1]}`;
   }
@@ -131,7 +146,7 @@ function rowToEvent(row: EventObservationRow, includeSources: boolean): EventObs
 export class EventObservationStore {
   constructor(private readonly db: DatabaseSync) {}
 
-  upsertObservation(input: EventObservationInput): void {
+  async upsertObservation(input: EventObservationInput): Promise<void> {
     if (!Number.isFinite(input.confidence ?? 0.5) || (input.confidence ?? 0.5) < 0 || (input.confidence ?? 0.5) > 1) {
       throw new Error("confidence must be between 0 and 1.");
     }
@@ -146,41 +161,63 @@ export class EventObservationStore {
       throw new Error("event source ID is required.");
     }
     const sourceIds = normalizeSourceIds(input.sourceIds, sourceId);
-    this.db.prepare(
-      `INSERT INTO lcm_event_observations (
-        event_id, conversation_id, event_kind, title, description, query_key,
-        event_time, ingest_time, confidence, rationale, source_type, source_id,
-        source_ids, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-      ON CONFLICT(event_id) DO UPDATE SET
-        conversation_id = excluded.conversation_id,
-        event_kind = excluded.event_kind,
-        title = excluded.title,
-        description = excluded.description,
-        query_key = excluded.query_key,
-        event_time = excluded.event_time,
-        ingest_time = excluded.ingest_time,
-        confidence = excluded.confidence,
-        rationale = excluded.rationale,
-        source_type = excluded.source_type,
-        source_id = excluded.source_id,
-        source_ids = excluded.source_ids,
-        updated_at = datetime('now')`,
-    ).run(
-      input.eventId,
-      input.conversationId,
-      input.eventKind,
-      input.title.trim(),
-      input.description?.trim() || null,
-      normalizeQueryKey(input.queryKey),
-      input.eventTime ?? null,
-      input.ingestTime,
-      input.confidence ?? 0.5,
-      input.rationale.trim(),
-      input.sourceType,
-      sourceId,
-      JSON.stringify(sourceIds),
-    );
+    if (sourceIds.length > MAX_EVENT_SOURCE_IDS) {
+      throw new Error(
+        `sourceIds must not exceed ${MAX_EVENT_SOURCE_IDS} entries (received ${sourceIds.length}).`
+      );
+    }
+    // Range filtering and ordering downstream use lexicographic comparisons on
+    // `coalesce(event_time, ingest_time)`. Persist canonical ISO-8601 UTC so
+    // a non-canonical caller can't sort outside its real window or evade
+    // since/before filters; reject unparseable timestamps loudly.
+    const eventTime = canonicalizeIsoTimestamp(input.eventTime, "eventTime");
+    const ingestTime = canonicalizeIsoTimestamp(input.ingestTime, "ingestTime");
+    if (ingestTime == null) {
+      throw new Error("ingestTime is required.");
+    }
+    // Route through `withDatabaseTransaction` so concurrent callers serialize
+    // on the per-DB async mutex (issue #260). When invoked from inside an
+    // outer transaction (e.g. ObservedWorkExtractor's processConversation),
+    // this function reuses the held lock and wraps the upsert in a savepoint
+    // — which is required because a raw `BEGIN IMMEDIATE` here would throw
+    // with "cannot start a transaction within a transaction".
+    await withDatabaseTransaction(this.db, "BEGIN IMMEDIATE", () => {
+      this.db.prepare(
+        `INSERT INTO lcm_event_observations (
+          event_id, conversation_id, event_kind, title, description, query_key,
+          event_time, ingest_time, confidence, rationale, source_type, source_id,
+          source_ids, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(event_id) DO UPDATE SET
+          conversation_id = excluded.conversation_id,
+          event_kind = excluded.event_kind,
+          title = excluded.title,
+          description = excluded.description,
+          query_key = excluded.query_key,
+          event_time = excluded.event_time,
+          ingest_time = excluded.ingest_time,
+          confidence = excluded.confidence,
+          rationale = excluded.rationale,
+          source_type = excluded.source_type,
+          source_id = excluded.source_id,
+          source_ids = excluded.source_ids,
+          updated_at = datetime('now')`,
+      ).run(
+        input.eventId,
+        input.conversationId,
+        input.eventKind,
+        input.title.trim(),
+        input.description?.trim() || null,
+        normalizeQueryKey(input.queryKey),
+        eventTime,
+        ingestTime,
+        input.confidence ?? 0.5,
+        input.rationale.trim(),
+        input.sourceType,
+        sourceId,
+        JSON.stringify(sourceIds),
+      );
+    });
   }
 
   listObservations(input?: {
@@ -206,28 +243,29 @@ export class EventObservationStore {
     const query = normalizeQueryKey(input?.query);
     if (query) {
       const likeQuery = `%${escapeLikePattern(query)}%`;
-      // query_key is already normalized to lowercase on write (see normalizeQueryKey
-      // call in upsertObservation), so we compare directly to keep
-      // lcm_event_observations_query_time_idx usable. title/description are not
-      // pre-lowercased and still need lower() for case-insensitive LIKE.
+      // INVARIANT: query_key is stored already lowercased+normalized via
+      // normalizeQueryKey() at insert time (see insertObservation). So we
+      // compare directly against the column rather than wrapping in
+      // lower(coalesce(...)) — that wrapper would prevent SQLite from
+      // using lcm_event_observations_query_time_idx and force a scan.
+      //
+      // The title/description LIKE clauses are inherently full-scan, but
+      // their cost is bounded by the time-window filters (since/before)
+      // appended below, which select on (event_time, ingest_time).
       where.push(
         "(query_key = ? OR lower(title) LIKE ? ESCAPE '\\' OR lower(coalesce(description, '')) LIKE ? ESCAPE '\\')"
       );
       args.push(query, likeQuery, likeQuery);
     }
     if (input?.since) {
-      where.push("julianday(coalesce(event_time, ingest_time)) >= julianday(?)");
+      where.push("coalesce(event_time, ingest_time) >= ?");
       args.push(input.since);
     }
     if (input?.before) {
-      where.push("julianday(coalesce(event_time, ingest_time)) < julianday(?)");
+      where.push("coalesce(event_time, ingest_time) < ?");
       args.push(input.before);
     }
-    const rawLimit = input?.limit;
-    const limit =
-      typeof rawLimit === "number" && Number.isFinite(rawLimit)
-        ? Math.max(1, Math.min(Math.trunc(rawLimit), 100))
-        : 20;
+    const limit = Math.max(1, Math.min(input?.limit ?? 20, 100));
     const order = input?.first ? "ASC" : "DESC";
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db.prepare(
@@ -236,7 +274,7 @@ export class EventObservationStore {
               source_ids, created_at, updated_at
        FROM lcm_event_observations
        ${whereSql}
-       ORDER BY julianday(coalesce(event_time, ingest_time)) ${order}, confidence DESC
+       ORDER BY coalesce(event_time, ingest_time) ${order}, confidence DESC, event_id ASC
        LIMIT ?`,
     ).all(...args, limit) as EventObservationRow[];
     return rows.map((row) => rowToEvent(row, input?.includeSources === true));
