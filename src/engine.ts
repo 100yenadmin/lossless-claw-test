@@ -74,7 +74,7 @@ import {
 import { EventObservationStore } from "./store/event-observation-store.js";
 import { ObservedWorkStore } from "./store/observed-work-store.js";
 import { RollupStore } from "./store/rollup-store.js";
-import { SummaryStore } from "./store/summary-store.js";
+import { SummaryStore, type ConversationBootstrapStateRecord } from "./store/summary-store.js";
 import { TaskBridgeSuggestionStore } from "./store/task-bridge-suggestion-store.js";
 import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError } from "./summarize.js";
 import type { LcmDependencies, StartupSessionFileCandidate } from "./types.js";
@@ -2266,6 +2266,30 @@ export class LcmContextEngine implements ContextEngine {
     const normalizedSessionKey = sessionKey?.trim();
     const normalizedSessionId = sessionId?.trim();
     return normalizedSessionKey || normalizedSessionId || "__lcm__";
+  }
+
+  /**
+   * Resolve the lookup key for `oversizedAutoRotateCheckpointByQueueKey`.
+   *
+   * Keying by queueKey alone (CodeRabbit MAJOR finding, fix in this PR) is
+   * unsafe: after the active transcript file rolls over (sessionFile path
+   * changes for the same session identity), a leftover oversized-checkpoint
+   * entry from the prior file would suppress legitimate rotation on the new
+   * file until enough new growth accumulated past the stale checkpoint.
+   *
+   * Including the normalized `sessionFile` path in the key makes each
+   * (queueKey, transcript path) pair its own checkpoint scope, so rolling to a
+   * new transcript starts with a clean slate. The NUL escape matches the
+   * `messageIdentity` separator pattern used elsewhere in the engine.
+   */
+  private resolveOversizedAutoRotateKey(
+    sessionId?: string,
+    sessionKey?: string,
+    sessionFile?: string,
+  ): string {
+    const queueKey = this.resolveSessionQueueKey(sessionId, sessionKey);
+    const normalizedFile = normalizeSessionFilePathForComparison(sessionFile?.trim() ?? "");
+    return `${queueKey} ${normalizedFile}`;
   }
 
   /** Normalize optional live token estimates supplied by runtime callers. */
@@ -5725,6 +5749,7 @@ export class LcmContextEngine implements ContextEngine {
     sessionId: string,
     sessionKey: string | undefined,
     batch: AgentMessage[],
+    options?: { reconcileSucceeded?: boolean },
   ): Promise<AgentMessage[]> {
     if (batch.length === 0) return batch;
 
@@ -5753,6 +5778,7 @@ export class LcmContextEngine implements ContextEngine {
         storedBatch,
         storedMessageCount,
         lastDbMessage,
+        { reconcileSucceeded: options?.reconcileSucceeded === true },
       );
     }
 
@@ -5807,6 +5833,7 @@ export class LcmContextEngine implements ContextEngine {
     storedBatch: ReturnType<typeof toStoredMessage>[],
     storedMessageCount: number,
     lastDbMessage: { role: string; content: string },
+    options?: { reconcileSucceeded?: boolean },
   ): Promise<AgentMessage[]> {
     const lastBatchIdentity = messageIdentity(
       storedBatch[storedBatch.length - 1]!.role,
@@ -5843,18 +5870,21 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    // Fall back to suffix matching. If the DB is already longer than the
-    // incoming afterTurn batch and no suffix overlap exists, fail closed:
-    // importing the whole short batch as new would duplicate/pollute LCM with
-    // stale runtime tail snapshots. The transcript reconcile path runs before
-    // this and is responsible for importing genuine missing JSONL tail turns.
+    // Fall back to suffix matching. Fail-closed (`onNoOverlap: "skip"`) is
+    // only safe when the transcript reconcile path actually completed: that
+    // path is what imports any genuinely missing JSONL tail turns. When
+    // `afterTurn` logged-and-continued past a reconcile failure, we MUST NOT
+    // drop the current turn on no-overlap — that would be silent history loss.
+    // Fall through to "ingest" in that case so legitimate new turns survive
+    // even if the dedup heuristic can't find a suffix anchor (CodeRabbit MAJOR
+    // finding, fix in this PR).
     return this.deduplicateSuffixFallback(
       conversationId,
       batch,
       storedBatch,
       storedMessageCount,
       "oversized",
-      { onNoOverlap: "skip" },
+      { onNoOverlap: options?.reconcileSucceeded === true ? "skip" : "ingest" },
     );
   }
 
@@ -6660,12 +6690,22 @@ export class LcmContextEngine implements ContextEngine {
     const newMessages = filterPersistableMessages(
       params.messages.slice(params.prePromptMessageCount),
     );
+    // Track whether the transcript-tail reconcile succeeded. The oversized
+    // fail-closed dedup path (`deduplicateOversizedBatch` → `deduplicateSuffixFallback`
+    // with `onNoOverlap: "skip"`) ASSUMES reconcile already imported any
+    // legitimate missing tail turns. When reconcile threw and we logged-and-
+    // continued, that precondition no longer holds, so silently dropping the
+    // current turn would be silent history loss (CodeRabbit MAJOR finding,
+    // fix in this PR). Pass the success signal into dedup and only enable
+    // fail-closed when reconcile actually succeeded.
+    let reconcileSucceeded = false;
     try {
       await this.reconcileTranscriptTailForAfterTurn({
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
         sessionFile: params.sessionFile,
       });
+      reconcileSucceeded = true;
     } catch (err) {
       this.deps.log.warn(
         `[lcm] afterTurn: transcript reconcile failed for ${sessionLabel}: ${describeLogError(err)}`,
@@ -6675,6 +6715,7 @@ export class LcmContextEngine implements ContextEngine {
       params.sessionId,
       params.sessionKey,
       newMessages,
+      { reconcileSucceeded },
     );
     const summaryCoveredMessages: AgentMessage[] = [];
     const summaryDedupedNewMessages: AgentMessage[] = [];
@@ -7905,7 +7946,7 @@ export class LcmContextEngine implements ContextEngine {
 
     if (sizeBytes <= thresholdBytes) {
       this.oversizedAutoRotateCheckpointByQueueKey.delete(
-        this.resolveSessionQueueKey(sessionId, sessionKey),
+        this.resolveOversizedAutoRotateKey(sessionId, sessionKey, sessionFile),
       );
       skip("below-threshold", sizeBytes);
       return;
@@ -7939,7 +7980,8 @@ export class LcmContextEngine implements ContextEngine {
     // threshold worth of new growth before trying again. This avoids a turn-by-
     // turn loop when the preserved tail is itself larger than the configured cap.
     const queueKey = this.resolveSessionQueueKey(sessionId, sessionKey);
-    const previousOversizedCheckpoint = this.oversizedAutoRotateCheckpointByQueueKey.get(queueKey);
+    const oversizedKey = this.resolveOversizedAutoRotateKey(sessionId, sessionKey, sessionFile);
+    const previousOversizedCheckpoint = this.oversizedAutoRotateCheckpointByQueueKey.get(oversizedKey);
     if (
       previousOversizedCheckpoint !== undefined &&
       sizeBytes < previousOversizedCheckpoint + thresholdBytes
@@ -7989,9 +8031,9 @@ export class LcmContextEngine implements ContextEngine {
 
     if (result.kind === "rotated") {
       if (result.checkpointSize >= thresholdBytes) {
-        this.oversizedAutoRotateCheckpointByQueueKey.set(queueKey, result.checkpointSize);
+        this.oversizedAutoRotateCheckpointByQueueKey.set(oversizedKey, result.checkpointSize);
       } else {
-        this.oversizedAutoRotateCheckpointByQueueKey.delete(queueKey);
+        this.oversizedAutoRotateCheckpointByQueueKey.delete(oversizedKey);
       }
       this.logAutoRotateSessionFileDecision({
         ...baseLog,
@@ -8095,9 +8137,34 @@ export class LcmContextEngine implements ContextEngine {
       return { kind: "skipped" };
     }
 
-    const bootstrapState = await this.summaryStore.getConversationBootstrapState(
-      conversation.conversationId,
-    );
+    // CodeRabbit MAJOR finding (fix in this PR): the surrounding for-loop in
+    // `autoRotateManagedSessionFilesAtStartup()` awaits this helper without a
+    // try/catch, so any uncaught DB exception would abort the entire startup
+    // scan and leave later candidates unrotated. Mirror the warn-and-skip
+    // pattern already used for `getConversationForSession()` and `stat()`
+    // around the remaining DB reads (`getConversationBootstrapState`,
+    // `getMessageCount`) so one bad row cannot poison the rest of the scan.
+    let bootstrapState: ConversationBootstrapStateRecord | null;
+    try {
+      bootstrapState = await this.summaryStore.getConversationBootstrapState(
+        conversation.conversationId,
+      );
+    } catch (error) {
+      this.logAutoRotateSessionFileDecision({
+        phase: "startup",
+        action: "warn",
+        sessionId,
+        sessionKey,
+        conversationId: conversation.conversationId,
+        sessionFile,
+        thresholdBytes: params.thresholdBytes,
+        durationMs: Date.now() - params.startedAt,
+        reason: "bootstrap-state-lookup-failed",
+        error: describeLogError(error),
+        level: "warn",
+      });
+      return { kind: "warned" };
+    }
     const bootstrapPath = bootstrapState?.sessionFilePath?.trim();
     if (
       !bootstrapPath ||
@@ -8131,9 +8198,30 @@ export class LcmContextEngine implements ContextEngine {
     }
     if (sizeBytes <= params.thresholdBytes) {
       this.oversizedAutoRotateCheckpointByQueueKey.delete(
-        this.resolveSessionQueueKey(sessionId, sessionKey),
+        this.resolveOversizedAutoRotateKey(sessionId, sessionKey, sessionFile),
       );
       return { kind: "skipped" };
+    }
+
+    let currentMessageCount: number;
+    try {
+      currentMessageCount = await this.conversationStore.getMessageCount(conversation.conversationId);
+    } catch (error) {
+      this.logAutoRotateSessionFileDecision({
+        phase: "startup",
+        action: "warn",
+        sessionId,
+        sessionKey,
+        conversationId: conversation.conversationId,
+        sessionFile,
+        sizeBytes,
+        thresholdBytes: params.thresholdBytes,
+        durationMs: Date.now() - params.startedAt,
+        reason: "message-count-lookup-failed",
+        error: describeLogError(error),
+        level: "warn",
+      });
+      return { kind: "warned" };
     }
 
     return {
@@ -8144,7 +8232,7 @@ export class LcmContextEngine implements ContextEngine {
         sessionFile,
         conversationId: conversation.conversationId,
         sizeBytes,
-        currentMessageCount: await this.conversationStore.getMessageCount(conversation.conversationId),
+        currentMessageCount,
       },
     };
   }
@@ -8290,11 +8378,15 @@ export class LcmContextEngine implements ContextEngine {
 
               result.rotated += 1;
               result.bytesRemoved += rotateResult.bytesRemoved;
-              const queueKey = this.resolveSessionQueueKey(candidate.sessionId, candidate.sessionKey);
+              const oversizedKey = this.resolveOversizedAutoRotateKey(
+                candidate.sessionId,
+                candidate.sessionKey,
+                candidate.sessionFile,
+              );
               if (rotateResult.checkpointSize >= params.thresholdBytes) {
-                this.oversizedAutoRotateCheckpointByQueueKey.set(queueKey, rotateResult.checkpointSize);
+                this.oversizedAutoRotateCheckpointByQueueKey.set(oversizedKey, rotateResult.checkpointSize);
               } else {
-                this.oversizedAutoRotateCheckpointByQueueKey.delete(queueKey);
+                this.oversizedAutoRotateCheckpointByQueueKey.delete(oversizedKey);
               }
               this.logAutoRotateSessionFileDecision({
                 phase: "startup",

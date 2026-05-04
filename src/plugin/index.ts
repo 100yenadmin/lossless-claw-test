@@ -90,12 +90,27 @@ function getRuntimeAgentSessionApi(api: OpenClawPluginApi): RuntimeAgentSessionA
   return sessionApi as RuntimeAgentSessionApi;
 }
 
-/** List configured OpenClaw agent ids whose session stores can be active at startup. */
+/** List configured OpenClaw agent ids whose session stores can be active at startup.
+ *
+ * "main" is the implicit default agent — its session store is always loaded
+ * by the host even when no entry for it appears in `agents.list`. The earlier
+ * implementation only added "main" when the list was empty, which meant
+ * a host that declared OTHER agents but left the default main implicit would
+ * cause `listStartupSessionFileCandidates` to skip the main store entirely
+ * and never propose its oversized transcripts for rotation (CodeRabbit MAJOR
+ * finding, fix in this PR). Always include "main" so the startup scan covers
+ * it regardless of how the explicit list is configured.
+ */
 function listConfiguredAgentIds(config: unknown): string[] {
   const agents = isRecord(config) ? config.agents : undefined;
   const list = isRecord(agents) && Array.isArray(agents.list) ? agents.list : [];
   const seen = new Set<string>();
   const ids: string[] = [];
+
+  // Always seed with "main" — see comment above.
+  const mainId = normalizeAgentId("main");
+  seen.add(mainId);
+  ids.push(mainId);
 
   for (const entry of list) {
     if (!isRecord(entry) || entry.enabled === false || typeof entry.id !== "string") {
@@ -109,7 +124,7 @@ function listConfiguredAgentIds(config: unknown): string[] {
     ids.push(agentId);
   }
 
-  return ids.length > 0 ? ids : ["main"];
+  return ids;
 }
 
 /** Read a string value from an unknown object field. */

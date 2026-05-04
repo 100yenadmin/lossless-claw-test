@@ -405,21 +405,32 @@ export class ConversationStore {
     return this.getConversationBySessionId(normalizedSessionId);
   }
 
-  /** List active conversations that may own live session storage. */
+  /** List active conversations that may own live session storage.
+   *
+   * No implicit limit: an implicit `1000` cap silently dropped active
+   * conversations beyond the top 1000 from startup/maintenance scans
+   * (CodeRabbit MAJOR finding, fix in this PR). Callers who need a bound
+   * must pass one explicitly.
+   */
   async listActiveConversations(limit?: number): Promise<ConversationRecord[]> {
     const normalizedLimit =
       typeof limit === "number" && Number.isFinite(limit) && limit > 0
         ? Math.floor(limit)
-        : 1000;
-    const rows = this.db
-      .prepare(
-        `SELECT conversation_id, session_id, session_key, active, archived_at, title, bootstrapped_at, created_at, updated_at
+        : undefined;
+    const sql = normalizedLimit !== undefined
+      ? `SELECT conversation_id, session_id, session_key, active, archived_at, title, bootstrapped_at, created_at, updated_at
          FROM conversations
          WHERE active = 1
          ORDER BY updated_at DESC, conversation_id DESC
-         LIMIT ?`,
-      )
-      .all(normalizedLimit) as unknown as ConversationRow[];
+         LIMIT ?`
+      : `SELECT conversation_id, session_id, session_key, active, archived_at, title, bootstrapped_at, created_at, updated_at
+         FROM conversations
+         WHERE active = 1
+         ORDER BY updated_at DESC, conversation_id DESC`;
+    const stmt = this.db.prepare(sql);
+    const rows = (normalizedLimit !== undefined
+      ? stmt.all(normalizedLimit)
+      : stmt.all()) as unknown as ConversationRow[];
 
     return rows.map(toConversationRecord);
   }
