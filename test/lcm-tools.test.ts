@@ -124,17 +124,17 @@ function buildLcmEngine(params: {
               updatedAt: new Date("2026-01-01T00:00:00.000Z"),
             },
       ),
-      getConversationFamilyIds: vi.fn(async () => {
+      listConversationsBySessionKey: vi.fn(async () => {
         if (params.conversationFamilyIds && params.conversationFamilyIds.length > 0) {
-          return params.conversationFamilyIds;
+          return params.conversationFamilyIds.map((id) => ({ conversationId: id }));
         }
         if (typeof params.conversationIdBySessionKey === "number") {
-          return [params.conversationIdBySessionKey];
+          return [{ conversationId: params.conversationIdBySessionKey }];
         }
         if (typeof params.conversationId === "number") {
-          return [params.conversationId];
+          return [{ conversationId: params.conversationId }];
         }
-        return [];
+        return [] as Array<{ conversationId: number }>;
       }),
     }),
   };

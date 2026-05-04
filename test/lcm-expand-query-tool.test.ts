@@ -149,6 +149,7 @@ function makeEngine(params: {
           ? {
               conversationId: params.conversationId,
               sessionId: "session-1",
+              sessionKey: "agent:main:main",
               title: null,
               bootstrappedAt: null,
               createdAt: new Date("2026-01-01T00:00:00.000Z"),
@@ -156,11 +157,11 @@ function makeEngine(params: {
             }
           : null,
       ),
-      getConversationFamilyIds: vi.fn(async () =>
+      listConversationsBySessionKey: vi.fn(async () =>
         params.conversationFamilyIds && params.conversationFamilyIds.length > 0
-          ? params.conversationFamilyIds
+          ? params.conversationFamilyIds.map((id) => ({ conversationId: id }))
           : typeof params.conversationId === "number"
-            ? [params.conversationId]
+            ? [{ conversationId: params.conversationId }]
             : [],
       ),
     }),

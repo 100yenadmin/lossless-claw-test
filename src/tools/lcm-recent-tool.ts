@@ -1512,42 +1512,65 @@ export function createLcmRecentTool(input: {
       let lastBuiltAt: Date | null = null;
 
       const currentDayKey = getZonedDayString(callTime, timezone);
-      const rollupState = rollupStore.getState(conversationId);
+      // MAJOR-1 (audit/round1-2): consult `getState` for the WHOLE conversation
+      // family (rooted at this conversationId), OR'ing the pending_rebuild +
+      // pending day-key flags across all siblings. Without this, an
+      // auto-rotated session where conv A has `pending_rebuild=1` covering
+      // yesterday and conv B is clean would serve A's stale rollup whenever
+      // queried via B's sessionKey — the freshness gate only saw B's clean
+      // state. The "freshest unsafe state" wins.
+      const familyConversationIds =
+        conversationScope.relatedConversationIds.length > 0
+          ? conversationScope.relatedConversationIds
+          : [conversationId];
+      const familyRollupStates = familyConversationIds.map((id) => ({
+        conversationId: id,
+        state: rollupStore.getState(id),
+      }));
       // M1 (audit/round1): also reject unparseable ISO strings here, not just at
       // each downstream use site. A corrupt `last_message_at` column would
       // otherwise produce an Invalid Date that compares falsy to range bounds
       // but also is not `== null`, so `pendingRebuildUnknown` stayed false and
       // stored rollups were silently served despite an unknown freshness
       // boundary.
-      const parsedLastPendingMessageAt =
-        rollupState?.pending_rebuild === 1 && rollupState.last_message_at
-          ? new Date(rollupState.last_message_at)
-          : null;
-      const lastPendingMessageAt =
-        parsedLastPendingMessageAt != null &&
-        !Number.isNaN(parsedLastPendingMessageAt.getTime())
-          ? parsedLastPendingMessageAt
-          : null;
+      const familyPendingDayKeys = new Set<string>();
+      let familyHasPendingRebuild = false;
+      let familyPendingRebuildUnknown = false;
+      for (const { state } of familyRollupStates) {
+        if (state?.pending_rebuild !== 1) continue;
+        familyHasPendingRebuild = true;
+        const parsed = state.last_message_at ? new Date(state.last_message_at) : null;
+        const valid = parsed != null && !Number.isNaN(parsed.getTime()) ? parsed : null;
+        if (valid == null) {
+          familyPendingRebuildUnknown = true;
+          continue;
+        }
+        if (valid >= resolution.start && valid < resolution.end) {
+          familyPendingDayKeys.add(getZonedDayString(valid, timezone));
+        }
+      }
+      // For backwards-compatible single-conversation logic below we keep a
+      // representative `pendingDayKey` (any one matching the requested
+      // window). All decision flags are now OR'd across family.
       const pendingDayKey =
-        lastPendingMessageAt &&
-        lastPendingMessageAt >= resolution.start &&
-        lastPendingMessageAt < resolution.end
-          ? getZonedDayString(lastPendingMessageAt, timezone)
+        familyPendingDayKeys.size > 0
+          ? Array.from(familyPendingDayKeys)[0]!
           : null;
       const canUseStoredCurrentDay =
         resolution.periodKey == null || resolution.periodKey !== currentDayKey;
-      const hasPendingRebuild = rollupState?.pending_rebuild === 1;
-      const pendingRebuildUnknown = hasPendingRebuild && lastPendingMessageAt == null;
+      const hasPendingRebuild = familyHasPendingRebuild;
+      const pendingRebuildUnknown = familyPendingRebuildUnknown;
       const pendingRebuildTouchesWindow =
-        hasPendingRebuild && (pendingRebuildUnknown || pendingDayKey != null);
+        hasPendingRebuild && (pendingRebuildUnknown || familyPendingDayKeys.size > 0);
       const canUseStoredResolvedRollup =
         canUseStoredCurrentDay && !pendingRebuildTouchesWindow;
       if (!canUseStoredCurrentDay) {
         degradedReason =
           "Stored current-day rollups were bypassed so same-day recall uses bounded fresh sources.";
-      } else if (pendingDayKey) {
+      } else if (familyPendingDayKeys.size > 0) {
+        const sortedKeys = Array.from(familyPendingDayKeys).sort();
         degradedReason =
-          `Rollup rebuild is pending for ${pendingDayKey}, so stored rollups for that day were bypassed.`;
+          `Rollup rebuild is pending for ${sortedKeys.join(", ")}, so stored rollups for that day were bypassed.`;
       } else if (pendingRebuildUnknown) {
         degradedReason =
           "Rollup rebuild is pending with unknown freshness bounds, so stored rollups were bypassed.";
@@ -1699,9 +1722,16 @@ export function createLcmRecentTool(input: {
           resolution.kind === "day" &&
           hasPendingRebuild
         ) {
-          if (pendingDayKey && expectedKeys.includes(pendingDayKey)) {
-            liveFallbackKeys.add(pendingDayKey);
-          } else if (pendingRebuildUnknown) {
+          // MAJOR-1 (audit/round1-2): use the union of pending day keys
+          // across the conversation family, not just the representative key.
+          let matchedAnyFamilyKey = false;
+          for (const familyKey of familyPendingDayKeys) {
+            if (expectedKeys.includes(familyKey)) {
+              liveFallbackKeys.add(familyKey);
+              matchedAnyFamilyKey = true;
+            }
+          }
+          if (!matchedAnyFamilyKey && pendingRebuildUnknown) {
             for (const expectedKey of expectedKeys) {
               liveFallbackKeys.add(expectedKey);
             }

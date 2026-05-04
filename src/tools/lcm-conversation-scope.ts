@@ -31,11 +31,6 @@ type ConversationScopeStore = ReturnType<LcmContextEngine["getConversationStore"
   listConversationsBySessionKey?: (
     sessionKey: string,
   ) => Promise<Array<{ conversationId: number }>>;
-  getConversationFamilyIds?: (input: {
-    conversationId?: number;
-    sessionId?: string;
-    sessionKey?: string;
-  }) => Promise<number[]>;
 };
 
 async function lookupConversationForSession(input: {
@@ -203,13 +198,20 @@ export async function resolveLcmConversationScope(input: {
 
 /**
  * Resolve the full conversation family (active + archived siblings sharing a
- * stable session identity). Prefers PR #338's `getConversationFamilyIds`
- * (which works for both session_key and session_id paths), and falls back to
- * v0.9.4's `listConversationsBySessionKey` when the new helper is absent
- * (eg. test mocks that only stub the older shim).
+ * stable session identity). Standardized on
+ * `listConversationsBySessionKey` (capped at 256 most-recent siblings,
+ * ordered `(active DESC, created_at DESC, conversation_id DESC)`).
  *
- * Returns an empty array when neither helper is available — callers must
- * fall back to the singleton `[conversationId]` themselves.
+ * MINOR (audit/round1-2): previously preferred a `getConversationFamilyIds`
+ * optional path which was never implemented on the real store, only stubbed
+ * in tests. Two paths with different orderings produced an unstable
+ * "session family rooted at X (N segments)" string (MAJOR-2). We now route
+ * everything through the single capped+ordered path; tests stub
+ * `listConversationsBySessionKey` instead.
+ *
+ * Returns an empty array when no `sessionKey` is available or the store does
+ * not implement `listConversationsBySessionKey` — callers must fall back to
+ * the singleton `[conversationId]` themselves.
  */
 async function collectFamilyConversationIds(input: {
   lcm: LcmContextEngine;
@@ -218,13 +220,6 @@ async function collectFamilyConversationIds(input: {
   sessionKey?: string;
 }): Promise<number[]> {
   const store = input.lcm.getConversationStore() as ConversationScopeStore;
-  if (typeof store.getConversationFamilyIds === "function") {
-    return store.getConversationFamilyIds({
-      conversationId: input.conversationId,
-      sessionId: input.sessionId,
-      sessionKey: input.sessionKey,
-    });
-  }
   const sessionKey = input.sessionKey?.trim();
   if (sessionKey && typeof store.listConversationsBySessionKey === "function") {
     const records = await store.listConversationsBySessionKey(sessionKey);

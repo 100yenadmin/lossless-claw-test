@@ -27,8 +27,8 @@ export function appendConversationScopeConstraint(params: {
     return;
   }
 
-  if (params.conversationId != null) {
+  if (params.conversationId != null && Number.isFinite(params.conversationId)) {
     params.where.push(`${params.columnExpr} = ?`);
-    params.args.push(params.conversationId);
+    params.args.push(Math.trunc(params.conversationId));
   }
 }
