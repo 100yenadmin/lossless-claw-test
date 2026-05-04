@@ -1,8 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import { escapeLikePattern, placeholders } from "../db/sql-utils.js";
+import { clampListLimit, escapeLikePattern, placeholders } from "../db/sql-utils.js";
 import { withDatabaseTransaction } from "../transaction-mutex.js";
-import { clampListLimit } from "../db/sql-utils.js";
 
 export type EventObservationKind =
   | "primary"
