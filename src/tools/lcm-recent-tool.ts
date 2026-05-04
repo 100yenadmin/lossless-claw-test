@@ -1101,6 +1101,35 @@ function getExpectedDayKeys(
   return keys;
 }
 
+/**
+ * C1/M2 (audit/round1): Centralized predicate that filters raw messages down
+ * to "operator-visible" rows the bounded fallback should treat as fresh
+ * evidence. Roles `tool` and `system` carry tool I/O / harness scaffolding
+ * that should never leak into recall, and the internal-context markers wrap
+ * harness-internal blocks. Keep this list in sync between every fallback
+ * query site (fetch / availableCount / hasFallbackSourceItemsInRange) so
+ * `totalMatches` telemetry and the "any source items?" probe agree with
+ * what is actually rendered.
+ */
+const SANITIZED_FALLBACK_INTERNAL_MARKERS = [
+  "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>",
+  "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>",
+  "[lossless-claw] missing tool result",
+] as const;
+
+function buildSanitizedMessagePredicate(messageAlias: string): string {
+  const markerClauses = SANITIZED_FALLBACK_INTERNAL_MARKERS.map(
+    (marker) =>
+      `instr(${messageAlias}.content, ${escapeSqlLiteral(marker)}) = 0`,
+  ).join("\n         AND ");
+  return `${messageAlias}.role IN ('user', 'assistant')
+         AND ${markerClauses}`;
+}
+
+function escapeSqlLiteral(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
 function getRecentSummaryFallback(
   db: DatabaseSync,
   conversationId: number | undefined,
@@ -1152,6 +1181,7 @@ function getRecentSummaryFallback(
        WHERE ${messageScopeClause}
          julianday(m.created_at) < julianday(?)
          AND julianday(m.created_at) >= julianday(?)
+         AND ${buildSanitizedMessagePredicate("m")}
          AND NOT EXISTS (
            SELECT 1
            FROM summary_messages sm
@@ -1189,6 +1219,7 @@ function getRecentSummaryFallback(
                  WHERE ${messageScopeClause}
                    julianday(m.created_at) < julianday(?)
                    AND julianday(m.created_at) >= julianday(?)
+                   AND ${buildSanitizedMessagePredicate("m")}
                    AND NOT EXISTS (
                      SELECT 1
                      FROM summary_messages sm
@@ -1268,6 +1299,7 @@ function hasFallbackSourceItemsInRange(
            WHERE ${messageScopeClause}
              julianday(m.created_at) < julianday(?)
              AND julianday(m.created_at) >= julianday(?)
+             AND ${buildSanitizedMessagePredicate("m")}
              AND NOT EXISTS (
                SELECT 1
                FROM summary_messages sm
@@ -1481,13 +1513,23 @@ export function createLcmRecentTool(input: {
 
       const currentDayKey = getZonedDayString(callTime, timezone);
       const rollupState = rollupStore.getState(conversationId);
-      const lastPendingMessageAt =
+      // M1 (audit/round1): also reject unparseable ISO strings here, not just at
+      // each downstream use site. A corrupt `last_message_at` column would
+      // otherwise produce an Invalid Date that compares falsy to range bounds
+      // but also is not `== null`, so `pendingRebuildUnknown` stayed false and
+      // stored rollups were silently served despite an unknown freshness
+      // boundary.
+      const parsedLastPendingMessageAt =
         rollupState?.pending_rebuild === 1 && rollupState.last_message_at
           ? new Date(rollupState.last_message_at)
           : null;
+      const lastPendingMessageAt =
+        parsedLastPendingMessageAt != null &&
+        !Number.isNaN(parsedLastPendingMessageAt.getTime())
+          ? parsedLastPendingMessageAt
+          : null;
       const pendingDayKey =
         lastPendingMessageAt &&
-        !Number.isNaN(lastPendingMessageAt.getTime()) &&
         lastPendingMessageAt >= resolution.start &&
         lastPendingMessageAt < resolution.end
           ? getZonedDayString(lastPendingMessageAt, timezone)
@@ -1495,24 +1537,20 @@ export function createLcmRecentTool(input: {
       const canUseStoredCurrentDay =
         resolution.periodKey == null || resolution.periodKey !== currentDayKey;
       const hasPendingRebuild = rollupState?.pending_rebuild === 1;
+      const pendingRebuildUnknown = hasPendingRebuild && lastPendingMessageAt == null;
       const pendingRebuildTouchesWindow =
-        hasPendingRebuild && (resolution.kind === "day" || pendingDayKey != null);
+        hasPendingRebuild && (pendingRebuildUnknown || pendingDayKey != null);
       const canUseStoredResolvedRollup =
-        canUseStoredCurrentDay &&
-        !pendingRebuildTouchesWindow &&
-        (resolution.kind === "day" || !hasPendingRebuild);
+        canUseStoredCurrentDay && !pendingRebuildTouchesWindow;
       if (!canUseStoredCurrentDay) {
         degradedReason =
           "Stored current-day rollups were bypassed so same-day recall uses bounded fresh sources.";
       } else if (pendingDayKey) {
         degradedReason =
           `Rollup rebuild is pending for ${pendingDayKey}, so stored rollups for that day were bypassed.`;
-      } else if (resolution.kind === "day" && hasPendingRebuild) {
+      } else if (pendingRebuildUnknown) {
         degradedReason =
-          "Rollup rebuild is pending, so stored day rollups were bypassed.";
-      } else if (resolution.kind && resolution.kind !== "day" && hasPendingRebuild) {
-        degradedReason =
-          "Rollup rebuild is pending, so stored aggregate rollups were bypassed.";
+          "Rollup rebuild is pending with unknown freshness bounds, so stored rollups were bypassed.";
       }
 
       if (
@@ -1585,7 +1623,14 @@ export function createLcmRecentTool(input: {
       } else if (
         resolution.kind &&
         !resolution.window &&
-        (resolution.kind === "day" || !hasPendingRebuild)
+        !pendingRebuildUnknown &&
+        // C2 (audit/round1): for week/month resolutions, also bypass stored
+        // rollups when the pending rebuild touches the window. Without this
+        // gate, a stored weekly/monthly rollup could be served when its
+        // underlying data has a pending rebuild that lands inside the window.
+        // Day resolution is already covered by the per-day usableKeys filter
+        // below (each missing/pending day falls through to liveFallbackKeys).
+        (resolution.kind === "day" || !pendingRebuildTouchesWindow)
       ) {
         // Cross-conversation: gather rollups across all conversations under
         // the same session_key, dedupe by period_key keeping the freshest.
@@ -1656,7 +1701,7 @@ export function createLcmRecentTool(input: {
         ) {
           if (pendingDayKey && expectedKeys.includes(pendingDayKey)) {
             liveFallbackKeys.add(pendingDayKey);
-          } else if (!pendingDayKey) {
+          } else if (pendingRebuildUnknown) {
             for (const expectedKey of expectedKeys) {
               liveFallbackKeys.add(expectedKey);
             }
