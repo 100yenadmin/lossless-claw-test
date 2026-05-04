@@ -70,6 +70,7 @@ import {
   type MessagePartRecord,
   type MessagePartType,
 } from "./store/conversation-store.js";
+import { ObservedWorkStore } from "./store/observed-work-store.js";
 import { RollupStore } from "./store/rollup-store.js";
 import { SummaryStore } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError } from "./summarize.js";
@@ -1868,6 +1869,7 @@ export class LcmContextEngine implements ContextEngine {
   private summaryStore: SummaryStore;
   private compactionTelemetryStore: CompactionTelemetryStore;
   private compactionMaintenanceStore: CompactionMaintenanceStore;
+  private observedWorkStore: ObservedWorkStore;
   private rollupStore: RollupStore;
   private rollupBuilder: RollupBuilder;
   private assembler: ContextAssembler;
@@ -2001,6 +2003,7 @@ export class LcmContextEngine implements ContextEngine {
       weeklyMaxTokens: this.config.rollupWeeklyMaxTokens,
       monthlyMaxTokens: this.config.rollupMonthlyMaxTokens,
     });
+    this.observedWorkStore = new ObservedWorkStore(this.db);
 
     if (!this.fts5Available) {
       this.deps.log.warn(
@@ -8009,6 +8012,10 @@ export class LcmContextEngine implements ContextEngine {
 
   getCompactionMaintenanceStore(): CompactionMaintenanceStore {
     return this.compactionMaintenanceStore;
+  }
+
+  getObservedWorkStore(): ObservedWorkStore {
+    return this.observedWorkStore;
   }
 
   getRollupStore(): RollupStore {
