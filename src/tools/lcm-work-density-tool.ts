@@ -47,7 +47,7 @@ const LcmWorkDensitySchema = Type.Object({
       description: "Reserved for a future bounded admin mode; currently rejected so density reads stay conversation-scoped.",
     })
   ),
-  period: Type.Optional(Type.String({ description: 'Observed work period: "today", "yesterday", "7d", "30d", "week", "month", or "date:YYYY-MM-DD". Explicit since/before wins when provided.' })),
+  period: Type.Optional(Type.String({ description: 'Observed work period: "today", "yesterday", "7d", "30d", "week", "month", "date:YYYY-MM-DD", or a bare "YYYY-MM-DD" (treated as that single day). Explicit since/before wins when provided.' })),
   since: Type.Optional(Type.String({ description: "Only include observed items last seen at or after this ISO timestamp." })),
   before: Type.Optional(Type.String({ description: "Only include observed items first seen before this ISO timestamp." })),
   topic: Type.Optional(Type.String({ description: "Exact topic_key filter." })),
@@ -109,7 +109,7 @@ function resolvePeriodBounds(
     };
   }
   throw new Error(
-    'period must be one of "today", "yesterday", "7d", "30d", "week", "month", or "date:YYYY-MM-DD".'
+    'period must be one of "today", "yesterday", "7d", "30d", "week", "month", "date:YYYY-MM-DD", or a bare "YYYY-MM-DD".'
   );
 }
 

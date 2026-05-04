@@ -176,6 +176,31 @@ export class ObservedWorkStore {
   constructor(private readonly db: DatabaseSync) {}
 
   upsertItem(item: ObservedWorkItemInput): void {
+    // Clamp confidence to [0, 1] before binding so out-of-range inputs from
+    // upstream extractors (e.g. an LLM returning 1.7 or -0.2) cannot poison
+    // downstream filters that assume the column stays in the documented range.
+    const confidenceRaw =
+      item.confidence == null
+        ? null
+        : Math.max(0, Math.min(1, item.confidence));
+    // For optional-with-default fields (confidence, confidence_band,
+    // authority_source, evidence_count, source_*_count), we bind NULL when the
+    // caller did not supply a value. The INSERT path uses COALESCE(?, default)
+    // in VALUES so the NOT-NULL constraints hold on first insert. The
+    // ON CONFLICT path then references the raw bound parameter via a separate
+    // placeholder so a missing value preserves the existing row instead of
+    // overwriting it with the default.
+    const ownerId = item.ownerId ?? null;
+    const description = item.description ?? null;
+    const confidenceBand = item.confidenceBand ?? null;
+    const rationale = item.rationale ?? null;
+    const topicKey = item.topicKey ?? null;
+    const evidenceCount = item.evidenceCount ?? null;
+    const sourceMessageCount = item.sourceMessageCount ?? null;
+    const sourceTokenCount = item.sourceTokenCount ?? null;
+    const authoritySource = item.authoritySource ?? null;
+    const sensitivity = item.sensitivity ?? null;
+    const visibility = item.visibility ?? null;
     this.db.prepare(
       `INSERT INTO lcm_observed_work_items (
         work_item_id, conversation_id, owner_id, title, description, observed_status, kind,
@@ -183,22 +208,36 @@ export class ObservedWorkStore {
         completed_at, completion_confidence, evidence_count, source_message_count,
         source_token_count, authority_source, sensitivity, visibility, fingerprint,
         fingerprint_version, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      ) VALUES (
+        ?, ?, ?, ?, ?, ?, ?,
+        COALESCE(?, 0.5), COALESCE(?, 'medium'), ?, ?, ?, ?,
+        ?, ?, COALESCE(?, 0), COALESCE(?, 0),
+        COALESCE(?, 0), COALESCE(?, 'lcm_observed'), ?, ?, ?,
+        ?, datetime('now')
+      )
       ON CONFLICT(work_item_id) DO UPDATE SET
         -- conversation_id is intentionally NOT updated on conflict. Treating it
         -- as immutable prevents an existing observed-work row (and its sources)
         -- from being silently moved between conversations if a workItemId is
         -- ever reused, which would corrupt history and leak evidence across
         -- conversation boundaries.
-        owner_id = excluded.owner_id,
+        --
+        -- Optional fields below use COALESCE(?, existing.X) so a partial
+        -- re-upsert (e.g. lighter snapshot that omits ownerId, description,
+        -- rationale, etc.) does not blow away values established by a richer
+        -- earlier snapshot. Counters use MAX so they cannot regress under a
+        -- smaller snapshot. Required fields (title, observed_status, kind)
+        -- and per-snapshot stable fields (fingerprint, last_seen_at, etc.)
+        -- are still overwritten directly.
+        owner_id = COALESCE(?, lcm_observed_work_items.owner_id),
         title = excluded.title,
-        description = excluded.description,
+        description = COALESCE(?, lcm_observed_work_items.description),
         observed_status = excluded.observed_status,
         kind = excluded.kind,
-        confidence = excluded.confidence,
-        confidence_band = excluded.confidence_band,
-        rationale = excluded.rationale,
-        topic_key = excluded.topic_key,
+        confidence = COALESCE(?, lcm_observed_work_items.confidence),
+        confidence_band = COALESCE(?, lcm_observed_work_items.confidence_band),
+        rationale = COALESCE(?, lcm_observed_work_items.rationale),
+        topic_key = COALESCE(?, lcm_observed_work_items.topic_key),
         first_seen_at = CASE
           WHEN excluded.first_seen_at < lcm_observed_work_items.first_seen_at
             THEN excluded.first_seen_at
@@ -223,39 +262,55 @@ export class ObservedWorkStore {
             THEN excluded.completion_confidence
           ELSE lcm_observed_work_items.completion_confidence
         END,
-        evidence_count = excluded.evidence_count,
-        source_message_count = excluded.source_message_count,
-        source_token_count = excluded.source_token_count,
-        authority_source = excluded.authority_source,
-        sensitivity = excluded.sensitivity,
-        visibility = excluded.visibility,
+        evidence_count = MAX(COALESCE(?, lcm_observed_work_items.evidence_count), lcm_observed_work_items.evidence_count),
+        source_message_count = MAX(COALESCE(?, lcm_observed_work_items.source_message_count), lcm_observed_work_items.source_message_count),
+        source_token_count = MAX(COALESCE(?, lcm_observed_work_items.source_token_count), lcm_observed_work_items.source_token_count),
+        authority_source = COALESCE(?, lcm_observed_work_items.authority_source),
+        sensitivity = COALESCE(?, lcm_observed_work_items.sensitivity),
+        visibility = COALESCE(?, lcm_observed_work_items.visibility),
         fingerprint = excluded.fingerprint,
         fingerprint_version = excluded.fingerprint_version,
         updated_at = datetime('now')`,
     ).run(
+      // INSERT VALUES binds (23 params)
       item.workItemId,
       item.conversationId,
-      item.ownerId ?? null,
+      ownerId,
       item.title,
-      item.description ?? null,
+      description,
       item.observedStatus,
       item.kind,
-      item.confidence ?? 0.5,
-      item.confidenceBand ?? "medium",
-      item.rationale ?? null,
-      item.topicKey ?? null,
+      confidenceRaw,
+      confidenceBand,
+      rationale,
+      topicKey,
       item.firstSeenAt,
       item.lastSeenAt,
       item.completedAt ?? null,
       item.completionConfidence ?? null,
-      item.evidenceCount ?? 0,
-      item.sourceMessageCount ?? 0,
-      item.sourceTokenCount ?? 0,
-      item.authoritySource ?? "lcm_observed",
-      item.sensitivity ?? null,
-      item.visibility ?? null,
+      evidenceCount,
+      sourceMessageCount,
+      sourceTokenCount,
+      authoritySource,
+      sensitivity,
+      visibility,
       item.fingerprint,
       item.fingerprintVersion ?? 1,
+      // ON CONFLICT DO UPDATE binds — re-bind the raw NULL-or-value so the
+      // COALESCE(?, existing.X) pattern preserves prior values on partial
+      // re-upserts.
+      ownerId,
+      description,
+      confidenceRaw,
+      confidenceBand,
+      rationale,
+      topicKey,
+      evidenceCount,
+      sourceMessageCount,
+      sourceTokenCount,
+      authoritySource,
+      sensitivity,
+      visibility,
     );
   }
 

@@ -1297,6 +1297,14 @@ export function runLcmMigrations(
         CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_status_kind_seen_idx
           ON lcm_observed_work_items(conversation_id, observed_status, kind, last_seen_at DESC);
 
+        -- Per-status density hot path: when 'kind' is unconstrained (the
+        -- default density tool call), the kind-bearing composite index above
+        -- forces SQLite into a TEMP B-TREE for the ORDER BY last_seen_at DESC
+        -- step. This narrower index lets the planner walk directly in
+        -- last_seen_at order for the (conversation, status) prefix.
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_status_seen_idx
+          ON lcm_observed_work_items(conversation_id, observed_status, last_seen_at DESC);
+
         CREATE INDEX IF NOT EXISTS lcm_observed_work_items_owner_status_kind_seen_idx
           ON lcm_observed_work_items(owner_id, observed_status, kind, last_seen_at DESC);
 
