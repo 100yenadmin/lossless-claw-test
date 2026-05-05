@@ -45,7 +45,12 @@ import {
   type EvalMode,
   type RunEvalArgs,
 } from "../operator/eval-runner.js";
-import { getWorkerStatusSnapshot } from "../operator/worker-orchestrator.js";
+import {
+  getWorkerStatusSnapshot,
+  tickEmbeddingBackfill,
+} from "../operator/worker-orchestrator.js";
+import { countPendingDocs as countBackfillPending } from "../embeddings/backfill.js";
+import { getActiveEmbeddingModel } from "../embeddings/semantic-search.js";
 import { runHybridSearch } from "../embeddings/hybrid-search.js";
 import { vec0Version } from "../embeddings/store.js";
 import { SummaryStore } from "../store/summary-store.js";
@@ -97,6 +102,7 @@ type ParsedLcmCommand =
   | { kind: "doctor_cleaners"; apply: boolean; filterId?: DoctorCleanerId; vacuum: boolean }
   | { kind: "health" }
   | { kind: "worker_status" }
+  | { kind: "worker_tick_backfill" }
   | { kind: "reconcile_session_keys_list" }
   | {
       kind: "reconcile_session_keys_apply";
@@ -486,22 +492,36 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
       };
     }
     case "worker": {
-      // /lcm worker [status]
-      // Currently only `status` is wired (Final review #3 partial fix).
-      // Manual `tick <kind>` is deferred to a follow-up wiring commit
-      // — the underlying orchestrator service is in src/operator/
-      // worker-orchestrator.ts; production wiring needs an LLM-call
-      // injection path that's not yet plumbed through the plugin.
+      // /lcm worker [status | tick <kind>]
       if (rest.length === 0 || rest[0]?.toLowerCase() === "status") {
         return { kind: "worker_status" };
       }
+      if (rest[0]?.toLowerCase() === "tick") {
+        const kind = rest[1]?.toLowerCase();
+        if (!kind) {
+          return {
+            kind: "help",
+            error:
+              `\`${VISIBLE_COMMAND} worker tick\` requires a job kind. ` +
+              `Supported: \`embedding-backfill\`. ` +
+              `Other kinds (extraction, procedure-mining, themes-consolidation) ` +
+              `need LLM-call injection wiring — deferred to a cycle-2 commit.`,
+          };
+        }
+        if (kind !== "embedding-backfill") {
+          return {
+            kind: "help",
+            error:
+              `\`${VISIBLE_COMMAND} worker tick ${kind}\` not supported. ` +
+              `Only \`embedding-backfill\` is wired today (no LLM call needed; uses Voyage HTTP directly). ` +
+              `Extraction / procedure-mining / themes-consolidation need LLM-injection wiring (cycle-2).`,
+          };
+        }
+        return { kind: "worker_tick_backfill" };
+      }
       return {
         kind: "help",
-        error:
-          `\`${VISIBLE_COMMAND} worker\` currently supports \`status\` only. ` +
-          `Manual \`tick <kind>\` deferred to follow-up; backfill / extraction / ` +
-          `procedure-mining / themes-consolidation services exist in src/operator/ ` +
-          `but are not yet wired into the plugin lifecycle (cycle-2 work).`,
+        error: `\`${VISIBLE_COMMAND} worker\` accepts \`status\` (default) or \`tick <kind>\`.`,
       };
     }
     case "doctor":
@@ -1585,6 +1605,112 @@ function buildWorkerStatusText(params: { db: DatabaseSync }): string {
   return lines.join("\n");
 }
 
+/**
+ * /lcm worker tick embedding-backfill
+ *
+ * Runs ONE tick of the embedding-backfill cron against the active
+ * embedding profile. Reads VOYAGE_API_KEY from env. perTickLimit
+ * default 200 (covers ~7-15 minutes of work at 0.5 RPS); operator
+ * can re-invoke until pending count is 0.
+ *
+ * Returns markdown summary of the tick result + a hint about the next
+ * tick if work remains.
+ */
+async function buildWorkerTickBackfillText(params: { db: DatabaseSync }): Promise<string> {
+  const lines: string[] = [...buildHeaderLines(), "", "### Worker Tick — embedding-backfill", ""];
+
+  // 1. Pre-flight checks
+  if (!process.env.VOYAGE_API_KEY?.trim()) {
+    lines.push("**ERROR**: `VOYAGE_API_KEY` env var is empty.");
+    lines.push("");
+    lines.push("Set it via your shell or `.envrc` and retry. See `~/.openclaw/credentials/voyage-api-key`.");
+    return lines.join("\n");
+  }
+  if (vec0Version(params.db) === null) {
+    lines.push("**ERROR**: sqlite-vec extension not loaded.");
+    lines.push("");
+    lines.push(
+      "Embedding backfill requires sqlite-vec. Install via `pnpm add sqlite-vec` (or upstream's preferred path) and restart the gateway.",
+    );
+    return lines.join("\n");
+  }
+  const active = getActiveEmbeddingModel(params.db);
+  if (!active) {
+    lines.push("**ERROR**: no active embedding model registered in `lcm_embedding_profile`.");
+    lines.push("");
+    lines.push(
+      "Register one before backfilling. Example for voyage-4-large (1024 dims):",
+    );
+    lines.push("```sql");
+    lines.push(
+      "INSERT INTO lcm_embedding_profile (model_name, dim, active) VALUES ('voyage-4-large', 1024, 1);",
+    );
+    lines.push("```");
+    lines.push(
+      "Then call `ensureEmbeddingsTable(db, 'voyage-4-large', 1024)` from a Node script (it creates the vec0 virtual table + cascade triggers).",
+    );
+    return lines.join("\n");
+  }
+
+  // 2. Pre-tick stats
+  const pendingBefore = countBackfillPending(params.db, { modelName: active.modelName });
+  lines.push(`**Active model**: ${active.modelName} (dim=${active.dim})`);
+  lines.push(`**Pending docs before tick**: ${pendingBefore}`);
+  if (pendingBefore === 0) {
+    lines.push("");
+    lines.push("Nothing to do. All eligible leaves already embedded.");
+    return lines.join("\n");
+  }
+
+  // 3. Run the tick
+  lines.push("");
+  lines.push("Running tick (perTickLimit=200; may take 5-15 min at 0.5 RPS)...");
+  const startedAt = Date.now();
+  let result;
+  try {
+    result = await tickEmbeddingBackfill(params.db, {
+      modelName: active.modelName,
+      voyageModel: active.modelName as Parameters<typeof tickEmbeddingBackfill>[1]["voyageModel"],
+      inputType: "document",
+      // operator-tick uses longer Voyage budget than agent-hot-path
+      voyageMaxRetries: 2,
+      voyageTimeoutMs: 30_000,
+      maxRequestsPerSecond: 0.5,
+      perTickLimit: 200,
+    });
+  } catch (e) {
+    lines.push("");
+    lines.push(`**ERROR**: backfill tick failed: ${e instanceof Error ? e.message : String(e)}`);
+    return lines.join("\n");
+  }
+  const durationMs = Date.now() - startedAt;
+
+  // 4. Result + next-step hint
+  lines.push("");
+  lines.push("### Result");
+  lines.push("");
+  lines.push(`- **Embedded**: ${result.embeddedCount}`);
+  lines.push(`- **Skipped (over-cap)**: ${result.skippedOverCap}`);
+  lines.push(`- **Skipped (other failures)**: ${result.skipped.length}`);
+  lines.push(`- **Voyage tokens consumed**: ${result.voyageTokensConsumed.toLocaleString()}`);
+  lines.push(`- **Duration**: ${(durationMs / 1000).toFixed(1)}s`);
+  if (result.lockNotAcquired) {
+    lines.push("- **Lock contention**: another worker held the lock; this tick was a no-op");
+  }
+
+  const pendingAfter = countBackfillPending(params.db, { modelName: active.modelName });
+  lines.push("");
+  lines.push(`**Pending docs after tick**: ${pendingAfter}`);
+  if (pendingAfter > 0) {
+    lines.push("");
+    lines.push(`Re-run \`${VISIBLE_COMMAND} worker tick embedding-backfill\` to continue.`);
+  } else {
+    lines.push("");
+    lines.push("✅ Backfill complete. `lcm_semantic_recall` and `lcm_grep --mode hybrid` should now return real results.");
+  }
+  return lines.join("\n");
+}
+
 function buildReconcileListText(params: { db: DatabaseSync }): string {
   const candidates = listLegacyCandidates(params.db);
   const lines: string[] = [
@@ -2149,6 +2275,8 @@ export function createLcmCommand(params: {
           return { text: buildHealthText({ db: await getDb() }) };
         case "worker_status":
           return { text: buildWorkerStatusText({ db: await getDb() }) };
+        case "worker_tick_backfill":
+          return { text: await buildWorkerTickBackfillText({ db: await getDb() }) };
         case "reconcile_session_keys_list":
           return { text: buildReconcileListText({ db: await getDb() }) };
         case "reconcile_session_keys_apply":

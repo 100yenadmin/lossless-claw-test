@@ -462,6 +462,31 @@ export class SummaryStore {
       )
       .get(input.summaryId) as unknown as SummaryRow;
 
+    // v4.1 §0/§6.1 — Leaf-write hook: enqueue async entity coreference
+    // extraction. NEVER inline (would couple gateway hot path to LLM
+    // latency, per the v3.1 invariant). Just inserts a queue row so the
+    // worker (Group F orchestrator) can pick it up later. Best-effort —
+    // if lcm_extraction_queue doesn't exist (pre-migration) or the
+    // insert fails, leaf-write still succeeds.
+    //
+    // MUST run BEFORE the FTS-availability early-return so FTS-disabled
+    // installs (or in-memory test DBs) still get the queue write.
+    if (input.kind === "leaf") {
+      try {
+        const queueId = `q_${input.summaryId}_${Date.now().toString(36)}`;
+        this.db
+          .prepare(
+            `INSERT INTO lcm_extraction_queue (queue_id, leaf_id, kind, queued_at)
+             VALUES (?, ?, 'entity', datetime('now'))`,
+          )
+          .run(queueId, input.summaryId);
+      } catch {
+        // lcm_extraction_queue not present (pre-migration) OR queue_id
+        // collision (incredibly rare given the timestamp suffix). Either
+        // way: leaf-write must succeed regardless.
+      }
+    }
+
     // Index in FTS5 as best-effort; compaction flow must continue even if
     // FTS indexing fails for any reason.
     if (!this.fts5Available) {
