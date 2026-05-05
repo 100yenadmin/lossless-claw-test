@@ -179,6 +179,29 @@ export function vec0Version(db: DatabaseSync): string | null {
  *     without a separate JOIN to summaries).
  *
  * Idempotent via `IF NOT EXISTS`.
+ *
+ * Also creates per-model triggers on `summaries` (B.03):
+ *
+ *   - `lcm_embed_suppress_<slug>` — AFTER UPDATE OF suppressed_at on
+ *     summaries, mirrors NULL-vs-not-NULL into vec0.suppressed metadata
+ *     col. Why we use a trigger: the suppression cascade has to fire
+ *     every time the operator marks a leaf suppressed (could be from
+ *     any path — `lcm_purge`, agent tool, manual SQL); a trigger is
+ *     guaranteed-by-DB rather than guaranteed-by-convention.
+ *
+ *   - `lcm_embed_delete_<slug>` — AFTER DELETE on summaries, removes
+ *     vec0 row. Why a trigger and not FK CASCADE: vec0 corrupts under
+ *     FK constraints (v4.1.1 finding). Trigger is the only safe path.
+ *
+ * Both triggers are per-model (one set per `lcm_embeddings_<slug>` table)
+ * because vec0 SQL doesn't support dynamic table-name resolution inside
+ * triggers — each trigger references its specific vec0 table by name.
+ *
+ * v4.1.1 NOTE on entities/themes: parallel triggers should be created
+ * for `lcm_entities` and `lcm_themes` when those embeddings are added
+ * (Group E entity coreference, Group G themes). For now the embedding
+ * store only knows about summary embeddings; entity/theme triggers will
+ * extend this helper or land their own when Groups E/G ship.
  */
 export function ensureEmbeddingsTable(
   db: DatabaseSync,
@@ -189,8 +212,8 @@ export function ensureEmbeddingsTable(
     throw new Error(`[embeddings.store] invalid dim ${dim} (must be 1-4096)`);
   }
   const tableName = embeddingsTableName(modelName);
-  // No bind params allowed in CREATE VIRTUAL TABLE; we've validated
-  // tableName via embeddingsTableName regex + dim is a safe int.
+  // No bind params allowed in CREATE VIRTUAL TABLE / CREATE TRIGGER;
+  // tableName has been validated via embeddingsTableName regex (alphanum+underscore).
   db.exec(
     `CREATE VIRTUAL TABLE IF NOT EXISTS ${tableName} USING vec0(
        embedding float[${dim}],
@@ -199,6 +222,56 @@ export function ensureEmbeddingsTable(
        suppressed integer
      )`,
   );
+
+  // Per-model suppression cascade trigger. Fires only when the
+  // suppressed_at column actually transitioned NULL ↔ not-NULL — avoids
+  // unnecessary work when other columns of summaries are updated. We use
+  // BigInt literal-style 0/1 in CASE because vec0 INTEGER metadata cols
+  // require integer-typed values (JS-floats rejected).
+  db.exec(
+    `CREATE TRIGGER IF NOT EXISTS lcm_embed_suppress_${tableName.replace(/^lcm_embeddings_/, "")}
+       AFTER UPDATE OF suppressed_at ON summaries
+       WHEN (NEW.suppressed_at IS NULL) != (OLD.suppressed_at IS NULL)
+       BEGIN
+         UPDATE ${tableName}
+           SET suppressed = CASE WHEN NEW.suppressed_at IS NULL THEN 0 ELSE 1 END
+           WHERE embedded_id = NEW.summary_id AND embedded_kind = 'summary';
+       END`,
+  );
+
+  // Per-model deletion cascade trigger. Fires on hard-delete of a summary
+  // (only path: lcm_purge with --immediate, or migration cleanup). Removes
+  // the vec0 row so KNN doesn't return a dangling pointer.
+  db.exec(
+    `CREATE TRIGGER IF NOT EXISTS lcm_embed_delete_${tableName.replace(/^lcm_embeddings_/, "")}
+       AFTER DELETE ON summaries
+       BEGIN
+         DELETE FROM ${tableName}
+           WHERE embedded_id = OLD.summary_id AND embedded_kind = 'summary';
+       END`,
+  );
+}
+
+/**
+ * Drop the per-model triggers (and optionally the vec0 table) for a
+ * given model. Used during model archival / cutover.
+ *
+ * If `dropTable` is true, also drops the vec0 virtual table itself —
+ * unrecoverable. Default false (keeps the table for forensic queries
+ * even after archival; only the active flag flips in `lcm_embedding_profile`).
+ */
+export function dropEmbeddingsTriggers(
+  db: DatabaseSync,
+  modelName: string,
+  opts: { dropTable?: boolean } = {},
+): void {
+  const tableName = embeddingsTableName(modelName);
+  const slug = tableName.replace(/^lcm_embeddings_/, "");
+  db.exec(`DROP TRIGGER IF EXISTS lcm_embed_suppress_${slug}`);
+  db.exec(`DROP TRIGGER IF EXISTS lcm_embed_delete_${slug}`);
+  if (opts.dropTable) {
+    db.exec(`DROP TABLE IF EXISTS ${tableName}`);
+  }
 }
 
 /**

@@ -1821,6 +1821,30 @@ export function runLcmMigrations(
       `);
     });
 
+    // v4.1 B.03 — meta-table cleanup trigger on summaries hard-delete.
+    //
+    // lcm_embedding_meta has no FK to summaries (polymorphic embedded_id —
+    // can also reference lcm_entities or lcm_themes). So FK CASCADE can't
+    // do this cleanup. Trigger fires on summaries DELETE and removes only
+    // the rows for the corresponding summary (kind='summary' filter so we
+    // never accidentally delete entity/theme meta).
+    //
+    // Note: this trigger is INDEPENDENT of the per-model triggers in
+    // src/embeddings/store.ts. Those handle vec0 cleanup (one per
+    // active embedding model). This trigger handles the SHARED meta
+    // sidecar that exists once regardless of how many models are active.
+    runMigrationStep("ensureLcmEmbeddingMetaCleanupTrigger", log, () => {
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS lcm_embedding_meta_cleanup_summary
+          AFTER DELETE ON summaries
+          BEGIN
+            DELETE FROM lcm_embedding_meta
+              WHERE embedded_id = OLD.summary_id
+                AND embedded_kind = 'summary';
+          END
+      `);
+    });
+
     // ── v4.1 indexes on summaries (A.08) ────────────────────────────────────
     // These are CONDITIONAL on the v4.1 columns existing (added by A.02
     // ensureSummaryV41Columns above), so we run them after that step.
