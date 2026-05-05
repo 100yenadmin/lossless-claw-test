@@ -32,6 +32,12 @@ export type SharedLcmInit = {
    * accidentally start a second autostart loop on the same DB.
    */
   backfillAutostart?: { stop: () => void } | null;
+  /**
+   * v4.1 cycle-2: extraction autostart handle. Same lifecycle as
+   * backfillAutostart. Drains lcm_extraction_queue with an LLM-backed
+   * entity extractor.
+   */
+  extractionAutostart?: { stop: () => void } | null;
 };
 
 const SHARED_KEY = Symbol.for(

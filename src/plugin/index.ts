@@ -22,11 +22,13 @@ import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
 import { createLcmRecentThemesTool } from "../tools/lcm-recent-themes-tool.js";
 import { createLcmSemanticRecallTool } from "../tools/lcm-semantic-recall-tool.js";
 import { createLcmThemeExplainTool } from "../tools/lcm-theme-explain-tool.js";
+import { createLcmSynthesizeAroundTool } from "../tools/lcm-synthesize-around-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
 import {
   tryStartBackfillAutostart,
   type AutostartHandle,
 } from "../operator/backfill-autostart.js";
+import { tryStartExtractionAutostart } from "../operator/extraction-autostart.js";
 import type { LcmDependencies, StartupSessionFileCandidate } from "../types.js";
 
 /** Parse `agent:<agentId>:<suffix...>` session keys. */
@@ -2397,6 +2399,9 @@ function wirePluginHandlers(
   api.registerTool((ctx) =>
     createLcmThemeExplainTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
   );
+  api.registerTool((ctx) =>
+    createLcmSynthesizeAroundTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  );
 
   api.registerCommand(
     createLcmCommand({
@@ -2603,6 +2608,11 @@ const lcmPlugin = {
         shared.backfillAutostart.stop();
         shared.backfillAutostart = null;
       }
+      // v4.1 cycle-2: stop the extraction autostart loop too.
+      if (shared.extractionAutostart) {
+        shared.extractionAutostart.stop();
+        shared.extractionAutostart = null;
+      }
       if (!lcm && !database) {
         rejectDeferredEngine(new Error("[lcm] Database connection closed after gateway_stop"));
       }
@@ -2634,6 +2644,23 @@ const lcmPlugin = {
       } catch (e) {
         deps.log.warn(
           `[lcm] backfill autostart: skipped — DB init failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    })();
+
+    // v4.1 cycle-2: extraction (entity coref) autostart. Default ON
+    // (opt-out via LCM_EXTRACTION_LLM_ENABLED=false); uses deps.complete
+    // for the LLM call (reuses existing model/auth resolution chain).
+    // Drains lcm_extraction_queue every 60s.
+    void (async () => {
+      try {
+        const db = await shared.waitForDatabase();
+        if (shared.stopped) return;
+        const handle = tryStartExtractionAutostart(db, { log: deps.log, deps });
+        shared.extractionAutostart = handle;
+      } catch (e) {
+        deps.log.warn(
+          `[lcm] extraction autostart: skipped — DB init failed: ${e instanceof Error ? e.message : String(e)}`,
         );
       }
     })();

@@ -14,7 +14,8 @@
       "lcm_describe",
       "lcm_expand",
       "lcm_expand_query",
-      "lcm_recent_themes"
+      "lcm_recent_themes",
+      "lcm_theme_explain"
     ]
   },
   "uiHints": {
