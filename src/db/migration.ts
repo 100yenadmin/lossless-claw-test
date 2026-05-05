@@ -1858,6 +1858,68 @@ export function runLcmMigrations(
       `);
     });
 
+    // v4.1 §6.3 / Group G — themes (idle consolidation; agent-explicit
+    // only, NEVER in assemble() pyramid per RAG-leak agent finding).
+    runMigrationStep("ensureLcmThemesTable", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_themes (
+          theme_id TEXT NOT NULL PRIMARY KEY,
+          session_key TEXT NOT NULL,
+          name TEXT NOT NULL,
+          description TEXT NOT NULL,
+          source_leaf_count INTEGER NOT NULL,
+          consolidated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          status TEXT NOT NULL DEFAULT 'active'
+            CHECK (status IN ('active', 'stale', 'archived')),
+          consolidation_model TEXT,
+          consolidation_pass_id TEXT
+        )
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_themes_lookup_idx
+          ON lcm_themes (session_key, status, consolidated_at DESC)
+      `);
+    });
+
+    // lcm_theme_sources: normalized many-to-many between themes and the
+    // leaves they were consolidated from. CASCADE both directions:
+    //   - DELETE theme → drop all source rows
+    //   - DELETE summary (purge) → drop the rows pointing to that summary
+    //     (theme stays; source_leaf_count stale until next consolidation)
+    runMigrationStep("ensureLcmThemeSourcesTable", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_theme_sources (
+          theme_id TEXT NOT NULL REFERENCES lcm_themes(theme_id) ON DELETE CASCADE,
+          summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
+          PRIMARY KEY (theme_id, summary_id)
+        )
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_theme_sources_by_summary_idx
+          ON lcm_theme_sources (summary_id)
+      `);
+    });
+
+    // Theme cleanup trigger: when a leaf is suppressed (NOT deleted),
+    // mark all themes that referenced it as 'stale' so the next
+    // consolidation pass re-builds them. The CASCADE on DELETE handles
+    // the hard-purge path; this trigger handles the soft-suppress path.
+    runMigrationStep("ensureLcmThemesStaleTrigger", log, () => {
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS lcm_themes_stale_on_suppress
+          AFTER UPDATE OF suppressed_at ON summaries
+          WHEN (NEW.suppressed_at IS NULL) != (OLD.suppressed_at IS NULL)
+            AND NEW.suppressed_at IS NOT NULL
+          BEGIN
+            UPDATE lcm_themes SET status = 'stale'
+              WHERE status = 'active' AND theme_id IN (
+                SELECT DISTINCT theme_id FROM lcm_theme_sources
+                  WHERE summary_id = NEW.summary_id
+              );
+          END
+      `);
+    });
+
     // ── v4.1 indexes on summaries (A.08) ────────────────────────────────────
     // These are CONDITIONAL on the v4.1 columns existing (added by A.02
     // ensureSummaryV41Columns above), so we run them after that step.
