@@ -21,6 +21,10 @@ import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
 import { createLcmSemanticRecallTool } from "../tools/lcm-semantic-recall-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
+import {
+  tryStartBackfillAutostart,
+  type AutostartHandle,
+} from "../operator/backfill-autostart.js";
 import type { LcmDependencies, StartupSessionFileCandidate } from "../types.js";
 
 /** Parse `agent:<agentId>:<suffix...>` session keys. */
@@ -2585,6 +2589,12 @@ const lcmPlugin = {
     api.on("gateway_stop", async () => {
       stopped = true;
       shared.stopped = true;
+      // v4.1 Wire-2: stop the backfill autostart loop (if running) so
+      // we don't make a Voyage call after the DB connection closes.
+      if (shared.backfillAutostart) {
+        shared.backfillAutostart.stop();
+        shared.backfillAutostart = null;
+      }
       if (!lcm && !database) {
         rejectDeferredEngine(new Error("[lcm] Database connection closed after gateway_stop"));
       }
@@ -2597,6 +2607,28 @@ const lcmPlugin = {
     });
 
     wirePluginHandlers(api, deps, shared);
+
+    // v4.1 Wire-2: try to start the embedding-backfill autostart loop.
+    // Best-effort + opt-in (gated on VOYAGE_API_KEY env var). If any
+    // pre-flight fails (no key / no vec0 / no active model), the helper
+    // logs once and returns a NO_OP_HANDLE — gateway boots normally.
+    //
+    // The autostart needs an OPEN db handle. waitForDatabase resolves
+    // either immediately (if eager init succeeded) or once the deferred
+    // init completes; we await it here in a fire-and-forget so plugin
+    // load isn't blocked.
+    void (async () => {
+      try {
+        const db = await shared.waitForDatabase();
+        if (shared.stopped) return; // gateway_stop fired during wait
+        const handle = tryStartBackfillAutostart(db, { log: deps.log });
+        shared.backfillAutostart = handle;
+      } catch (e) {
+        deps.log.warn(
+          `[lcm] backfill autostart: skipped — DB init failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    })();
 
     logStartupBannerOnce({
       key: "plugin-loaded",
