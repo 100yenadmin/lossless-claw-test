@@ -1555,6 +1555,85 @@ export function runLcmMigrations(
       `);
     });
 
+    // ── v4.1 eval harness tables (A.05) ─────────────────────────────────────
+    // Per v4.1 §11 + v4.1.1 (revising the v4 design): N≥100 stratified
+    // queries, 2× empirical SD threshold (calibrate by 5x repeated runs),
+    // ensemble judge, mixed absolute+pairwise per dimension, drift index
+    // for cumulative regression. Measures BOTH retrieval recall AND
+    // synthesis quality (separate metrics, not collapsed).
+    runMigrationStep("ensureLcmEvalQuerySetTable", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_eval_query_set (
+          query_set_id TEXT NOT NULL PRIMARY KEY,
+          version INTEGER NOT NULL,
+          description TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+      `);
+    });
+
+    runMigrationStep("ensureLcmEvalQueryTable", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_eval_query (
+          query_id TEXT NOT NULL PRIMARY KEY,
+          query_set_id TEXT NOT NULL REFERENCES lcm_eval_query_set(query_set_id) ON DELETE CASCADE,
+          query_text TEXT NOT NULL,
+          stratum TEXT NOT NULL CHECK (stratum IN ('fts-easy', 'fts-medium', 'paraphrastic')),
+          expected_topics TEXT NOT NULL,
+          expected_sources TEXT,
+          reference_summary TEXT,
+          must_not_regress INTEGER NOT NULL DEFAULT 0,
+          rubric TEXT NOT NULL
+        )
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_eval_query_set_stratum_idx
+          ON lcm_eval_query (query_set_id, stratum)
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_eval_query_must_not_regress_idx
+          ON lcm_eval_query (query_set_id)
+          WHERE must_not_regress = 1
+      `);
+    });
+
+    runMigrationStep("ensureLcmEvalRunTable", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_eval_run (
+          run_id TEXT NOT NULL PRIMARY KEY,
+          query_set_id TEXT NOT NULL REFERENCES lcm_eval_query_set(query_set_id) ON DELETE CASCADE,
+          prompt_bundle_version INTEGER NOT NULL,
+          ran_at TEXT NOT NULL DEFAULT (datetime('now')),
+          retrieval_recall_score REAL NOT NULL,
+          synthesis_quality_score REAL NOT NULL,
+          per_query_scores TEXT NOT NULL,
+          judge_models TEXT NOT NULL,
+          noise_floor_sd REAL,
+          trigger TEXT NOT NULL CHECK (trigger IN ('manual', 'prompt-update', 'model-update', 'ci', 'nightly'))
+        )
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_eval_run_recent_idx
+          ON lcm_eval_run (query_set_id, ran_at DESC)
+      `);
+    });
+
+    runMigrationStep("ensureLcmEvalDriftTable", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_eval_drift (
+          drift_id TEXT NOT NULL PRIMARY KEY,
+          query_set_id TEXT NOT NULL REFERENCES lcm_eval_query_set(query_set_id) ON DELETE CASCADE,
+          cumulative_delta REAL NOT NULL,
+          window_runs INTEGER NOT NULL,
+          computed_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_eval_drift_recent_idx
+          ON lcm_eval_drift (query_set_id, computed_at DESC)
+      `);
+    });
+
     db.exec(`COMMIT`);
     transactionActive = false;
   } catch (error) {
