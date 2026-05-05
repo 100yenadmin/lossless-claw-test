@@ -113,10 +113,16 @@ export interface SynthesizeRequest {
   sourceText: string;
   /**
    * Either targetSummaryId (rewriting an existing summaries row) OR
-   * targetCacheId (writing to lcm_synthesis_cache). Audit row needs
-   * exactly one (CHECK constraint on the table). For a synthesis pass
-   * that doesn't yet have a target (e.g., dry-run), pass neither —
-   * the audit row will be skipped.
+   * targetCacheId (writing to lcm_synthesis_cache). REQUIRED — the
+   * lcm_synthesis_audit table has CHECK (target_summary_id IS NOT NULL
+   * OR target_cache_id IS NOT NULL); passing neither throws
+   * SynthesisDispatchError("missing_target") up-front rather than
+   * deferring to a confusing CHECK violation mid-pass.
+   *
+   * (Group D adversarial Gap 1 fix: previous docstring claimed dry-run
+   * was supported via skipping the audit row; the implementation
+   * always inserted, so dry-run requests crashed with a raw SQLite
+   * error before any LLM call.)
    */
   targetSummaryId?: string;
   targetCacheId?: string;
@@ -165,7 +171,12 @@ export interface SynthesizeResult {
 
 export class SynthesisDispatchError extends Error {
   constructor(
-    public readonly kind: "missing_prompt" | "llm_failure" | "judge_failure",
+    public readonly kind:
+      | "missing_prompt"
+      | "missing_target"
+      | "llm_failure"
+      | "judge_failure"
+      | "audit_insert_failure",
     message: string,
   ) {
     super(message);
@@ -188,6 +199,17 @@ export async function dispatchSynthesis(
   llmCall: LlmCall,
   req: SynthesizeRequest,
 ): Promise<SynthesizeResult> {
+  // Group D adversarial Gap 1 fix: validate target up-front. The
+  // CHECK constraint on lcm_synthesis_audit would catch this later
+  // anyway, but we throw a clear typed error before touching the LLM.
+  if (!req.targetSummaryId && !req.targetCacheId) {
+    throw new SynthesisDispatchError(
+      "missing_target",
+      "[synthesis.dispatch] either targetSummaryId or targetCacheId is required " +
+        "(lcm_synthesis_audit CHECK constraint requires one of them set)",
+    );
+  }
+
   // 1. Look up active prompt for the primary pass
   const tier = req.tier;
   const passKinds = PASS_STRATEGY_BY_TIER[tier];
@@ -322,18 +344,31 @@ async function runPassWithAudit(
   audit: PassAuditCtx,
 ): Promise<PassResult> {
   const auditId = `audit_${audit.passSessionId}_${audit.promptId.slice(-6)}_${randomSuffix()}`;
-  // Insert 'started' row up-front so a failure leaves a forensic record
-  insertAuditRow(db, {
-    auditId,
-    passSessionId: audit.passSessionId,
-    targetSummaryId: audit.targetSummaryId ?? null,
-    targetCacheId: audit.targetCacheId ?? null,
-    promptId: audit.promptId,
-    passKind: llmArgs.passKind,
-    passInputTruncated: truncateForAudit(audit.passInputForAudit),
-    status: "started",
-    modelUsed: llmArgs.model,
-  });
+  // Group D adversarial Gap 4 fix: wrap insertAuditRow in try/catch so
+  // FK violations (bad target_summary_id) and CHECK violations surface
+  // as typed SynthesisDispatchError(audit_insert_failure) instead of
+  // raw SQLite errors. Forensic record still attempted; if THAT fails,
+  // the typed error tells the caller the LLM was never called.
+  try {
+    insertAuditRow(db, {
+      auditId,
+      passSessionId: audit.passSessionId,
+      targetSummaryId: audit.targetSummaryId ?? null,
+      targetCacheId: audit.targetCacheId ?? null,
+      promptId: audit.promptId,
+      passKind: llmArgs.passKind,
+      passInputTruncated: truncateForAudit(audit.passInputForAudit),
+      status: "started",
+      modelUsed: llmArgs.model,
+    });
+  } catch (e: unknown) {
+    throw new SynthesisDispatchError(
+      "audit_insert_failure",
+      `[synthesis.dispatch] failed to insert 'started' audit row (LLM not called): ${
+        e instanceof Error ? e.message : String(e)
+      }`,
+    );
+  }
 
   let result: LlmCallResult;
   try {
@@ -474,7 +509,15 @@ async function runBestOfNYearly(
         maxOutputTokens: undefined,
       },
       {
-        passSessionId: `${req.passSessionId}_cand${i}`,
+        // Group D adversarial Gap 2 fix: ALL passes in this best-of-N
+        // attempt share the same pass_session_id so operators can
+        // SELECT WHERE pass_session_id = X to retrieve the full
+        // attempt's audit trail. (Previously each candidate had a
+        // distinct `_cand${i}` suffix, splattering rows across N+1
+        // distinct sessions and breaking the orphan-GC invariant.)
+        // Per-candidate disambiguation lives in pass_input_truncated
+        // and the (sequential) ran_at timestamps.
+        passSessionId: req.passSessionId,
         promptId: primaryPrompt.promptId,
         targetSummaryId: req.targetSummaryId,
         targetCacheId: req.targetCacheId,
@@ -516,7 +559,11 @@ async function runBestOfNYearly(
       maxOutputTokens: 50,
     },
     {
-      passSessionId: `${req.passSessionId}_judge`,
+      // Group D adversarial Gap 2: judge call shares the same
+      // pass_session_id as the candidate calls (all part of one
+      // best-of-N attempt — operators query by pass_session_id to
+      // retrieve the full trail).
+      passSessionId: req.passSessionId,
       promptId: judgePrompt.promptId,
       targetSummaryId: req.targetSummaryId,
       targetCacheId: req.targetCacheId,

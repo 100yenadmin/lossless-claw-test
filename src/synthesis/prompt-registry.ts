@@ -83,11 +83,18 @@ export function getActivePrompt(
   db: DatabaseSync,
   args: { memoryType: MemoryType; tierLabel: string | null; passKind: PassKind },
 ): PromptRecord | null {
-  const tierClause = args.tierLabel === null ? "tier_label IS NULL" : "tier_label = ?";
+  // Group D adversarial Gap 3 fix: normalize empty-string tier_label
+  // to null. The B.fix Gap 2 UNIQUE INDEX uses COALESCE(tier_label, '')
+  // — treating NULL and '' as equivalent at the DB level. Aligning the
+  // API surface here so callers don't get confusing "no row found"
+  // results when they pass "" instead of null.
+  const normalizedTier =
+    args.tierLabel === null || args.tierLabel === "" ? null : args.tierLabel;
+  const tierClause = normalizedTier === null ? "tier_label IS NULL" : "tier_label = ?";
   const params: unknown[] =
-    args.tierLabel === null
+    normalizedTier === null
       ? [args.memoryType, args.passKind]
-      : [args.memoryType, args.tierLabel, args.passKind];
+      : [args.memoryType, normalizedTier, args.passKind];
   const sql = `SELECT prompt_id, memory_type, tier_label, pass_kind, version, template,
                       model_recommendation, created_at, active, bundle_version, notes
                  FROM lcm_prompt_registry
@@ -156,7 +163,12 @@ export function registerPrompt(
   db: DatabaseSync,
   opts: RegisterPromptOptions,
 ): string {
-  const tierLabel = opts.tierLabel ?? null;
+  // Group D adversarial Gap 3 fix: normalize empty-string to null,
+  // matching getActivePrompt + the COALESCE-based UNIQUE index.
+  const tierLabel =
+    opts.tierLabel === null || opts.tierLabel === undefined || opts.tierLabel === ""
+      ? null
+      : opts.tierLabel;
   const bundleVersion = opts.bundleVersion ?? 1;
 
   db.exec("BEGIN IMMEDIATE");
