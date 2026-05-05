@@ -1821,6 +1821,53 @@ export function runLcmMigrations(
       `);
     });
 
+    // ── v4.1 indexes on summaries (A.08) ────────────────────────────────────
+    // These are CONDITIONAL on the v4.1 columns existing (added by A.02
+    // ensureSummaryV41Columns above), so we run them after that step.
+    // CREATE INDEX IF NOT EXISTS is idempotent.
+    //
+    // session_key index supports cross-conv assemble (PR #338 session-family
+    // scope) + every retrieval surface that filters by scope.
+    runMigrationStep("ensureSummariesV41Indexes", log, () => {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS summaries_session_key_kind_latest_idx
+          ON summaries (session_key, kind, latest_at DESC)
+          WHERE session_key != ''
+      `);
+      // suppressed_at filter index — every retrieval surface filters
+      // WHERE suppressed_at IS NULL per v3.1 A3 invariant. Partial index
+      // is small (only suppressed rows; NULL-row count grows with corpus
+      // but suppressed-row count stays small).
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS summaries_suppressed_idx
+          ON summaries (suppressed_at)
+          WHERE suppressed_at IS NOT NULL
+      `);
+      // Idle-rebuild candidate scan: §8.1 finds condensed rows whose
+      // descendants got suppressed but haven't been rebuilt yet.
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS summaries_contains_suppressed_idx
+          ON summaries (contains_suppressed_leaves)
+          WHERE contains_suppressed_leaves = 1 AND superseded_by IS NULL
+      `);
+      // messages.suppressed_at filter (for lcm_quote / lcm_factcheck)
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS messages_suppressed_idx
+          ON messages (suppressed_at)
+          WHERE suppressed_at IS NOT NULL
+      `);
+      // session_key index on conversations (boosts the cross-conv JOIN
+      // path used by retrieval surfaces). Already indexed by existing
+      // conversations_session_key_active_created_idx but the v4.1 read
+      // pattern often filters by session_key WITHOUT the active flag
+      // (e.g. legacy:conv_<id> session_keys are on archived conversations).
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS conversations_session_key_v41_idx
+          ON conversations (session_key)
+          WHERE session_key IS NOT NULL
+      `);
+    });
+
     db.exec(`COMMIT`);
     transactionActive = false;
   } catch (error) {
