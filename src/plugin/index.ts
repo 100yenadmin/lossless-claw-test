@@ -20,6 +20,7 @@ import { createLcmExpandQueryTool } from "../tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
 import { createLcmRecentThemesTool } from "../tools/lcm-recent-themes-tool.js";
+import { createLcmSearchThemesTool } from "../tools/lcm-search-themes-tool.js";
 import { createLcmSemanticRecallTool } from "../tools/lcm-semantic-recall-tool.js";
 import { createLcmThemeExplainTool } from "../tools/lcm-theme-explain-tool.js";
 import { createLcmSynthesizeAroundTool } from "../tools/lcm-synthesize-around-tool.js";
@@ -2395,6 +2396,9 @@ function wirePluginHandlers(
   );
   api.registerTool((ctx) =>
     createLcmRecentThemesTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  );
+  api.registerTool((ctx) =>
+    createLcmSearchThemesTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
   );
   api.registerTool((ctx) =>
     createLcmThemeExplainTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
