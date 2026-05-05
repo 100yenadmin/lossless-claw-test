@@ -1118,6 +1118,11 @@ export class SummaryStore {
   ): SummarySearchResult[] {
     const where: string[] = ["summaries_fts MATCH ?"];
     const args: Array<string | number> = [sanitizeFts5Query(query)];
+    // v4.1 §10 invariant: every retrieval surface defaults to
+    // exclude-suppressed. lcm_grep / lcm_semantic_recall flow through
+    // here; operator/admin tools that need to see suppressed should
+    // bypass searchSummaries entirely.
+    where.push("s.suppressed_at IS NULL");
     appendConversationScopeConstraint({
       where,
       args,
@@ -1167,6 +1172,9 @@ export class SummaryStore {
 
     const where: string[] = [...plan.where];
     const args: Array<string | number> = [...plan.args];
+    // v4.1 §10 invariant: exclude suppressed by default (LIKE fallback
+    // for FTS — same surface from agent's POV).
+    where.push("suppressed_at IS NULL");
     appendConversationScopeConstraint({
       where,
       args,
@@ -1272,6 +1280,8 @@ export class SummaryStore {
 
     const where: string[] = ["summaries_fts_cjk MATCH ?"];
     const args: Array<string | number> = [cjkGroups.join(" AND ")];
+    // v4.1 §10 invariant: exclude suppressed (CJK FTS path).
+    where.push("s.suppressed_at IS NULL");
     for (const token of latinTokens) {
       where.push("LOWER(s.content) LIKE ? ESCAPE '\\'");
       args.push(`%${this.escapeLikeTerm(token)}%`);
@@ -1415,7 +1425,7 @@ export class SummaryStore {
       return [];
     }
 
-    const where: string[] = [];
+    const where: string[] = ["suppressed_at IS NULL"]; // v4.1 §10
     const args: Array<string | number> = [];
     appendConversationScopeConstraint({
       where,
