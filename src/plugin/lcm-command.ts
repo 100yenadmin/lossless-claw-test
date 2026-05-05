@@ -32,6 +32,12 @@ import {
   type V41HealthSnapshot,
   type WorkerStatus,
 } from "../operator/health.js";
+import {
+  listLegacyCandidates,
+  reconcileSessionKeys,
+  ReconcileError,
+  type ReconcileResult,
+} from "../operator/reconcile-session-keys.js";
 
 const VISIBLE_COMMAND = "/lossless";
 const HIDDEN_ALIAS = "/lcm";
@@ -78,6 +84,14 @@ type ParsedLcmCommand =
   | { kind: "doctor"; apply: boolean }
   | { kind: "doctor_cleaners"; apply: boolean; filterId?: DoctorCleanerId; vacuum: boolean }
   | { kind: "health" }
+  | { kind: "reconcile_session_keys_list" }
+  | {
+      kind: "reconcile_session_keys_apply";
+      fromSessionKeys: string[];
+      toSessionKey: string;
+      reason: string;
+      allowMainSession: boolean;
+    }
   | { kind: "help"; error?: string };
 
 type RotateCommandEngine = {
@@ -180,6 +194,107 @@ function splitArgs(rawArgs: string | undefined): string[] {
     .filter(Boolean);
 }
 
+/**
+ * Tokenize a raw argument string respecting double-quoted segments. Used
+ * by subcommands whose flag values can contain spaces (`--reason "all
+ * rebase work"`). Returns the list of tokens with surrounding quotes
+ * stripped. Backslash inside a quoted region escapes the next char.
+ */
+function splitArgsQuoted(rawArgs: string | undefined): string[] {
+  const text = rawArgs ?? "";
+  const out: string[] = [];
+  let cur = "";
+  let inQuote = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (inQuote) {
+      if (ch === "\\" && i + 1 < text.length) {
+        cur += text[i + 1];
+        i += 1;
+        continue;
+      }
+      if (ch === '"') {
+        inQuote = false;
+        continue;
+      }
+      cur += ch;
+      continue;
+    }
+    if (ch === '"') {
+      inQuote = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (cur.length > 0) {
+        out.push(cur);
+        cur = "";
+      }
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur.length > 0) out.push(cur);
+  return out;
+}
+
+interface ReconcileParseResult {
+  fromSessionKeys: string[];
+  toSessionKey?: string;
+  reason?: string;
+  allowMainSession: boolean;
+  list: boolean;
+  apply: boolean;
+}
+
+function parseReconcileArgs(tokens: string[]):
+  | { ok: true; parsed: ReconcileParseResult }
+  | { ok: false; error: string } {
+  const result: ReconcileParseResult = {
+    fromSessionKeys: [],
+    allowMainSession: false,
+    list: false,
+    apply: false,
+  };
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i]!;
+    switch (t) {
+      case "--list-candidates":
+        result.list = true;
+        break;
+      case "--apply":
+        result.apply = true;
+        break;
+      case "--allow-main-session":
+        result.allowMainSession = true;
+        break;
+      case "--from": {
+        const v = tokens[i + 1];
+        if (!v) return { ok: false, error: "`--from` requires a comma-separated session_key list." };
+        result.fromSessionKeys = v.split(",").map((s) => s.trim()).filter(Boolean);
+        i += 1;
+        break;
+      }
+      case "--to": {
+        const v = tokens[i + 1];
+        if (!v) return { ok: false, error: "`--to` requires a session_key." };
+        result.toSessionKey = v;
+        i += 1;
+        break;
+      }
+      case "--reason": {
+        const v = tokens[i + 1];
+        if (!v) return { ok: false, error: "`--reason` requires a string." };
+        result.reason = v;
+        i += 1;
+        break;
+      }
+      default:
+        return { ok: false, error: `Unknown argument \`${t}\` for \`/lcm reconcile-session-keys\`.` };
+    }
+  }
+  return { ok: true, parsed: result };
+}
+
 function parseDoctorCleanerApplyArgs(tokens: string[]):
   | { ok: true; filterId?: DoctorCleanerId; vacuum: boolean }
   | { ok: false; error: string } {
@@ -230,6 +345,49 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
       return rest.length === 0
         ? { kind: "health" }
         : { kind: "help", error: "`/lcm health` does not accept extra arguments." };
+    case "reconcile-session-keys": {
+      // Re-tokenize via the quote-aware splitter so `--reason "..."`
+      // survives. We strip the leading subcommand token from the raw
+      // arg string and re-parse the remainder.
+      const idx = (rawArgs ?? "").toLowerCase().indexOf("reconcile-session-keys");
+      const remainder = idx >= 0
+        ? (rawArgs ?? "").slice(idx + "reconcile-session-keys".length)
+        : "";
+      const quoted = splitArgsQuoted(remainder);
+      const r = parseReconcileArgs(quoted);
+      if (!r.ok) {
+        return { kind: "help", error: r.error };
+      }
+      const { parsed } = r;
+      if (parsed.list && parsed.apply) {
+        return { kind: "help", error: "`/lcm reconcile-session-keys` cannot combine `--list-candidates` with `--apply`." };
+      }
+      if (parsed.list) {
+        return { kind: "reconcile_session_keys_list" };
+      }
+      if (!parsed.apply) {
+        return {
+          kind: "help",
+          error: "`/lcm reconcile-session-keys` requires `--list-candidates` or `--apply --from k1,k2 --to k3 --reason \"...\"`.",
+        };
+      }
+      if (parsed.fromSessionKeys.length === 0) {
+        return { kind: "help", error: "`/lcm reconcile-session-keys --apply` requires `--from <comma-separated session_keys>`." };
+      }
+      if (!parsed.toSessionKey) {
+        return { kind: "help", error: "`/lcm reconcile-session-keys --apply` requires `--to <destination session_key>`." };
+      }
+      if (!parsed.reason || parsed.reason.trim().length === 0) {
+        return { kind: "help", error: "`/lcm reconcile-session-keys --apply` requires `--reason \"...\"`." };
+      }
+      return {
+        kind: "reconcile_session_keys_apply",
+        fromSessionKeys: parsed.fromSessionKeys,
+        toSessionKey: parsed.toSessionKey,
+        reason: parsed.reason,
+        allowMainSession: parsed.allowMainSession,
+      };
+    }
     case "doctor":
       if (rest.length === 0) {
         return { kind: "doctor", apply: false };
@@ -261,7 +419,7 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
     default:
       return {
         kind: "help",
-        error: `Unknown subcommand \`${head}\`. Supported: status, backup, rotate, health, doctor, doctor clean, doctor apply, help.`,
+        error: `Unknown subcommand \`${head}\`. Supported: status, backup, rotate, health, reconcile-session-keys, doctor, doctor clean, doctor apply, help.`,
       };
   }
 }
@@ -577,6 +735,14 @@ function buildHelpText(error?: string): string {
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} health`),
         "Show LCM v4.1 subsystem health: embeddings, workers, synthesis, eval, suppression.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} reconcile-session-keys --list-candidates`),
+        "List `legacy:conv_*` session keys that may be candidates for merging.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} reconcile-session-keys --apply --from k1,k2 --to k3 --reason "..."`),
+        "Merge multiple legacy session keys into one logical session.",
       ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor`), "Scan for broken or truncated summaries."),
       buildStatLine(
@@ -1253,6 +1419,105 @@ function buildHealthText(params: { db: DatabaseSync }): string {
   return lines.join("\n");
 }
 
+function buildReconcileListText(params: { db: DatabaseSync }): string {
+  const candidates = listLegacyCandidates(params.db);
+  const lines: string[] = [
+    ...buildHeaderLines(),
+    "",
+    "🔗 Lossless Claw Reconcile Session Keys",
+    "",
+    buildSection("📋 Legacy candidates", [
+      buildStatLine("matched session keys", formatNumber(candidates.length)),
+    ]),
+  ];
+  if (candidates.length === 0) {
+    lines.push(
+      "",
+      buildSection("✅ Result", ["No `legacy:conv_*` session keys present."]),
+    );
+    return lines.join("\n");
+  }
+  lines.push(
+    "",
+    buildSection(
+      "🧷 Candidates",
+      candidates.map((c) =>
+        `${formatCommand(truncateMiddle(c.sessionKey, 44))} · convs=${formatNumber(c.conversationCount)} · leaves=${formatNumber(c.leafCount)}`,
+      ),
+    ),
+    "",
+    buildSection("🛠️ Next step", [
+      `${formatCommand(`${VISIBLE_COMMAND} reconcile-session-keys --apply --from k1,k2 --to my-thread --reason "..."`)} merges the listed keys.`,
+    ]),
+  );
+  return lines.join("\n");
+}
+
+function buildReconcileApplyText(params: {
+  db: DatabaseSync;
+  fromSessionKeys: string[];
+  toSessionKey: string;
+  reason: string;
+  allowMainSession: boolean;
+}): string {
+  const lines: string[] = [
+    ...buildHeaderLines(),
+    "",
+    "🔗 Lossless Claw Reconcile Session Keys",
+    "",
+    buildSection("📋 Plan", [
+      buildStatLine("from", params.fromSessionKeys.map((k) => formatCommand(truncateMiddle(k, 44))).join(", ")),
+      buildStatLine("to", formatCommand(truncateMiddle(params.toSessionKey, 44))),
+      buildStatLine("reason", params.reason),
+      buildStatLine("allow main session", formatBoolean(params.allowMainSession)),
+    ]),
+    "",
+  ];
+
+  let result: ReconcileResult;
+  try {
+    result = reconcileSessionKeys(params.db, {
+      fromSessionKeys: params.fromSessionKeys,
+      toSessionKey: params.toSessionKey,
+      reason: params.reason,
+      allowMainSession: params.allowMainSession,
+    });
+  } catch (e) {
+    if (e instanceof ReconcileError) {
+      lines.push(
+        buildSection("🛠️ Apply", [
+          buildStatLine("status", "failed"),
+          buildStatLine("kind", e.kind),
+          buildStatLine("reason", e.message),
+        ]),
+      );
+      return lines.join("\n");
+    }
+    lines.push(
+      buildSection("🛠️ Apply", [
+        buildStatLine("status", "failed"),
+        buildStatLine("reason", formatFailureReason(e)),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const fromLabel = params.fromSessionKeys.map((k) => `\`${truncateMiddle(k, 32)}\``).join(", ");
+  lines.push(
+    buildSection("🛠️ Apply", [
+      buildStatLine("status", "completed"),
+      buildStatLine("conversations moved", formatNumber(result.conversationsMoved)),
+      buildStatLine("summaries moved", formatNumber(result.summariesMoved)),
+      buildStatLine("audit entries", formatNumber(result.auditEntries)),
+      buildStatLine(
+        "summary",
+        `Moved ${formatNumber(result.conversationsMoved)} conversations, ${formatNumber(result.summariesMoved)} summaries from {${fromLabel}} to ${formatCommand(truncateMiddle(params.toSessionKey, 44))}`,
+      ),
+    ]),
+  );
+  return lines.join("\n");
+}
+
 async function buildDoctorCleanersApplyText(params: {
   db: DatabaseSync;
   config: LcmConfig;
@@ -1560,6 +1825,18 @@ export function createLcmCommand(params: {
             : { text: await buildDoctorCleanersText({ db: await getDb() }) };
         case "health":
           return { text: buildHealthText({ db: await getDb() }) };
+        case "reconcile_session_keys_list":
+          return { text: buildReconcileListText({ db: await getDb() }) };
+        case "reconcile_session_keys_apply":
+          return {
+            text: buildReconcileApplyText({
+              db: await getDb(),
+              fromSessionKeys: parsed.fromSessionKeys,
+              toSessionKey: parsed.toSessionKey,
+              reason: parsed.reason,
+              allowMainSession: parsed.allowMainSession,
+            }),
+          };
         case "help":
           return { text: buildHelpText(parsed.error) };
       }
