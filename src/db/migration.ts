@@ -1287,6 +1287,113 @@ export function runLcmMigrations(
       ensureLcmFeatureFlagsTable(db),
     );
 
+    // v4.1.1 A3 — lcm_extraction_queue: gateway atomically inserts a row
+    // alongside every leaf write; worker picks up the queue to run entity
+    // coreference (and procedure-recheck on demand). Per v4.1.1 A3 + B18
+    // atomicity rule: leaf-write transaction MUST insert the queue row in
+    // the same transaction as the leaf insert (Group B leaf-write code).
+    runMigrationStep("ensureLcmExtractionQueueTable", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_extraction_queue (
+          queue_id TEXT NOT NULL PRIMARY KEY,
+          leaf_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
+          kind TEXT NOT NULL CHECK (kind IN ('entity', 'procedure-recheck')),
+          queued_at TEXT NOT NULL DEFAULT (datetime('now')),
+          picked_at TEXT,
+          worker_id TEXT,
+          completed_at TEXT,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT
+        )
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_extraction_queue_pending_idx
+          ON lcm_extraction_queue (queued_at)
+          WHERE picked_at IS NULL
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_extraction_queue_dead_letter_idx
+          ON lcm_extraction_queue (attempts)
+          WHERE attempts >= 5
+      `);
+    });
+
+    // v4.1.1 B2 — lcm_purge_rebuild_queue: persistent rebuild queue for
+    // operator-on-demand hard-purge (lcm_purge --immediate). T1 fires
+    // suppression cascade + enqueues rebuild targets; worker drains the
+    // queue using A4 forwarder pattern (INSERT new condensed row, UPDATE
+    // OLD.superseded_by, never mutate summary_parents).
+    runMigrationStep("ensureLcmPurgeRebuildQueueTable", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_purge_rebuild_queue (
+          queue_id TEXT NOT NULL PRIMARY KEY,
+          target_summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
+          purge_session_id TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          queued_at TEXT NOT NULL DEFAULT (datetime('now')),
+          picked_at TEXT,
+          worker_id TEXT,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT
+        )
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_purge_rebuild_queue_pending_idx
+          ON lcm_purge_rebuild_queue (queued_at)
+          WHERE picked_at IS NULL
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_purge_rebuild_queue_session_idx
+          ON lcm_purge_rebuild_queue (purge_session_id)
+      `);
+    });
+
+    // v4.1.1 B3 — lcm_voyage_rate_state: cross-process rate-limit budget
+    // for Voyage embeddings + reranker. SQLite serializes BEGIN IMMEDIATE
+    // naturally so gateway query embeds, worker leaf-time embeds, worker
+    // entity-coref embeds, and worker backfill all coordinate via this
+    // shared row. Caller pattern (per v4.1.1 B3): brief BEGIN IMMEDIATE
+    // updates the counters and COMMITs BEFORE the HTTP call (HTTP must
+    // NOT be wrapped in the transaction — that would serialize all calls).
+    runMigrationStep("ensureLcmVoyageRateStateTable", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_voyage_rate_state (
+          bucket TEXT NOT NULL PRIMARY KEY CHECK (bucket IN ('embed', 'rerank')),
+          tokens_consumed_window INTEGER NOT NULL DEFAULT 0,
+          requests_consumed_window INTEGER NOT NULL DEFAULT 0,
+          window_started_at TEXT NOT NULL DEFAULT (datetime('now')),
+          last_429_at TEXT,
+          consecutive_429_count INTEGER NOT NULL DEFAULT 0
+        )
+      `);
+      // Seed both buckets so callers can UPDATE without first INSERTing.
+      db.exec(`
+        INSERT OR IGNORE INTO lcm_voyage_rate_state (bucket) VALUES ('embed'), ('rerank')
+      `);
+    });
+
+    // v4.1.1 §C item — lcm_session_key_audit: reversibility log for the
+    // §2.1 step 1 re-key of 5 legacy convs to agent:main:main. Eva can
+    // run /lcm undo-session-key-rekey <conversation_id> if the spike's
+    // identification turns out to be wrong for any of those convs.
+    runMigrationStep("ensureLcmSessionKeyAuditTable", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_session_key_audit (
+          audit_id TEXT NOT NULL PRIMARY KEY,
+          conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+          original_session_key TEXT,
+          new_session_key TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          applied_at TEXT NOT NULL DEFAULT (datetime('now')),
+          applied_by TEXT NOT NULL DEFAULT 'migration'
+        )
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_session_key_audit_conv_idx
+          ON lcm_session_key_audit (conversation_id, applied_at DESC)
+      `);
+    });
+
     db.exec(`COMMIT`);
     transactionActive = false;
   } catch (error) {
