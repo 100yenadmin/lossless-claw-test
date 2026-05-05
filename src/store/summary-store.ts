@@ -408,6 +408,13 @@ export class SummaryStore {
           ? 0
           : 1;
 
+    // v4.1 Gap 8 (Group A adversarial review): atomically populate
+    // session_key from conversations.session_key via sub-SELECT. Closes
+    // the gap where new summaries inserted between gateway boots had
+    // session_key='' until the next boot's JOIN-backfill step ran.
+    // The COALESCE protects against a (theoretically impossible) case
+    // where conversations.session_key is NULL — in that case the row
+    // would be backfilled by the migration on next boot.
     this.db
       .prepare(
         `INSERT INTO summaries (
@@ -423,9 +430,11 @@ export class SummaryStore {
           descendant_count,
           descendant_token_count,
           source_message_token_count,
-          model
+          model,
+          session_key
         )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+               COALESCE((SELECT session_key FROM conversations WHERE conversation_id = ?), ''))`,
       )
       .run(
         input.summaryId,
@@ -441,6 +450,7 @@ export class SummaryStore {
         descendantTokenCount,
         sourceMessageTokenCount,
         input.model ?? "unknown",
+        input.conversationId,
       );
 
     const row = this.db
