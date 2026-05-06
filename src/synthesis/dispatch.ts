@@ -61,14 +61,21 @@ export type TierLabel =
 
 /** Per-tier model recommendation. Override via prompt's
  *  model_recommendation field if a specific tier+memory_type combo
- *  needs a different default. */
+ *  needs a different default.
+ *
+ *  All tiers default to the same model — operators pick a single default
+ *  via LCM_SUMMARY_MODEL env (matching the existing leaf-summarizer
+ *  convention in summarize.ts). Tier-specific tuning is done by setting
+ *  model_recommendation per-prompt in lcm_prompt_registry, NOT by
+ *  hardcoded tier defaults. Falls back to "gpt-5.4-mini" if env unset. */
+const _LCM_DEFAULT_MODEL = process.env.LCM_SUMMARY_MODEL?.trim() || "gpt-5.4-mini";
 export const DEFAULT_MODEL_BY_TIER: Record<TierLabel, string> = {
-  daily: "claude-haiku-4-5",
-  weekly: "claude-sonnet-4-5",
-  monthly: "claude-opus-4-7",
-  yearly: "claude-opus-4-7-thinking",
-  custom: "claude-sonnet-4-5",
-  filtered: "claude-sonnet-4-5",
+  daily: _LCM_DEFAULT_MODEL,
+  weekly: _LCM_DEFAULT_MODEL,
+  monthly: _LCM_DEFAULT_MODEL,
+  yearly: _LCM_DEFAULT_MODEL,
+  custom: _LCM_DEFAULT_MODEL,
+  filtered: _LCM_DEFAULT_MODEL,
 };
 
 /** Pass strategy per tier. The synthesis flow runs the listed passes

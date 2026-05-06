@@ -35,7 +35,10 @@ export interface WorkerLlmConfig {
 }
 
 const DEFAULT_TIMEOUT_MS = 60_000;
-const DEFAULT_MODEL = "claude-sonnet-4-5";
+// Reads LCM_SUMMARY_MODEL env (operator's chosen default; matches the
+// leaf-summarizer convention in summarize.ts) with a 'gpt-5.4-mini'
+// fallback if env unset.
+const DEFAULT_MODEL = process.env.LCM_SUMMARY_MODEL?.trim() || "gpt-5.4-mini";
 
 /**
  * Build an `LlmCall` from the plugin's deps. The returned function is

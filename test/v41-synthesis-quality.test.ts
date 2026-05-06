@@ -113,7 +113,7 @@ function makeRequest(opts: {
 // ────────────────────────────────────────────────────────────────────
 
 describe("dispatch quality — per-tier routing with mock LLM", () => {
-  it("daily tier dispatches single-pass with mini model", async () => {
+  it("daily tier dispatches single-pass through env-driven default", async () => {
     const captured: LlmCallArgs[] = [];
     const mock = makeMockLlm({ captured });
     const req = makeRequest({ tier: "daily" });
@@ -121,18 +121,21 @@ describe("dispatch quality — per-tier routing with mock LLM", () => {
     expect(result.output).toContain("[mock-good]");
     expect(captured).toHaveLength(1);
     expect(captured[0]!.passKind).toBe("single");
-    // Default model for daily is haiku.
-    expect(captured[0]!.model).toMatch(/haiku/i);
+    // Per-tier dispatch routes through DEFAULT_MODEL_BY_TIER which reads
+    // LCM_SUMMARY_MODEL env (operator's chosen default) with a
+    // 'gpt-5.4-mini' fallback. Tests run without the env set, so the
+    // fallback is what should appear.
+    expect(captured[0]!.model).toBe(process.env.LCM_SUMMARY_MODEL?.trim() || "gpt-5.4-mini");
   });
 
-  it("weekly tier dispatches single-pass with mid model (sonnet)", async () => {
+  it("weekly tier dispatches single-pass through env-driven default", async () => {
     const captured: LlmCallArgs[] = [];
     const mock = makeMockLlm({ captured });
     const req = makeRequest({ tier: "weekly" });
     const result = await dispatchSynthesis(db, mock, req);
     expect(result.output).toContain("[mock-good]");
     expect(captured[0]!.passKind).toBe("single");
-    expect(captured[0]!.model).toMatch(/sonnet/i);
+    expect(captured[0]!.model).toBe(process.env.LCM_SUMMARY_MODEL?.trim() || "gpt-5.4-mini");
   });
 
   it("monthly tier runs single + verify_fidelity (2 calls)", async () => {

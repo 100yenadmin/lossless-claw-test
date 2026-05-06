@@ -86,13 +86,14 @@ JSON output (a JSON array only, even if empty):`;
 
 export interface EntityExtractorLlmConfig {
   deps: LcmDependencies;
-  /** Default model. Default 'claude-haiku-4-5' (cheap; entity extraction
-   *  is high-volume). */
+  /** Default model. Reads LCM_SUMMARY_MODEL env (operator's chosen
+   *  default; matches the leaf-summarizer convention) with a
+   *  'gpt-5.4-mini' fallback if env unset. */
   model?: string;
   timeoutMs?: number;
 }
 
-const DEFAULT_MODEL = "claude-haiku-4-5";
+const DEFAULT_MODEL = process.env.LCM_SUMMARY_MODEL?.trim() || "gpt-5.4-mini";
 
 /**
  * Build an `ExtractEntities` callback suitable for
