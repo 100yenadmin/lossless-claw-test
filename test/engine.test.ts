@@ -31,6 +31,7 @@ function createTestConfig(databasePath: string): LcmConfig {
     statelessSessionPatterns: [],
     skipStatelessSessions: true,
     contextThreshold: 0.75,
+    respectThresholdAsHardFloor: false,
     freshTailCount: 8,
     newSessionRetainDepth: 2,
     leafMinFanout: 8,
@@ -9145,6 +9146,179 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(infoLog).toHaveBeenCalledWith(
       expect.stringContaining("cacheReadSharePct=20.5%"),
     );
+  });
+
+  it("evaluateIncrementalCompaction short-circuits below contextThreshold when respectThresholdAsHardFloor is enabled", async () => {
+    const infoLog = vi.fn();
+    const engine = createEngineWithDeps(
+      { respectThresholdAsHardFloor: true, contextThreshold: 0.7 },
+      {
+        log: {
+          info: infoLog,
+          warn: vi.fn(),
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      },
+    );
+    const sessionId = "incremental-hard-floor-below";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number, leafChunkTokens?: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+      evaluateIncrementalCompaction: (params: {
+        conversationId: number;
+        tokenBudget: number;
+        currentTokenCount?: number;
+      }) => Promise<{ shouldCompact: boolean; reason: string; threshold: number; cacheState: string }>;
+    };
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "seed" }),
+    });
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    // Spies must NOT be invoked when the hard-floor short-circuit fires.
+    const leafTriggerSpy = vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger");
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate");
+
+    const decision = await privateEngine.evaluateIncrementalCompaction({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 200_000,
+      currentTokenCount: 100_000, // 50% of budget — below 0.7 floor (140k).
+    });
+
+    expect(decision.shouldCompact).toBe(false);
+    expect(decision.reason).toBe("below-context-threshold-floor");
+    expect(decision.threshold).toBe(140_000);
+    expect(leafTriggerSpy).not.toHaveBeenCalled();
+    expect(evaluateSpy).not.toHaveBeenCalled();
+    expect(infoLog).toHaveBeenCalledWith(
+      expect.stringContaining("reason=below-context-threshold-floor"),
+    );
+  });
+
+  it("evaluateIncrementalCompaction allows existing compaction logic at/above contextThreshold even when hard-floor is enabled", async () => {
+    const infoLog = vi.fn();
+    const engine = createEngineWithDeps(
+      { respectThresholdAsHardFloor: true, contextThreshold: 0.7 },
+      {
+        log: {
+          info: infoLog,
+          warn: vi.fn(),
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      },
+    );
+    const sessionId = "incremental-hard-floor-above";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number, leafChunkTokens?: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+      evaluateIncrementalCompaction: (params: {
+        conversationId: number;
+        tokenBudget: number;
+        currentTokenCount?: number;
+      }) => Promise<{ shouldCompact: boolean; reason: string }>;
+    };
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "seed" }),
+    });
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: true,
+      rawTokensOutsideTail: 60_000,
+      threshold: 20_000,
+    });
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 150_000,
+      threshold: 140_000,
+    });
+
+    const decision = await privateEngine.evaluateIncrementalCompaction({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 200_000,
+      currentTokenCount: 150_000, // 75% of budget — above 0.7 floor (140k).
+    });
+
+    expect(decision.shouldCompact).toBe(true);
+    expect(decision.reason).toBe("budget-trigger");
+  });
+
+  it("evaluateIncrementalCompaction preserves default behavior when respectThresholdAsHardFloor is disabled", async () => {
+    const infoLog = vi.fn();
+    const engine = createEngineWithDeps(
+      { respectThresholdAsHardFloor: false, contextThreshold: 0.7 },
+      {
+        log: {
+          info: infoLog,
+          warn: vi.fn(),
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      },
+    );
+    const sessionId = "incremental-hard-floor-disabled";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number, leafChunkTokens?: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+      evaluateIncrementalCompaction: (params: {
+        conversationId: number;
+        tokenBudget: number;
+        currentTokenCount?: number;
+      }) => Promise<{ shouldCompact: boolean; reason: string }>;
+    };
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "seed" }),
+    });
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    // Without the hard-floor flag, the existing path must run regardless of currentTokenCount.
+    const leafTriggerSpy = vi
+      .spyOn(privateEngine.compaction, "evaluateLeafTrigger")
+      .mockResolvedValue({
+        shouldCompact: false,
+        rawTokensOutsideTail: 5_000,
+        threshold: 20_000,
+      });
+
+    const decision = await privateEngine.evaluateIncrementalCompaction({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 200_000,
+      currentTokenCount: 100_000, // 50% — below 0.7 floor, but flag disabled so logic runs.
+    });
+
+    expect(leafTriggerSpy).toHaveBeenCalled();
+    expect(decision.reason).toBe("below-leaf-trigger");
+    expect(decision.shouldCompact).toBe(false);
   });
 
   it("evaluateIncrementalCompaction treats low cache-read share as cold even when telemetry says hot", async () => {

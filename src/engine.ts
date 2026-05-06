@@ -2819,6 +2819,40 @@ export class LcmContextEngine implements ContextEngine {
     tokenBudget: number;
     currentTokenCount?: number;
   }): Promise<IncrementalCompactionDecision> {
+    // Hard-floor short-circuit: when respectThresholdAsHardFloor is enabled,
+    // never propose compaction below contextThreshold of the token budget,
+    // regardless of cache state, leaf trigger, or activity band. This prevents
+    // cold-cache catch-up passes from compacting away context during idle gaps.
+    // Opt-in: default false preserves existing behavior.
+    if (this.config.respectThresholdAsHardFloor) {
+      const minTokenFloor = Math.floor(this.config.contextThreshold * params.tokenBudget);
+      if (
+        typeof params.currentTokenCount === "number"
+        && Number.isFinite(params.currentTokenCount)
+        && params.currentTokenCount < minTokenFloor
+      ) {
+        return this.logIncrementalCompactionDecision({
+          conversationId: params.conversationId,
+          cacheState: "unknown",
+          activityBand: "low",
+          tokenBudget: params.tokenBudget,
+          currentTokenCount: params.currentTokenCount,
+          cacheRead: null,
+          cacheWrite: null,
+          cachePromptTokenCount: null,
+          triggerLeafChunkTokens: 0,
+          preferredLeafChunkTokens: 0,
+          fallbackLeafChunkTokens: [],
+          rawTokensOutsideTail: 0,
+          threshold: minTokenFloor,
+          shouldCompact: false,
+          maxPasses: 1,
+          allowCondensedPasses: false,
+          reason: "below-context-threshold-floor",
+        });
+      }
+    }
+
     const telemetry = await this.compactionTelemetryStore.getConversationCompactionTelemetry(
       params.conversationId,
     );
