@@ -87,6 +87,17 @@ const LcmGrepSchema = Type.Object({
       enum: ["recency", "relevance", "hybrid"],
     }),
   ),
+  // P6 fix (2026-05-06 harness): in verbatim mode, the 20-result cap was
+  // saturating with tool-role messages (code grep output, audit blobs) on
+  // common queries, crowding out the user/assistant turns the agent
+  // actually wants to quote. `role` filters at the SQL layer.
+  role: Type.Optional(
+    Type.String({
+      description:
+        'Restrict matches to messages of this role. Useful in verbatim mode where tool-role messages (code grep output, audit blobs) often crowd out user/assistant turns. Accepts "user", "assistant", "tool", or "all" (default). Honored only by mode="verbatim" — other modes already match summaries that have no role.',
+      enum: ["user", "assistant", "tool", "all"],
+    }),
+  ),
 });
 
 function truncateSnippet(content: string, maxLen: number = 200): string {
@@ -95,6 +106,51 @@ function truncateSnippet(content: string, maxLen: number = 200): string {
     return singleLine;
   }
   return singleLine.substring(0, maxLen - 3) + "...";
+}
+
+/**
+ * P7 fix (2026-05-06 harness): FTS5 MATCH chokes on bare non-tokenizer
+ * characters in user input (`v4.1`, `[brackets]`, hyphenated terms,
+ * leading/trailing operators). Users hit opaque "fts5: syntax error" with
+ * no recovery hint.
+ *
+ * Strategy: detect patterns that FTS5 would reject AS-IS, and auto-wrap
+ * them in double quotes (FTS5 phrase syntax — literal multi-token match).
+ * Leave already-quoted patterns alone (user explicitly opted-in to FTS5
+ * phrase semantics) AND leave patterns containing FTS5 boolean operators
+ * alone (`AND`, `OR`, `NEAR(...)`).
+ *
+ * For verbatim mode this is always-on because verbatim is by definition
+ * "I want literal text." For full_text mode this is opt-in via the existing
+ * convention: if your pattern looks like an FTS5 query (uppercase boolean
+ * operators, parens), we leave it; otherwise we sanitize.
+ *
+ * Returns the (possibly transformed) pattern.
+ */
+function sanitizeFts5Pattern(pattern: string): string {
+  const trimmed = pattern.trim();
+  if (trimmed.length === 0) return trimmed;
+  // Already double-quoted phrase — user knows what they're doing.
+  if (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) {
+    return trimmed;
+  }
+  // Contains FTS5 boolean operators or grouping — assume user knows FTS5.
+  // Match \bAND\b / \bOR\b / \bNOT\b / \bNEAR\b / opening paren.
+  if (/\b(?:AND|OR|NOT|NEAR)\b/.test(trimmed) || /[()]/.test(trimmed)) {
+    return trimmed;
+  }
+  // Detect chars FTS5 default tokenizer treats as separators or operators
+  // when present BARE (not inside a phrase): `.` `[` `]` `-` (leading/trailing)
+  // `+` `*` `^` `:` `/` `\\`.
+  const HAS_PROBLEM_CHAR = /[.\[\]+*^:\/\\!~]/;
+  const STARTS_OR_ENDS_WITH_HYPHEN = /^-|-$/;
+  if (HAS_PROBLEM_CHAR.test(trimmed) || STARTS_OR_ENDS_WITH_HYPHEN.test(trimmed)) {
+    // Wrap as a phrase. Escape internal double quotes by doubling them
+    // (FTS5's escape convention).
+    const escaped = trimmed.replace(/"/g, '""');
+    return `"${escaped}"`;
+  }
+  return trimmed;
 }
 
 export function createLcmGrepTool(input: {
@@ -189,6 +245,10 @@ export function createLcmGrepTool(input: {
       }
 
       if (mode === "verbatim") {
+        const roleFilterRaw =
+          typeof p.role === "string" ? p.role.trim() : undefined;
+        const roleFilter =
+          roleFilterRaw && roleFilterRaw !== "all" ? roleFilterRaw : undefined;
         return runVerbatimLcmGrep({
           lcm,
           pattern,
@@ -197,11 +257,18 @@ export function createLcmGrepTool(input: {
           before,
           limit,
           timezone,
+          roleFilter,
         });
       }
 
+      // P7 fix: sanitize the FTS5 pattern for full_text mode so dots /
+      // brackets / hyphens / leading-trailing operators don't crash the
+      // tool with "fts5: syntax error". regex mode bypasses this — regex
+      // patterns have their own escape rules.
+      const queryToPass =
+        mode === "full_text" ? sanitizeFts5Pattern(pattern) : pattern;
       const result = await retrieval.grep({
-        query: pattern,
+        query: queryToPass,
         mode,
         scope,
         conversationId: conversationScope.conversationId,
@@ -298,6 +365,9 @@ interface HybridGrepInput {
   before?: Date;
   limit: number;
   timezone: string;
+  // P6 fix: optional role filter, honored only by verbatim mode (other
+  // paths run on summaries which have no role).
+  roleFilter?: string;
 }
 
 /**
@@ -658,7 +728,8 @@ async function runSemanticLcmGrep(input: HybridGrepInput) {
  * (verbatim is a raw-message concept; summaries are by definition paraphrased).
  */
 async function runVerbatimLcmGrep(input: HybridGrepInput) {
-  const { lcm, pattern, conversationScope, since, before, limit, timezone } = input;
+  const { lcm, pattern, conversationScope, since, before, limit, timezone, roleFilter } =
+    input;
   const db = lcm.getDb();
 
   // Build the SQL query. Mirror conversation-store.searchFullText shape but
@@ -668,8 +739,19 @@ async function runVerbatimLcmGrep(input: HybridGrepInput) {
 
   // FTS5 join: messages_fts virtual table indexed on content
   // (we use FTS5 here since it's faster than LIKE for natural-language patterns)
+  // P7 fix: sanitize the pattern so dots/brackets/hyphens don't trigger
+  // "fts5: syntax error". Always-on for verbatim — by definition you want
+  // literal text.
   filters.push("messages_fts MATCH ?");
-  binds.push(pattern);
+  binds.push(sanitizeFts5Pattern(pattern));
+
+  // P6 fix: role filter — at SQL layer so it composes with FTS5 and doesn't
+  // burn the 20-result cap on tool-message blobs when the agent wants user
+  // or assistant turns.
+  if (roleFilter && (roleFilter === "user" || roleFilter === "assistant" || roleFilter === "tool")) {
+    filters.push("m.role = ?");
+    binds.push(roleFilter);
+  }
 
   if (conversationScope.allConversations) {
     // no conversation filter
@@ -743,7 +825,11 @@ async function runVerbatimLcmGrep(input: HybridGrepInput) {
   const lines: string[] = [];
   lines.push("## LCM Grep Results");
   lines.push(`**Pattern:** \`${pattern}\``);
-  lines.push(`**Mode:** verbatim | **Scope:** messages | **Cap:** ${limit} (full message rows; hard limit 20)`);
+  lines.push(
+    `**Mode:** verbatim | **Scope:** messages${
+      roleFilter ? ` (role=${roleFilter})` : ""
+    } | **Cap:** ${limit} (full message rows; hard limit 20)`,
+  );
   if (conversationScope.allConversations) {
     lines.push("**Conversation scope:** all conversations");
   } else if (conversationScope.conversationId != null) {

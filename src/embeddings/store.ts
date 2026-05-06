@@ -495,8 +495,19 @@ export interface SearchHit {
 }
 
 /**
- * KNN search against the per-model vec0 table. Returns nearest-K rows,
- * cosine distance ascending (smallest = most similar).
+ * KNN search against the per-model vec0 table. Returns nearest-K rows
+ * by L2 (Euclidean) distance ascending (smallest = most similar).
+ *
+ * Distance metric note: vec0's `CREATE VIRTUAL TABLE ... USING vec0(embedding float[N])`
+ * uses L2 by default — there is NO cosine column-modifier in this declaration.
+ * We rely on Voyage embeddings being unit-normalized (norm ≈ 1.0), which
+ * makes L2 monotone with cosine: L² = 2·(1 - cosine_similarity). For unit
+ * vectors, distances cluster as:
+ *   - ~0.45 (cos ≈ 0.9) = strongly related
+ *   - ~1.00 (cos ≈ 0.5) = weakly related
+ *   - ~1.41 (cos ≈ 0.0) = orthogonal / unrelated
+ * Callers that need cosine for thresholding should derive it from `distance`
+ * (see runSemanticSearch which exposes `cosineSimilarity` on each hit).
  *
  * Throws if the embeddings table for this model doesn't exist. Caller
  * should `vec0Version(db) !== null && embeddingsTableExists(db, modelName)`

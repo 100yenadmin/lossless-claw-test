@@ -224,6 +224,31 @@ export function createLcmSemanticRecallTool(input: {
         }
         lines.push(`**Model:** ${result.modelName}`);
         lines.push(`**Total hits:** ${result.hits.length}`);
+
+        // P3 confidence band — derived from cosine similarity (Voyage = unit
+        // vectors; cos = 1 - L²/2). Bands (calibrated per harness 2026-05-06):
+        //   high  ≥ 0.65 — strong match, agent can cite directly
+        //   med   ≥ 0.50 — likely related, verify with describe before citing
+        //   low   ≥ 0.35 — weak match, more probably noise than signal
+        //   noise <  0.35 — almost certainly not the answer
+        // We emit the BAND OF THE TOP HIT so agents can adjust their confidence
+        // before treating the top result as the answer.
+        const topCos = result.hits[0]?.cosineSimilarity ?? -1;
+        const confidenceBand =
+          result.hits.length === 0
+            ? "no-match"
+            : topCos >= 0.65
+              ? "high"
+              : topCos >= 0.5
+                ? "medium"
+                : topCos >= 0.35
+                  ? "low"
+                  : "noise";
+        if (result.hits.length > 0) {
+          lines.push(
+            `**Confidence (top hit):** ${confidenceBand} (cosine=${topCos.toFixed(3)})`,
+          );
+        }
         lines.push("");
 
         let currentChars = lines.join("\n").length;
@@ -231,10 +256,16 @@ export function createLcmSemanticRecallTool(input: {
         if (result.hits.length === 0) {
           lines.push("No matches found.");
         } else {
+          if (confidenceBand === "low" || confidenceBand === "noise") {
+            lines.push(
+              `*Note: top-hit cosine ${topCos.toFixed(3)} is below the medium-confidence threshold (0.5). Treat results as candidates, not answers — verify with lcm_describe / lcm_grep verbatim.*`,
+            );
+            lines.push("");
+          }
           for (const hit of result.hits) {
             const snippet = truncateSnippet(hit.content);
-            const distanceStr = hit.distance.toFixed(4);
-            const line = `- [${hit.summaryId}] (${hit.kind}, distance=${distanceStr}, ${formatDisplayTime(hit.createdAt, timezone)}): ${snippet}`;
+            const cosStr = hit.cosineSimilarity.toFixed(3);
+            const line = `- [${hit.summaryId}] (${hit.kind}, cosine=${cosStr}, ${formatDisplayTime(hit.createdAt, timezone)}): ${snippet}`;
             if (currentChars + line.length > MAX_RESULT_CHARS) {
               lines.push("*(truncated — more results available)*");
               break;
@@ -251,12 +282,14 @@ export function createLcmSemanticRecallTool(input: {
             candidateCount: result.candidateCount,
             voyageTokensConsumed: result.voyageTokensConsumed,
             hitCount: result.hits.length,
+            confidenceBand,
             hits: result.hits.map((h) => ({
               summaryId: h.summaryId,
               conversationId: h.conversationId,
               sessionKey: h.sessionKey,
               kind: h.kind,
               distance: h.distance,
+              cosineSimilarity: h.cosineSimilarity,
               tokenCount: h.tokenCount,
               createdAt: h.createdAt,
             })),

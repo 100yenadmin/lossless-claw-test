@@ -54,22 +54,29 @@ const LcmDescribeSchema = Type.Object({
   ),
   expandChildrenLimit: Type.Optional(
     Type.Number({
-      description: "Max child summaries to inline when expandChildren=true (default 5, max 20).",
+      description: "Max child summaries to inline when expandChildren=true (default 20, max 50).",
       minimum: 1,
-      maximum: 20,
+      maximum: 50,
     }),
   ),
   expandMessages: Type.Optional(
     Type.Boolean({
       description:
-        "When true (and target is a sum_xxx leaf), include the first-hop source messages' full verbatim content inline (capped at expandMessagesLimit, default 5). Ignored for condensed summaries (no direct messages) and file_xxx targets. Suppressed messages are filtered out.",
+        "When true (and target is a sum_xxx leaf), include the first-hop source messages' full verbatim content inline (capped at expandMessagesLimit, default 20). Ignored for condensed summaries (no direct messages) and file_xxx targets. Suppressed messages are filtered out.",
     }),
   ),
   expandMessagesLimit: Type.Optional(
     Type.Number({
-      description: "Max source messages to inline when expandMessages=true (default 5, max 20).",
+      description: "Max source messages to inline when expandMessages=true (default 20, max 50).",
       minimum: 1,
-      maximum: 20,
+      maximum: 50,
+    }),
+  ),
+  expandMessagesOffset: Type.Optional(
+    Type.Number({
+      description:
+        "Skip the first N messages before returning expandMessagesLimit. Use to paginate through long leaves (e.g. 216-message leaves where the default 20 only covers ~10% of source). Default 0.",
+      minimum: 0,
     }),
   ),
 });
@@ -224,6 +231,25 @@ export function createLcmDescribeTool(input: {
               `m=${node.budgetFit.withMessages ? "in" : "over"}]`,
           );
         }
+        // P4 harness fix: emit a HEADER signal line BEFORE content (which
+        // can be very long for condensed summaries). The detailed expansion
+        // sections still go below content, but the early header guarantees
+        // an agent sees the empty-vs-found signal even when content gets
+        // truncated by an outer wrapper.
+        const expandChildren = p.expandChildren === true;
+        const expandMessages = p.expandMessages === true;
+        if (expandChildren) {
+          if (s.childIds.length === 0) {
+            lines.push("expansion (children): 0 — terminal node, nothing to drill into");
+          } else {
+            lines.push(`expansion (children): ${s.childIds.length} candidate(s); details below`);
+          }
+        }
+        if (expandMessages) {
+          if (s.kind !== "leaf") {
+            lines.push("expansion (messages): n/a — target is not a leaf");
+          }
+        }
         lines.push("content");
         lines.push(s.content);
 
@@ -232,9 +258,7 @@ export function createLcmDescribeTool(input: {
         // (which paraphrases via sub-agent LLM call). The lcm_expand sub-
         // agent gate stays intact for deeper traversal; this is the
         // "describe is safe" mental model extension Agent 2 recommended.
-        // Hard-capped (default 5, max 20) to prevent runaway context loads.
-        const expandChildren = p.expandChildren === true;
-        const expandMessages = p.expandMessages === true;
+        // Hard-capped (default 20, max 50) to prevent runaway context loads.
         const expandedChildren: Array<{
           summaryId: string;
           kind: string;
@@ -250,98 +274,196 @@ export function createLcmDescribeTool(input: {
           content: string;
         }> = [];
 
-        if (expandChildren && s.childIds.length > 0) {
-          const requestedLimit =
-            typeof p.expandChildrenLimit === "number" && Number.isFinite(p.expandChildrenLimit)
-              ? Math.max(1, Math.min(20, Math.trunc(p.expandChildrenLimit)))
-              : 5;
-          const ids = s.childIds.slice(0, requestedLimit);
-          const placeholders = ids.map(() => "?").join(",");
-          const db = lcm.getDb();
-          const rows = db
-            .prepare(
-              `SELECT summary_id, kind, content, token_count, created_at
-                 FROM summaries
-                 WHERE summary_id IN (${placeholders})
-                   AND suppressed_at IS NULL
-                 ORDER BY created_at ASC`,
-            )
-            .all(...ids) as Array<{
-            summary_id: string;
-            kind: string;
-            content: string;
-            token_count: number;
-            created_at: string;
-          }>;
-          for (const r of rows) {
-            expandedChildren.push({
-              summaryId: r.summary_id,
-              kind: r.kind,
-              tokenCount: r.token_count,
-              createdAt: r.created_at,
-              content: r.content,
-            });
-          }
-          if (expandedChildren.length > 0) {
+        // P4 FIX (2026-05-06 harness): always emit a status line when
+        // expandChildren is requested — silent empty was indistinguishable
+        // from "tool ignored my flag" / "node terminal" / "all suppressed".
+        let expandChildrenStatus:
+          | "no-children"
+          | "all-suppressed"
+          | "ok"
+          | "capped"
+          | "skipped-non-summary"
+          | undefined;
+        if (expandChildren) {
+          if (s.childIds.length === 0) {
+            expandChildrenStatus = "no-children";
             lines.push("");
             lines.push(
-              `expanded children (${expandedChildren.length}/${s.childIds.length}; capped at limit=${requestedLimit}, suppressed filtered)`,
+              `expanded children: 0 (this node has no children — it is a terminal in the DAG; nothing to drill into)`,
             );
-            for (const child of expandedChildren) {
+          } else {
+            const requestedLimit =
+              typeof p.expandChildrenLimit === "number" && Number.isFinite(p.expandChildrenLimit)
+                ? Math.max(1, Math.min(50, Math.trunc(p.expandChildrenLimit)))
+                : 20;
+            const ids = s.childIds.slice(0, requestedLimit);
+            const placeholders = ids.map(() => "?").join(",");
+            const db = lcm.getDb();
+            const rows = db
+              .prepare(
+                `SELECT summary_id, kind, content, token_count, created_at
+                   FROM summaries
+                   WHERE summary_id IN (${placeholders})
+                     AND suppressed_at IS NULL
+                   ORDER BY created_at ASC`,
+              )
+              .all(...ids) as Array<{
+              summary_id: string;
+              kind: string;
+              content: string;
+              token_count: number;
+              created_at: string;
+            }>;
+            for (const r of rows) {
+              expandedChildren.push({
+                summaryId: r.summary_id,
+                kind: r.kind,
+                tokenCount: r.token_count,
+                createdAt: r.created_at,
+                content: r.content,
+              });
+            }
+            const requestedCount = ids.length;
+            const survived = expandedChildren.length;
+            const totalChildren = s.childIds.length;
+            const wasCapped = totalChildren > requestedLimit;
+            if (survived === 0) {
+              expandChildrenStatus = "all-suppressed";
               lines.push("");
               lines.push(
-                `### child ${child.summaryId} (${child.kind}, ${child.tokenCount} tokens, ${formatDisplayTime(child.createdAt, timezone)})`,
+                `expanded children: 0/${totalChildren} (all children are suppressed — none returned; the node has children but they have been removed from the agent surface)`,
               );
+            } else {
+              expandChildrenStatus = wasCapped ? "capped" : "ok";
               lines.push("");
-              lines.push(child.content);
+              const suffix =
+                survived < requestedCount
+                  ? ` (${requestedCount - survived} children suppressed and filtered out)`
+                  : "";
+              lines.push(
+                `expanded children: ${survived}/${totalChildren}${
+                  wasCapped ? ` (capped at limit=${requestedLimit}; raise expandChildrenLimit up to 50 for more)` : ""
+                }${suffix}`,
+              );
+              for (const child of expandedChildren) {
+                lines.push("");
+                lines.push(
+                  `### child ${child.summaryId} (${child.kind}, ${child.tokenCount} tokens, ${formatDisplayTime(child.createdAt, timezone)})`,
+                );
+                lines.push("");
+                lines.push(child.content);
+              }
             }
           }
         }
 
-        if (expandMessages && s.kind === "leaf") {
-          const requestedLimit =
-            typeof p.expandMessagesLimit === "number" && Number.isFinite(p.expandMessagesLimit)
-              ? Math.max(1, Math.min(20, Math.trunc(p.expandMessagesLimit)))
-              : 5;
-          const db = lcm.getDb();
-          const rows = db
-            .prepare(
-              `SELECT m.message_id, m.role, m.content, m.token_count, m.created_at
-                 FROM summary_messages sm
-                 JOIN messages m ON m.message_id = sm.message_id
-                 WHERE sm.summary_id = ?
-                   AND m.suppressed_at IS NULL
-                 ORDER BY m.created_at ASC
-                 LIMIT ?`,
-            )
-            .all(id, requestedLimit) as Array<{
-            message_id: number;
-            role: string;
-            content: string;
-            token_count: number;
-            created_at: string;
-          }>;
-          for (const r of rows) {
-            expandedMessages.push({
-              messageId: r.message_id,
-              role: r.role,
-              tokenCount: r.token_count,
-              createdAt: r.created_at,
-              content: r.content,
-            });
-          }
-          if (expandedMessages.length > 0) {
+        // P4+P5 FIX: always emit status line; default cap raised 5→20 with
+        // optional `expandMessagesOffset` for pagination on long leaves.
+        let expandMessagesStatus:
+          | "not-leaf"
+          | "no-messages"
+          | "all-suppressed"
+          | "ok"
+          | "capped"
+          | undefined;
+        if (expandMessages) {
+          if (s.kind !== "leaf") {
+            expandMessagesStatus = "not-leaf";
             lines.push("");
             lines.push(
-              `expanded source messages (${expandedMessages.length}; capped at limit=${requestedLimit}, suppressed filtered)`,
+              `expanded source messages: 0 (target is a ${s.kind} summary, not a leaf — condensed summaries don't have direct messages; expand its children first to find leaves)`,
             );
-            for (const msg of expandedMessages) {
+          } else {
+            const requestedLimit =
+              typeof p.expandMessagesLimit === "number" && Number.isFinite(p.expandMessagesLimit)
+                ? Math.max(1, Math.min(50, Math.trunc(p.expandMessagesLimit)))
+                : 20;
+            const requestedOffset =
+              typeof p.expandMessagesOffset === "number" && Number.isFinite(p.expandMessagesOffset)
+                ? Math.max(0, Math.trunc(p.expandMessagesOffset))
+                : 0;
+            const db = lcm.getDb();
+            // Total source-message count (before offset/limit) to drive the
+            // capped-vs-ok status + pagination hint.
+            const totalRow = db
+              .prepare(
+                `SELECT COUNT(*) AS n
+                   FROM summary_messages sm
+                   JOIN messages m ON m.message_id = sm.message_id
+                   WHERE sm.summary_id = ?
+                     AND m.suppressed_at IS NULL`,
+              )
+              .get(id) as { n: number };
+            const totalMessages = totalRow?.n ?? 0;
+
+            const rows = db
+              .prepare(
+                `SELECT m.message_id, m.role, m.content, m.token_count, m.created_at
+                   FROM summary_messages sm
+                   JOIN messages m ON m.message_id = sm.message_id
+                   WHERE sm.summary_id = ?
+                     AND m.suppressed_at IS NULL
+                   ORDER BY m.created_at ASC
+                   LIMIT ? OFFSET ?`,
+              )
+              .all(id, requestedLimit, requestedOffset) as Array<{
+              message_id: number;
+              role: string;
+              content: string;
+              token_count: number;
+              created_at: string;
+            }>;
+            for (const r of rows) {
+              expandedMessages.push({
+                messageId: r.message_id,
+                role: r.role,
+                tokenCount: r.token_count,
+                createdAt: r.created_at,
+                content: r.content,
+              });
+            }
+            if (totalMessages === 0) {
+              expandMessagesStatus = "no-messages";
               lines.push("");
               lines.push(
-                `### msg#${msg.messageId} (${msg.role}, ${msg.tokenCount} tokens, ${formatDisplayTime(msg.createdAt, timezone)})`,
+                `expanded source messages: 0 (this leaf has no associated messages — likely a synthetic / migrated leaf without source-message lineage)`,
               );
+            } else if (expandedMessages.length === 0) {
+              // Either offset went past the end or all in-range messages
+              // were suppressed.
+              expandMessagesStatus =
+                requestedOffset >= totalMessages ? "ok" : "all-suppressed";
               lines.push("");
-              lines.push(msg.content);
+              if (requestedOffset >= totalMessages) {
+                lines.push(
+                  `expanded source messages: 0/${totalMessages} (offset=${requestedOffset} is past the end; reduce offset to see content)`,
+                );
+              } else {
+                lines.push(
+                  `expanded source messages: 0/${totalMessages} (all messages in this offset window were suppressed and filtered out)`,
+                );
+              }
+            } else {
+              const remaining =
+                totalMessages - (requestedOffset + expandedMessages.length);
+              expandMessagesStatus = remaining > 0 ? "capped" : "ok";
+              lines.push("");
+              const range = `[${requestedOffset + 1}..${requestedOffset + expandedMessages.length}]`;
+              const paginationHint =
+                remaining > 0
+                  ? ` — ${remaining} more after this window; paginate with expandMessagesOffset=${requestedOffset + expandedMessages.length}`
+                  : "";
+              lines.push(
+                `expanded source messages: ${expandedMessages.length}/${totalMessages} ${range}${paginationHint}`,
+              );
+              for (const msg of expandedMessages) {
+                lines.push("");
+                lines.push(
+                  `### msg#${msg.messageId} (${msg.role}, ${msg.tokenCount} tokens, ${formatDisplayTime(msg.createdAt, timezone)})`,
+                );
+                lines.push("");
+                lines.push(msg.content);
+              }
             }
           }
         }
@@ -362,7 +484,9 @@ export function createLcmDescribeTool(input: {
             },
             expansion: {
               children: expandedChildren,
+              childrenStatus: expandChildrenStatus,
               messages: expandedMessages,
+              messagesStatus: expandMessagesStatus,
             },
           },
         };

@@ -106,8 +106,25 @@ export interface SemanticSearchOptions {
 export interface SemanticHit {
   summaryId: string;
   embeddedKind: EmbeddedKind;
-  /** Cosine distance from query vector (smaller = more similar). */
+  /**
+   * vec0's reported L2 (Euclidean) distance from the query vector.
+   * Voyage embeddings are unit-normalized (norm=1.0); on unit vectors,
+   * L2² = 2·(1 - cosine_similarity). Range:
+   *   - 0.0 = identical
+   *   - ~0.45 (cos ≈ 0.9) = strongly related
+   *   - ~1.00 (cos ≈ 0.5) = weakly related
+   *   - ~1.41 (cos ≈ 0.0) = orthogonal / unrelated
+   *   - ~2.00 (cos ≈ -1.0) = opposite (rare with text embeddings)
+   * Use {@link cosineSimilarity} for the [-1, 1] cosine score.
+   */
   distance: number;
+  /**
+   * Convenience: cosine similarity in [-1, 1] derived from `distance`
+   * (assumes unit-normalized vectors, which Voyage guarantees).
+   * Higher = more similar. Use this for confidence-band classification:
+   *   ≥0.8 high / ≥0.6 medium / ≥0.4 low / <0.4 noise.
+   */
+  cosineSimilarity: number;
   /** From summaries: content + metadata (after suppression-filter join). */
   conversationId: number;
   sessionKey: string;
@@ -223,7 +240,27 @@ export async function runSemanticSearch(
   }
 
   // 3. KNN search (with vec0-side suppression + kind filter)
-  const k = opts.k ?? 50;
+  //
+  // P1 FIX (2026-05-06 harness finding): when any filter (time / conversation
+  // / sessionKey / kind) is present, vec0's nearest-K does not know about it.
+  // Top-K globally may all live OUTSIDE the filter window, leading to
+  // 0 hits even though hundreds of matching docs exist. Counter by
+  // OVER-FETCHING from vec0 (10× the user's k, capped at 500) when filters
+  // are active, then trimming after the JOIN. Without filters, request just
+  // k — no waste.
+  const userK = opts.k ?? 50;
+  const hasFilter = Boolean(
+    opts.since ||
+      opts.before ||
+      (opts.conversationIds && opts.conversationIds.length > 0) ||
+      (opts.sessionKeys && opts.sessionKeys.length > 0) ||
+      (opts.summaryKinds && opts.summaryKinds.length > 0),
+  );
+  const VEC0_OVERFETCH_MULT = 10;
+  const VEC0_OVERFETCH_MAX = 500;
+  const k = hasFilter
+    ? Math.min(VEC0_OVERFETCH_MAX, Math.max(userK, userK * VEC0_OVERFETCH_MULT))
+    : userK;
   const candidates = searchSimilar(db, {
     modelName: active.modelName,
     queryVector,
@@ -318,14 +355,21 @@ export async function runSemanticSearch(
 
   // 5. Build hits in candidate (distance) order, dropping any that didn't
   //    survive the filter JOIN. Mark filtered-out for diagnostics.
+  //    P1 FIX: trim to user-requested k after filtering — the over-fetch
+  //    above was just to give the post-filter step survivors to choose from.
   const hits: SemanticHit[] = [];
   for (const cand of summaryHits) {
     const row = rowsById.get(cand.embeddedId);
     if (!row) continue;
+    // Cosine similarity from L2 distance on unit vectors:
+    //   cos = 1 - L²/2
+    // Clamp to [-1, 1] to absorb floating-point error.
+    const cosSim = Math.max(-1, Math.min(1, 1 - (cand.distance * cand.distance) / 2));
     hits.push({
       summaryId: cand.embeddedId,
       embeddedKind: cand.embeddedKind,
       distance: cand.distance,
+      cosineSimilarity: cosSim,
       conversationId: row.conversation_id,
       sessionKey: row.session_key,
       kind: row.kind,
@@ -335,6 +379,7 @@ export async function runSemanticSearch(
       earliestAt: row.earliest_at,
       latestAt: row.latest_at,
     });
+    if (hits.length >= userK) break;
   }
 
   return {

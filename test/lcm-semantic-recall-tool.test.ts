@@ -314,9 +314,47 @@ describe.skipIf(!VEC0_AVAILABLE)("createLcmSemanticRecallTool — vec0 paths", (
     expect(text).toContain("**Query:** `alpha`");
     expect(text).toContain("[leaf_close]");
     expect(text).toContain("the alpha doc");
-    const details = result.details as { hitCount: number; hits: Array<{ summaryId: string }> };
+    const details = result.details as {
+      hitCount: number;
+      confidenceBand: string;
+      hits: Array<{ summaryId: string; cosineSimilarity: number }>;
+    };
     expect(details.hitCount).toBe(2);
     expect(details.hits[0].summaryId).toBe("leaf_close");
+    // P2/P3 harness fix: cosineSimilarity exposed + confidenceBand on details
+    expect(details.hits[0]).toHaveProperty("cosineSimilarity");
+    expect(details.confidenceBand).toMatch(/^(high|medium|low|noise)$/);
+    db.close();
+  });
+
+  // P3 harness fix (2026-05-06): if top hit has cosine < 0.5 (medium threshold),
+  // the rendered output emits a "low confidence" warning so the agent doesn't
+  // confidently cite noise as the answer.
+  it("emits a low-confidence warning when top hit cosine is below medium threshold", async () => {
+    process.env.VOYAGE_API_KEY = "test-key";
+    const db = setupDb();
+    // Document is far from query in vector space → high L2 distance → low cosine
+    insertLeafWithEmbedding(db, "leaf_far_doc", 1, [-0.9, -0.9, -0.9], "unrelated content");
+
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          data: [{ embedding: [0.9, 0.9, 0.9], index: 0 }],
+          usage: { total_tokens: 5 },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      )) as typeof fetch;
+
+    const tool = createLcmSemanticRecallTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ db, conversationId: 1 }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-low", { query: "anything" });
+    const text = (result.content[0] as { text: string }).text;
+    const details = result.details as { confidenceBand: string };
+    expect(details.confidenceBand).toMatch(/^(low|noise)$/);
+    expect(text).toMatch(/below the medium-confidence threshold/);
     db.close();
   });
 

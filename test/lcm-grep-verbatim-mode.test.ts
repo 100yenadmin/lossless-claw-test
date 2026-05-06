@@ -258,4 +258,63 @@ describe("createLcmGrepTool — verbatim mode", () => {
 
     db.close();
   });
+
+  // P6 harness fix (2026-05-06): the 20-result cap was saturating with
+  // tool-role messages on common queries, crowding out user/assistant turns.
+  // The new `role` param filters at the SQL layer.
+  it("role='user' filter restricts to user messages only", async () => {
+    const db = setupDb();
+    // Insert a mix of roles all matching the same pattern.
+    insertMessage(db, { messageId: 1, role: "tool", content: "race condition tool blob 1" });
+    insertMessage(db, { messageId: 2, role: "tool", content: "race condition tool blob 2" });
+    insertMessage(db, { messageId: 3, role: "user", content: "race condition user query" });
+    insertMessage(db, {
+      messageId: 4,
+      role: "assistant",
+      content: "race condition assistant turn",
+    });
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine(db) as never,
+      sessionKey: "agent:main:main",
+    });
+    const r = await tool.execute("c", {
+      pattern: "race",
+      mode: "verbatim",
+      role: "user",
+      conversationId: 1,
+    });
+    const details = r.details as { hits: Array<{ messageId: number; role: string }> };
+    expect(details.hits).toHaveLength(1);
+    expect(details.hits[0]!.role).toBe("user");
+    expect(details.hits[0]!.messageId).toBe(3);
+
+    db.close();
+  });
+
+  // P7 harness fix: FTS5 chokes on bare dots/brackets/leading-hyphens.
+  // The tool now auto-quotes problematic patterns so they don't crash.
+  it("auto-sanitizes patterns with dots so FTS5 doesn't crash (e.g. v4.1)", async () => {
+    const db = setupDb();
+    insertMessage(db, { messageId: 1, content: "v4.1 architecture decision" });
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine(db) as never,
+      sessionKey: "agent:main:main",
+    });
+    // Pre-fix this would throw "fts5: syntax error"; post-fix it auto-quotes
+    // to "v4.1" and matches the inserted message.
+    const r = await tool.execute("c", {
+      pattern: "v4.1",
+      mode: "verbatim",
+      conversationId: 1,
+    });
+    const details = r.details as { totalMatches: number; hits: Array<{ messageId: number }> };
+    expect(details.totalMatches).toBe(1);
+    expect(details.hits[0]!.messageId).toBe(1);
+
+    db.close();
+  });
 });

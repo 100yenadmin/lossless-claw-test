@@ -231,12 +231,17 @@ describe("createLcmDescribeTool — expandChildren flag", () => {
       expandChildren: true,
     });
     const text = (r.content[0] as { text: string }).text;
-    expect(text).toContain("expanded children (2/2");
+    // Format updated 2026-05-06: now uses colon prefix and explicit status
+    // (P4 harness fix — silent empty results were ambiguous).
+    expect(text).toContain("expanded children: 2/2");
     expect(text).toContain("First child content with race-condition fix details");
     expect(text).toContain("Second child content with another concrete topic");
 
-    const details = r.details as { expansion: { children: Array<{ summaryId: string }> } };
+    const details = r.details as {
+      expansion: { children: Array<{ summaryId: string }>; childrenStatus?: string };
+    };
     expect(details.expansion.children).toHaveLength(2);
+    expect(details.expansion.childrenStatus).toBe("ok");
 
     db.close();
   });
@@ -270,10 +275,13 @@ describe("createLcmDescribeTool — expandChildren flag", () => {
     db.close();
   });
 
-  it("respects expandChildrenLimit (capped at 20)", async () => {
+  it("respects expandChildrenLimit (capped at 50)", async () => {
+    // Cap raised 20 → 50 on 2026-05-06 (P5 harness fix). The 5-default
+    // was too low for typical 100-msg leaves; new defaults are
+    // expandChildrenLimit=20, max=50.
     const db = setupDb();
     insertSummary(db, { summaryId: "sum_parent", kind: "condensed", content: "parent" });
-    for (let i = 1; i <= 25; i++) {
+    for (let i = 1; i <= 60; i++) {
       insertSummary(db, { summaryId: `sum_c${i}`, content: `child ${i}` });
       insertParent(db, "sum_parent", `sum_c${i}`);
     }
@@ -287,10 +295,13 @@ describe("createLcmDescribeTool — expandChildren flag", () => {
       id: "sum_parent",
       conversationId: 1,
       expandChildren: true,
-      expandChildrenLimit: 50, // user asks for 50; tool caps at 20
+      expandChildrenLimit: 100, // user asks for 100; tool caps at 50
     });
-    const details = r.details as { expansion: { children: unknown[] } };
-    expect(details.expansion.children.length).toBeLessThanOrEqual(20);
+    const details = r.details as {
+      expansion: { children: unknown[]; childrenStatus?: string };
+    };
+    expect(details.expansion.children.length).toBeLessThanOrEqual(50);
+    expect(details.expansion.childrenStatus).toBe("capped");
 
     db.close();
   });

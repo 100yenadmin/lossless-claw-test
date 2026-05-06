@@ -194,6 +194,27 @@ export function createLcmSearchEntitiesTool(input: {
         )
         .all(...binds, limit) as EntityRow[];
 
+      // P8 fix (2026-05-06 harness): distinguish "0 results for query" from
+      // "0 entities indexed yet" — the latter is a coverage gap, not a
+      // negative answer. Probe the catalog scope so callers (and the agent)
+      // know which scenario they're in.
+      let catalogStatus:
+        | "active"
+        | "empty-for-session"
+        | "empty-globally" = "active";
+      if (rows.length === 0) {
+        const sessionRow = db
+          .prepare(`SELECT COUNT(*) AS n FROM lcm_entities WHERE session_key = ?`)
+          .get(effectiveSessionKey) as { n: number };
+        if ((sessionRow?.n ?? 0) === 0) {
+          const globalRow = db
+            .prepare(`SELECT COUNT(*) AS n FROM lcm_entities`)
+            .get() as { n: number };
+          catalogStatus =
+            (globalRow?.n ?? 0) === 0 ? "empty-globally" : "empty-for-session";
+        }
+      }
+
       // Markdown rendering
       const lines: string[] = [];
       lines.push(`## LCM Entity Search`);
@@ -207,7 +228,19 @@ export function createLcmSearchEntitiesTool(input: {
       lines.push("");
 
       if (rows.length === 0) {
-        lines.push("_No matching entities. The entity coreference worker may not have processed leaves containing this name yet._");
+        if (catalogStatus === "empty-globally") {
+          lines.push(
+            "_No entities indexed in this DB at all. The entity-coreference worker has not run on this DB. This is a coverage gap, NOT a negative answer to your query — the entity may exist in the corpus but has not been extracted yet. Fall back to lcm_grep --mode hybrid for now._",
+          );
+        } else if (catalogStatus === "empty-for-session") {
+          lines.push(
+            `_No entities indexed for session_key \`${effectiveSessionKey}\` (other sessions DO have entities — the worker has run on the corpus but not on this session yet, or no extractable entities have appeared in its leaves). Try sessionKey='agent:main:main' if you intended the main thread, or fall back to lcm_grep._`,
+          );
+        } else {
+          lines.push(
+            "_No entities matched this query (the catalog has entries for this session, but none match — try a wider query, mode='like', or drop the entityType filter)._",
+          );
+        }
       } else {
         lines.push(`| Entity | Type | Occurrences | Last seen |`);
         lines.push(`|---|---|---|---|`);
@@ -229,6 +262,7 @@ export function createLcmSearchEntitiesTool(input: {
           entityType: entityTypeFilter,
           totalMatches: rows.length,
           limitReached: rows.length === limit,
+          catalogStatus,
           entities: rows.map((r) => ({
             entityId: r.entity_id,
             canonicalText: r.canonical_text,

@@ -272,6 +272,54 @@ describe.skipIf(!VEC0_AVAILABLE)("semantic-search — vec0-dependent paths", () 
     db.close();
   });
 
+  // P1 harness fix (2026-05-06): when filters are present, vec0's nearest-K
+  // didn't know about them. Top-K globally could all live OUTSIDE the filter
+  // window, causing 0 hits when many matching docs existed. Fix: over-fetch
+  // 10× from vec0 (cap 500) when filters are active, then trim after JOIN.
+  it("filtered KNN over-fetches so post-filter survivors aren't crowded out", async () => {
+    const db = setupDb();
+    // 30 leaves, all very close to query vector. 5 are in the time window;
+    // 25 are outside. With over-fetch we should get all 5 in-window survivors.
+    for (let i = 1; i <= 30; i++) {
+      insertLeafWithEmbedding(db, `leaf_${i}`, 1, [0.1, 0.2, 0.3]);
+    }
+    // Move 25 leaves OUT of the time window
+    for (let i = 6; i <= 30; i++) {
+      db.prepare(`UPDATE summaries SET created_at = '2026-01-01 00:00:00' WHERE summary_id = ?`)
+        .run(`leaf_${i}`);
+    }
+    // The 5 in-window leaves stay at the default created_at (~now)
+    // Pre-fix: k=5 would request 5 candidates — almost certainly NOT the 5
+    // in-window. Post-fix: k=5 requests 50 from vec0, all 30 survive,
+    // then post-filter keeps the 5 in-window ones.
+    const result = await runSemanticSearch(db, {
+      query: "x",
+      queryVector: new Float32Array([0.1, 0.2, 0.3]),
+      since: new Date("2026-04-01"),
+      k: 5,
+    });
+    expect(result.hits.length).toBe(5);
+    expect(result.candidateCount).toBeGreaterThanOrEqual(30);
+    db.close();
+  });
+
+  // P2 harness fix: cosineSimilarity field added to each hit. Voyage embeddings
+  // are unit-normalized; vec0 default metric is L2. cos = 1 - L²/2.
+  it("each hit exposes cosineSimilarity derived from L2 distance", async () => {
+    const db = setupDb();
+    insertLeafWithEmbedding(db, "leaf_identical", 1, [1.0, 0.0, 0.0]);
+    const result = await runSemanticSearch(db, {
+      query: "x",
+      queryVector: new Float32Array([1.0, 0.0, 0.0]),
+      k: 1,
+    });
+    expect(result.hits[0]).toHaveProperty("cosineSimilarity");
+    // Identical unit vectors → distance ≈ 0 → cosine ≈ 1
+    expect(result.hits[0].distance).toBeCloseTo(0, 5);
+    expect(result.hits[0].cosineSimilarity).toBeCloseTo(1.0, 5);
+    db.close();
+  });
+
   it("summary_kinds filter restricts to leaf vs condensed", async () => {
     const db = setupDb();
     insertLeafWithEmbedding(db, "leaf_a", 1, [0.1, 0.2, 0.3]);

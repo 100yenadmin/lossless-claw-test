@@ -14,16 +14,30 @@
  *     --args '{"pattern":"race condition","mode":"hybrid","conversationId":1872,"limit":10}'
  *
  * SUPPORTED TOOLS (all 8 from the v4.1 ship):
- *   - lcm_grep (modes: regex / full_text / hybrid / semantic / verbatim)
+ *   - lcm_grep
+ *       args: {pattern, mode?, limit?, conversationId?, allConversations?,
+ *              since?, before?, sessionKey?}
+ *       modes: regex / full_text / hybrid / semantic / verbatim
+ *       NOTE: pass `allConversations: true` when running against a session
+ *       key that has no resolved conversation (e.g. agent:main:main on a
+ *       fresh snapshot) — otherwise the scope resolver returns no rows.
  *   - lcm_semantic_recall
+ *       args: {query, limit?, conversationId?, allConversations?, since?,
+ *              before?, summaryKinds?}
+ *       NOTE: schema uses `allConversations: boolean` (NOT `scope`); there
+ *       is NO `minScore` parameter. Distances are L2 floats; lower = more
+ *       similar. Currently un-normalized → distances commonly >1.0 (P2 bug).
  *   - lcm_synthesize_around (returns assembled source text only — no LLM call;
  *     the calling subagent should synthesize itself given the source)
  *   - lcm_describe (with expandChildren / expandMessages)
+ *       args: {id, expandChildren?, expandMessages?, messageOffset?}
  *   - lcm_expand (sub-agent only; harness fakes a sub-agent session_key)
  *   - lcm_expand_query (would normally delegate; harness returns the
  *     would-be candidate IDs only)
  *   - lcm_get_entity
  *   - lcm_search_entities
+ *       NOTE: returns empty on snapshots where the entity-coreference
+ *       worker has not run. Live DBs have it; VACUUM INTO snapshots do not.
  *
  * REQUIREMENTS:
  *   - VOYAGE_API_KEY env var (for hybrid / semantic modes)
@@ -93,7 +107,13 @@ const summaryStore = new SummaryStore(db);
 const conversationStoreReal = new ConversationStore(db, { fts5Available: true });
 const retrievalEngine = new RetrievalEngine(conversationStoreReal, summaryStore);
 
-// Wrapper that adapts ConversationStore to the simpler shape lcm-conversation-scope.ts expects
+// Wrapper that adapts ConversationStore to the production-interface shape
+// lcm-conversation-scope.ts expects (see src/tools/lcm-conversation-scope.ts:10-21).
+//
+// HARNESS BUG H1 FIX: getConversationFamilyIds takes an object input
+// ({conversationId?, sessionId?, sessionKey?}) in production, NOT a positional
+// number. Earlier shim was object-mismatched and threw "Unknown named parameter
+// 'conversationId'" on every call that hit the family-resolution path.
 const conversationStoreShim = {
   getConversationBySessionId: async (sessionId) => {
     const row = db
@@ -109,18 +129,25 @@ const conversationStoreShim = {
       .get(sessionKey);
     return row ? { conversationId: row.conversation_id } : null;
   },
-  getConversationFamilyIds: async (conversationId) => {
-    // Same session_key family — return all conversations sharing the key
-    const sk = db
-      .prepare(`SELECT session_key FROM conversations WHERE conversation_id = ?`)
-      .get(conversationId);
-    if (!sk?.session_key) return [conversationId];
+  // Production signature: ({conversationId?, sessionId?, sessionKey?}) => Promise<number[]>
+  getConversationFamilyIds: async ({ conversationId, sessionKey }) => {
+    let resolvedSessionKey = sessionKey;
+    if (!resolvedSessionKey && conversationId != null) {
+      const sk = db
+        .prepare(`SELECT session_key FROM conversations WHERE conversation_id = ?`)
+        .get(conversationId);
+      resolvedSessionKey = sk?.session_key;
+    }
+    if (!resolvedSessionKey) {
+      return conversationId != null ? [conversationId] : [];
+    }
     const fam = db
       .prepare(
         `SELECT conversation_id FROM conversations WHERE session_key = ? ORDER BY conversation_id`,
       )
-      .all(sk.session_key);
-    return fam.map((r) => r.conversation_id);
+      .all(resolvedSessionKey);
+    const ids = fam.map((r) => r.conversation_id);
+    return ids.length > 0 ? ids : conversationId != null ? [conversationId] : [];
   },
 };
 

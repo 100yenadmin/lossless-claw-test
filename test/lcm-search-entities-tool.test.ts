@@ -287,7 +287,11 @@ describe("createLcmSearchEntitiesTool — filters and edge cases", () => {
     db.close();
   });
 
-  it("returns empty result with helpful text when no matches", async () => {
+  it("returns empty result with helpful text when no matches (catalog empty)", async () => {
+    // P8 harness fix (2026-05-06): empty result now distinguishes
+    // "0 entities indexed" (coverage gap) from "0 matches for query"
+    // (negative answer). On a fresh DB with no entities, status is
+    // 'empty-globally' and the text says so explicitly.
     const db = setupDb();
     const tool = createLcmSearchEntitiesTool({
       deps: makeDeps(),
@@ -296,8 +300,12 @@ describe("createLcmSearchEntitiesTool — filters and edge cases", () => {
     });
     const r = await tool.execute("c", { query: "Nonexistent" });
     expect((r.details as { totalMatches: number }).totalMatches).toBe(0);
+    expect((r.details as { catalogStatus: string }).catalogStatus).toBe(
+      "empty-globally",
+    );
     const text = (r.content[0] as { text: string }).text;
-    expect(text).toContain("No matching entities");
+    expect(text).toContain("No entities indexed in this DB at all");
+    expect(text).toContain("coverage gap");
     db.close();
   });
 });
