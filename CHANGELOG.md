@@ -1,5 +1,17 @@
 # @martian-engineering/lossless-claw
 
+## 0.10.0
+
+### Minor Changes
+
+- [#338](https://github.com/Martian-Engineering/lossless-claw/pull/338) [`a05b9e4`](https://github.com/Martian-Engineering/lossless-claw/commit/a05b9e4c83a21c22e9279f66e848e84eed389fe8) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Search and expansion tools now treat rotated conversation segments that share a stable session identity as one recall scope by default.
+
+### Patch Changes
+
+- [#622](https://github.com/Martian-Engineering/lossless-claw/pull/622) [`36c47d1`](https://github.com/Martian-Engineering/lossless-claw/commit/36c47d1dbfd98258912e0bc883be703afc024ca6) Thanks [@jalehman](https://github.com/jalehman)! - Allow deferred `cold-cache-catchup` compaction debt to drain despite a recent prompt-cache touch. Background, assemble, and host-approved maintain drains now treat recorded cold-cache debt, or telemetry with an effectively cold cache-read share, as eligible for execution instead of preserving a nominally hot cache that is not actually being reused.
+
+- [#621](https://github.com/Martian-Engineering/lossless-claw/pull/621) [`a81bb34`](https://github.com/Martian-Engineering/lossless-claw/commit/a81bb34b869b4b3d1e0d52d248a499be7d45c3e5) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Fix `afterTurn` skipping compaction evaluation when `ingestBatch` is empty. When `deduplicateAfterTurnBatch` removed every new message (e.g. because `afterTurnTranscriptReconcile` or per-message `engine.ingest` calls had already imported them), `afterTurn` would early-return before reaching the compaction policy block. Long-running conversations could accumulate well beyond `contextThreshold` without ever triggering an incremental leaf pass, deferred-compaction debt record, or budget-trigger run — leaving the host's emergency overflow truncation as the only safety net. The early-return is now replaced with a fall-through: when `ingestBatch` is empty the actual `ingestBatch` call is skipped, but token-budget resolution, conversation lookup, and the existing compaction evaluation flow still run. This is observable in the `[lcm] afterTurn: nothing to ingest …` log line, which now ends with `(continuing to compaction evaluation; transcript reconcile may have already ingested)`.
+
 ## 0.9.4
 
 ### Patch Changes
