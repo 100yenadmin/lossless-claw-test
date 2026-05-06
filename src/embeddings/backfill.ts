@@ -516,17 +516,23 @@ function writeBatch(
 ): { succeeded: number; errors: BackfillSkippedDoc[] } {
   const errors: BackfillSkippedDoc[] = [];
   let succeeded = 0;
-  // Single transaction across the batch — one COMMIT, fewer fsyncs.
-  // recordEmbedding() does INSERT OR REPLACE on the meta sidecar so a
-  // re-run is safe. vec0 inserts have NO uniqueness constraint on
-  // auxiliary cols, so a duplicate would create a 2nd row — but the
-  // SELECT pre-filter (NOT EXISTS in meta) prevents that under
-  // single-flight worker.
+  // Wave-1 Auditor #2 finding #4: per-row write failure inside the batch
+  // tx left a phantom vec0 row (no corresponding meta) when recordEmbedding
+  // partially succeeded — the meta-side INSERT failed but the vec0-side
+  // had already gone through. On the next tick, NOT EXISTS in meta would
+  // re-pick the doc, INSERT a SECOND vec0 row, and now we have duplicate
+  // KNN entries.
+  //
+  // Each row gets its own SAVEPOINT so we can roll back JUST that row's
+  // partial writes (vec0 + meta together) on per-row failure, without
+  // killing the whole batch.
   db.exec("BEGIN IMMEDIATE");
   try {
     for (let i = 0; i < batch.length; i++) {
       const doc = batch[i];
       const vec = vectors[i];
+      const sp = `bf_${i}`;
+      db.exec(`SAVEPOINT ${sp}`);
       try {
         recordEmbedding(db, {
           modelName,
@@ -535,9 +541,19 @@ function writeBatch(
           vector: vec,
           sourceTokenCount: doc.tokenCount,
         });
+        db.exec(`RELEASE ${sp}`);
         succeeded++;
       } catch (e: unknown) {
-        // Per-row write failure (rare — dim mismatch, e.g.). Record + continue.
+        // Per-row write failure (rare — dim mismatch, e.g.). Roll back to
+        // SAVEPOINT — that erases any vec0 partial write, leaving the row
+        // entirely unsynced. Caller will re-pick on next tick (clean slate).
+        try {
+          db.exec(`ROLLBACK TO ${sp}`);
+          db.exec(`RELEASE ${sp}`);
+        } catch {
+          // best-effort; if savepoint rollback fails the outer
+          // try/catch will catch and ROLLBACK the whole tx.
+        }
         errors.push({
           summaryId: doc.summaryId,
           reason: "voyage_other",

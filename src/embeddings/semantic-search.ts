@@ -323,12 +323,22 @@ export async function runSemanticSearch(
     filters.push(`s.conversation_id IN (${opts.conversationIds.map(() => "?").join(",")})`);
     binds.push(...opts.conversationIds);
   }
+  // Wave-1 Auditor #4 finding #3: semantic and FTS arms had divergent
+  // time-filter semantics — semantic used `s.created_at` (row-write
+  // time), FTS used `COALESCE(s.latest_at, s.created_at)` (the content's
+  // covered-time bracket). On condensed summaries written long after the
+  // content they cover, the two arms returned different sets for the
+  // same since/before window. Use COALESCE here to match FTS.
   if (opts.since) {
-    filters.push(`s.created_at >= ?`);
+    filters.push(
+      `julianday(COALESCE(s.latest_at, s.created_at)) >= julianday(?)`,
+    );
     binds.push(opts.since.toISOString());
   }
   if (opts.before) {
-    filters.push(`s.created_at < ?`);
+    filters.push(
+      `julianday(COALESCE(s.latest_at, s.created_at)) < julianday(?)`,
+    );
     binds.push(opts.before.toISOString());
   }
   if (opts.summaryKinds && opts.summaryKinds.length > 0) {

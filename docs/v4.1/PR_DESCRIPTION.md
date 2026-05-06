@@ -46,7 +46,14 @@ A real person with continuity of memory can answer 5 types of questions about th
 | **D. Pattern** "history of project X" / "how do I rebuild gateway?" / "themes this month?" | `lcm_get_entity` + `lcm_search_entities` (entity sub-cases) | 2/5 PRIMARY (entity); 3/5 fallback (theme/procedure preserved in #616) |
 | **E. Drilldown** "where did this come from?" | `lcm_describe` (with new expandChildren / expandMessages flags) + `lcm_expand_query` | 5/5 PRIMARY |
 
-**22/25 test cases have PRIMARY coverage** out of 25 concrete agent queries the system is gated against. The 3 partial-coverage cases (Type D theme/procedure sub-cases) have adequate fallback via `lcm_grep --mode hybrid` + `lcm_synthesize_around`. Themes consolidation worker + procedure mining worker are preserved in draft PR #616 for a focused future-cycle PR with complete worker + agent-tool wiring together.
+**22/25 test cases have PRIMARY tool coverage** in the design — meaning each test case has a designated primary tool and at least one fallback path.
+
+Live-DB harness validation (5 parallel Sonnet subagents, 2026-05-06 against Eva's actual snapshot DB) refined the headline:
+- **14/25 cases pass with high confidence** end-to-end on the snapshot
+- **8/25 cases pass with degraded UX** — the tool returns useful output but it's a slower path, or returns "0 results with status hint" rather than the answer (most common when a fresh-snapshot DB has no entity-coreference catalog yet)
+- **3/25 cases (Type D D1, D3, D5)** are theme/procedure sub-cases with adequate fallback via `lcm_grep --mode hybrid` + `lcm_synthesize_around`. Themes consolidation worker + procedure mining worker are preserved in draft PR #616 for a focused future-cycle PR with complete worker + agent-tool wiring together.
+
+Live-harness verification details: `docs/v4.1/HARNESS_REPORT_2026-05-06.md` (post-fix annotated).
 
 ---
 

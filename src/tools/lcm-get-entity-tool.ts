@@ -49,8 +49,10 @@ const LcmGetEntitySchema = Type.Object({
   entityType: Type.Optional(
     Type.String({
       description:
-        "Optional entity_type filter (e.g. 'person', 'project', 'pr', 'commit', 'file'). " +
-        "Useful when the same name (e.g. 'main') could match multiple entity types.",
+        "Optional entity_type filter. Common extractor-produced values: 'person_name', " +
+        "'pr_number', 'agent_id', 'session_key', 'command', 'file_path', 'date'. Useful when " +
+        "the same name (e.g. 'main') could match multiple entity types. Discover what's in " +
+        "the catalog first via lcm_search_entities without an entityType filter.",
     }),
   ),
   mentionLimit: Type.Optional(

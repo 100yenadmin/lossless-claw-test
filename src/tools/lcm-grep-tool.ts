@@ -183,6 +183,14 @@ export function createLcmGrepTool(input: {
 
       const p = params as Record<string, unknown>;
       const pattern = (p.pattern as string).trim();
+      // Wave-1 Auditor #9 + QA-runner adv-empty-pattern fix: empty
+      // pattern was reaching FTS5 sanitizer which returns `'""'`,
+      // causing FTS5 to match all rows. Reject explicitly.
+      if (pattern.length === 0) {
+        return jsonResult({
+          error: "`pattern` is required and must be a non-empty string.",
+        });
+      }
       const mode =
         (p.mode as "regex" | "full_text" | "hybrid" | "semantic" | "verbatim") ?? "regex";
       const scope = (p.scope as "messages" | "summaries" | "both") ?? "both";
@@ -447,6 +455,14 @@ async function runHybridLcmGrep(input: HybridGrepInput) {
     excludeSuppressed?: boolean;
     limit: number;
   }): Promise<FtsHit[]> => {
+    // Wave-1 Auditor #4 finding #2: SummarySearchInput doesn't expose
+    // sessionKeys/summaryKinds. Caller-passed filters were SILENTLY
+    // DROPPED, leaking cross-session content into the FTS arm of hybrid
+    // search. Fix: over-fetch, then post-filter on what searchSummaries
+    // doesn't support.
+    const overFetchK = args.sessionKeys?.length || args.summaryKinds?.length
+      ? Math.max(args.limit, args.limit * 5, 100)
+      : args.limit;
     const ftsResults = await summaryStore.searchSummaries({
       query: pattern,
       mode: "full_text",
@@ -458,16 +474,29 @@ async function runHybridLcmGrep(input: HybridGrepInput) {
         : conversationScope.conversationIds,
       since: args.since,
       before: args.before,
-      limit: args.limit,
+      limit: overFetchK,
       sort: "relevance",
     });
     if (ftsResults.length === 0) return [];
     const hydrated = hydrateRowsById(ftsResults.map((r) => r.summaryId));
+    const sessionKeysFilter =
+      args.sessionKeys && args.sessionKeys.length > 0
+        ? new Set(args.sessionKeys)
+        : null;
+    const summaryKindsFilter =
+      args.summaryKinds && args.summaryKinds.length > 0
+        ? new Set(args.summaryKinds)
+        : null;
     const out: FtsHit[] = [];
     for (let i = 0; i < ftsResults.length; i++) {
       const r = ftsResults[i];
       const row = hydrated.get(r.summaryId);
       if (!row) continue; // suppressed/deleted between FTS and hydrate — drop
+      // Post-filter on sessionKeys (auditor #4 #2 fix) — required for
+      // session-family scoping invariant per v4.1 §10.
+      if (sessionKeysFilter && !sessionKeysFilter.has(row.sessionKey)) continue;
+      // Post-filter on summaryKinds (parity with semantic arm).
+      if (summaryKindsFilter && !summaryKindsFilter.has(row.kind)) continue;
       out.push({
         summaryId: r.summaryId,
         conversationId: row.conversationId,
@@ -478,6 +507,7 @@ async function runHybridLcmGrep(input: HybridGrepInput) {
         createdAt: row.createdAt,
         rank: i,
       });
+      if (out.length >= args.limit) break;
     }
     return out;
   };

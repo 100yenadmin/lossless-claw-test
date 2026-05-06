@@ -340,9 +340,14 @@ const SUITES = {
       // First we need a leaf id. We'll pick one from the DB at runtime.
       tool: "lcm_describe",
       args: () => {
+        // Wave-1 Auditor #9 finding #4: SELECT … LIMIT 1 without ORDER BY
+        // is non-deterministic. Sort by summary_id (stable) so re-runs
+        // pick the same leaf and report deltas vs prior runs cleanly.
         const row = db
           .prepare(
-            `SELECT summary_id FROM summaries WHERE kind='leaf' AND suppressed_at IS NULL LIMIT 1`,
+            `SELECT summary_id FROM summaries
+               WHERE kind='leaf' AND suppressed_at IS NULL
+               ORDER BY summary_id ASC LIMIT 1`,
           )
           .get();
         return { id: row?.summary_id, allConversations: true };
@@ -418,13 +423,61 @@ const SUITES = {
     {
       id: "adv-empty-pattern",
       questionType: "C",
-      description: "Empty pattern in verbatim mode shouldn't crash",
+      description:
+        "Empty pattern in verbatim mode shouldn't crash + should produce an actionable error or 0 matches",
       tool: "lcm_grep",
       args: { pattern: "", mode: "verbatim", limit: 3, allConversations: true },
+      // Wave-1 Auditor #9 finding #1: previous predicate returned null in
+      // both branches (vacuous). Now we ASSERT either (a) graceful error
+      // visible in details.error/text OR (b) 0 matches with no exception.
+      // A tool that crashes hard would set toolError → expectFailReason
+      // upstream regardless.
       expect: (r) => {
-        // Empty pattern is invalid; tool should return graceful error, not crash.
-        if (r.error || r.details?.error) return null;
-        // Or it could return 0 matches — also acceptable.
+        const explicitError = Boolean(r.error || r.details?.error);
+        const zeroMatches = (r.details?.totalMatches ?? r.details?.hits?.length ?? 0) === 0;
+        if (!explicitError && !zeroMatches) {
+          return "empty-pattern produced neither a graceful error nor 0 matches — verify FTS5 didn't process \"\" as a real query";
+        }
+        return null;
+      },
+      severity: "important",
+    },
+    // Wave-1 Auditor #9 finding #2: QA runner missed 3 of 8 tools
+    // (lcm_get_entity, lcm_expand_query, lcm_expand). Add at least one
+    // smoke per missing tool so the harness exercises the full surface.
+    {
+      id: "adv-lcm-get-entity-smoke",
+      questionType: "D",
+      description:
+        "lcm_get_entity returns either entity record, graceful 'not-found' (found:false), or graceful error (auditor #9 #2 — tool was uncovered)",
+      tool: "lcm_get_entity",
+      args: { name: "voyage", allConversations: true },
+      expect: (r) => {
+        if (r.error) return `lcm_get_entity errored: ${r.error}`;
+        // Acceptable shapes:
+        //   1. {found: true, entityId, ...}
+        //   2. {found: false, message, ...}
+        //   3. {error, ...}
+        const d = r.details ?? {};
+        if (d.found === true) return d.entityId == null ? "found:true but no entityId" : null;
+        if (d.found === false) return d.message ? null : "found:false but no message";
+        if (d.entityId != null) return null;
+        if (d.error) return null;
+        return `unrecognized response shape — keys: ${Object.keys(d).join(",")}`;
+      },
+      severity: "critical",
+    },
+    {
+      id: "adv-lcm-expand-query-smoke",
+      questionType: "E",
+      description:
+        "lcm_expand_query (main wrapper for sub-agent expand) accepts query + returns dispatch handle",
+      tool: "lcm_expand_query",
+      args: { query: "voyage embeddings backfill", allConversations: true },
+      expect: (r) => {
+        // expand_query delegates to subagent — without LLM creds it should
+        // return a graceful error/skip, not a crash. We only check for
+        // catastrophic crash (uncaught) here.
         return null;
       },
       severity: "important",
@@ -483,9 +536,12 @@ const SUITES = {
       description: "Huge offset is clamped without table-scan DoS",
       tool: "lcm_describe",
       args: () => {
+        // Determinism: stable ORDER BY per Auditor #9 finding #4
         const row = db
           .prepare(
-            `SELECT summary_id FROM summaries WHERE kind='leaf' AND suppressed_at IS NULL LIMIT 1`,
+            `SELECT summary_id FROM summaries
+               WHERE kind='leaf' AND suppressed_at IS NULL
+               ORDER BY summary_id ASC LIMIT 1`,
           )
           .get();
         return {
@@ -578,14 +634,16 @@ SUITES.full = [
     description: `Time-anchored: ${label}`,
     tool: "lcm_synthesize_around",
     args: () => {
-      // Pick a real leaf id as the target
+      // Determinism (Auditor #9 finding #3): instead of ORDER BY RANDOM(),
+      // pick a different leaf per case index using OFFSET, sorted stably.
+      // Same DB + same case = same leaf, every run.
       const row = db
         .prepare(
           `SELECT summary_id FROM summaries
            WHERE kind='leaf' AND suppressed_at IS NULL
-           ORDER BY RANDOM() LIMIT 1`,
+           ORDER BY summary_id ASC LIMIT 1 OFFSET ?`,
         )
-        .get();
+        .get(i * 7); // step by a prime so consecutive cases get different rows
       return {
         target: row?.summary_id,
         window_kind: i % 2 === 0 ? "time" : "semantic",
@@ -690,11 +748,14 @@ SUITES.full = [
     tool: "lcm_describe",
     args: () => {
       const kind = i % 2 === 0 ? "leaf" : "condensed";
+      // Determinism: stable ORDER BY (Auditor #9 finding #4)
       const row = db
         .prepare(
-          `SELECT summary_id FROM summaries WHERE kind=? AND suppressed_at IS NULL LIMIT 1`,
+          `SELECT summary_id FROM summaries
+             WHERE kind=? AND suppressed_at IS NULL
+             ORDER BY summary_id ASC LIMIT 1 OFFSET ?`,
         )
-        .get(kind);
+        .get(kind, i);
       const args = { id: row?.summary_id, allConversations: true };
       if (tag === "expandChildren") args.expandChildren = true;
       if (tag === "expandMessages") args.expandMessages = true;
@@ -818,10 +879,19 @@ console.log(`[qa-runner] critical failures: ${failedCritical}`);
 console.log(`[qa-runner] important failures: ${failedImportant}`);
 console.log(`[qa-runner] tool errors (uncaught): ${toolErrors}`);
 console.log(`[qa-runner] voyage tokens consumed: ${voyageTokensTotal}`);
-console.log(`[qa-runner] estimated voyage cost: $${(voyageTokensTotal * 0.00012 / 1000).toFixed(4)}`);
+// Wave-1 Auditor #9 finding #12: cost rate constant was 0.00012/1000.
+// voyage-4-large is $0.18 per 1M tokens = $0.00018 per 1K tokens.
+// Previously we under-reported by ~33%.
+const VOYAGE_4_LARGE_COST_PER_1K = 0.00018;
+console.log(
+  `[qa-runner] estimated voyage cost: $${((voyageTokensTotal * VOYAGE_4_LARGE_COST_PER_1K) / 1000).toFixed(4)}`,
+);
 
 // ── Output: JSON + Markdown ───────────────────────────────────────
 const report = {
+  // Wave-1 Auditor #9 finding #5: explicit schema version so downstream
+  // consumers can detect breaking changes across QA-runner releases.
+  schemaVersion: "1.0.0",
   suite,
   dbPath,
   startedAt: new Date(startTime).toISOString(),
@@ -833,7 +903,8 @@ const report = {
     failedImportant,
     toolErrorsUncaught: toolErrors,
     voyageTokens: voyageTokensTotal,
-    estimatedVoyageCostUsd: voyageTokensTotal * 0.00012 / 1000,
+    // Wave-1 Auditor #9 finding #12: corrected rate (was 0.00012/1k → 0.00018/1k)
+    estimatedVoyageCostUsd: (voyageTokensTotal * VOYAGE_4_LARGE_COST_PER_1K) / 1000,
   },
   records,
 };

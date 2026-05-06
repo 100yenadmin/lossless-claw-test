@@ -33,10 +33,10 @@ import type { LcmDependencies } from "../types.js";
 import { createEntityExtractorLlm } from "../extraction/entity-extractor-llm.js";
 import {
   countPendingExtractions,
-  runCoreferenceTick,
   type CoreferenceTickResult,
   type ExtractEntities,
 } from "../extraction/entity-coreference.js";
+import { tickExtraction } from "./worker-orchestrator.js";
 
 export const DEFAULT_EXTRACTION_INTERVAL_MS = 60 * 1000; // 1 minute
 
@@ -125,9 +125,16 @@ export function tryStartExtractionAutostart(
       consecutiveIdleTicks = 0;
 
       const startedAt = Date.now();
-      let result: CoreferenceTickResult;
+      let result: CoreferenceTickResult & { lockAcquired: boolean };
       try {
-        result = await runCoreferenceTick(db, extractor, {
+        // Wave-1 Auditor #6 finding #4: previously called runCoreferenceTick
+        // directly, bypassing the worker lock. Two gateway processes booting
+        // simultaneously would both pull the same queue items and double-
+        // process them (duplicate entities, duplicate mentions). Use
+        // tickExtraction (orchestrator-wrapped) so the autostart shares
+        // the same locking discipline as /lcm worker tick extraction.
+        result = await tickExtraction(db, {
+          extractor,
           passId: `autostart-${Date.now().toString(36)}`,
           perTickLimit: 50,
         });
@@ -145,6 +152,13 @@ export function tryStartExtractionAutostart(
         return;
       }
       totalTicks++;
+
+      if (!result.lockAcquired) {
+        log.info(
+          `[lcm] extraction autostart: lock held by another worker; skipping this tick.`,
+        );
+        return;
+      }
 
       const durationMs = Date.now() - startedAt;
       log.info(

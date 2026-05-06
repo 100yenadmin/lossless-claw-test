@@ -46,6 +46,11 @@ import {
   type RunEvalArgs,
 } from "../operator/eval-runner.js";
 import {
+  PurgeError,
+  runPurge,
+  type PurgeOptions,
+} from "../operator/purge.js";
+import {
   getWorkerStatusSnapshot,
   tickEmbeddingBackfill,
 } from "../operator/worker-orchestrator.js";
@@ -112,6 +117,21 @@ type ParsedLcmCommand =
       allowMainSession: boolean;
     }
   | { kind: "eval"; mode: EvalMode; querySetName: string; querySetVersion: number }
+  | {
+      // Wave-1 Auditor #8 BLOCKER #1 fix: wire /lcm purge so the runPurge
+      // module isn't dead code. Soft mode only (immediate cut). Required:
+      // a reason + at least one criterion. allowMainSession gates Eva's
+      // primary thread.
+      kind: "purge";
+      reason: string;
+      sessionKey?: string;
+      summaryIds?: string[];
+      since?: Date;
+      before?: Date;
+      minTokenCount?: number;
+      allowMainSession: boolean;
+      apply: boolean;
+    }
   | { kind: "help"; error?: string };
 
 type RotateCommandEngine = {
@@ -548,12 +568,125 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
         error:
           `\`${VISIBLE_COMMAND} doctor\` accepts no arguments, \`clean\` for global high-confidence junk diagnostics, \`clean apply [filter-id] [vacuum]\` for cleanup, or \`apply\` for the scoped summary repair path.`,
       };
+    case "purge": {
+      // Wave-1 Auditor #8 BLOCKER #1 fix: wire /lcm purge so the runPurge
+      // module is reachable. SOFT mode only (immediate was cut from PR).
+      // Re-tokenize quote-aware so --reason "complex text" parses.
+      const startIdx = (rawArgs ?? "").toLowerCase().indexOf("purge");
+      const tokens = startIdx >= 0
+        ? splitArgsQuoted((rawArgs ?? "").slice(startIdx).slice("purge".length).trim())
+        : [];
+      let reason = "";
+      let sessionKey: string | undefined;
+      let summaryIds: string[] | undefined;
+      let since: Date | undefined;
+      let before: Date | undefined;
+      let minTokenCount: number | undefined;
+      let allowMainSession = false;
+      let apply = false;
+      let parseError: string | undefined;
+      for (let i = 0; i < tokens.length; i++) {
+        const t = tokens[i];
+        switch (t) {
+          case "--apply":
+            apply = true;
+            break;
+          case "--allow-main-session":
+            allowMainSession = true;
+            break;
+          case "--reason": {
+            const v = tokens[++i];
+            if (!v) {
+              parseError = "`--reason` requires a value (in quotes if multi-word).";
+              break;
+            }
+            reason = v;
+            break;
+          }
+          case "--session-key": {
+            const v = tokens[++i];
+            if (!v) {
+              parseError = "`--session-key` requires a value.";
+              break;
+            }
+            sessionKey = v;
+            break;
+          }
+          case "--summary-ids": {
+            const v = tokens[++i];
+            if (!v) {
+              parseError = "`--summary-ids` requires a comma-separated list.";
+              break;
+            }
+            summaryIds = v.split(",").map((s) => s.trim()).filter(Boolean);
+            break;
+          }
+          case "--since": {
+            const v = tokens[++i];
+            if (!v) {
+              parseError = "`--since` requires an ISO timestamp.";
+              break;
+            }
+            const d = new Date(v);
+            if (Number.isNaN(d.getTime())) {
+              parseError = `\`--since\` value \`${v}\` is not a valid ISO timestamp.`;
+              break;
+            }
+            since = d;
+            break;
+          }
+          case "--before": {
+            const v = tokens[++i];
+            if (!v) {
+              parseError = "`--before` requires an ISO timestamp.";
+              break;
+            }
+            const d = new Date(v);
+            if (Number.isNaN(d.getTime())) {
+              parseError = `\`--before\` value \`${v}\` is not a valid ISO timestamp.`;
+              break;
+            }
+            before = d;
+            break;
+          }
+          case "--min-token-count": {
+            const v = tokens[++i];
+            const n = v ? Number(v) : NaN;
+            if (!Number.isFinite(n) || n < 0) {
+              parseError = "`--min-token-count` requires a non-negative integer.";
+              break;
+            }
+            minTokenCount = Math.trunc(n);
+            break;
+          }
+          default:
+            if (t?.startsWith("--")) {
+              parseError = `Unknown flag for \`${VISIBLE_COMMAND} purge\`: ${t}`;
+            }
+        }
+        if (parseError) break;
+      }
+      if (parseError) {
+        return { kind: "help", error: parseError };
+      }
+      return {
+        kind: "purge",
+        reason,
+        sessionKey,
+        summaryIds,
+        since,
+        before,
+        minTokenCount,
+        allowMainSession,
+        apply,
+      };
+    }
     case "help":
       return { kind: "help" };
     default:
       return {
         kind: "help",
-        error: `Unknown subcommand \`${head}\`. Supported: status, backup, rotate, health, worker, reconcile-session-keys, eval, doctor, doctor clean, doctor apply, help.`,
+        error: `Unknown subcommand \`${head}\`. Supported: status, backup, rotate, health, worker, reconcile-session-keys, eval, purge, doctor, doctor clean, doctor apply, help.`,
       };
   }
 }
@@ -885,6 +1018,10 @@ function buildHelpText(error?: string): string {
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} eval --mode hybrid --query-set <name> --version <n>`),
         "Run an eval against a specific query set + retrieval mode.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} purge --reason "<text>" [--session-key K | --summary-ids id1,id2 | --since ISO | --before ISO | --min-token-count N]`),
+        "Soft-purge leaves matching the criteria. Defaults to dry-run preview. Add --apply to actually suppress; --allow-main-session to target agent:main:main.",
       ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor`), "Scan for broken or truncated summaries."),
       buildStatLine(
@@ -1970,6 +2107,158 @@ function buildReconcileApplyText(params: {
   return lines.join("\n");
 }
 
+// Wave-1 Auditor #8 BLOCKER #1 fix: operator-reachable purge command.
+// Soft mode only (immediate cut from PR #613). Defaults to dry-run
+// preview unless --apply is explicitly passed.
+async function buildPurgeText(params: {
+  db: DatabaseSync;
+  reason: string;
+  sessionKey?: string;
+  summaryIds?: string[];
+  since?: Date;
+  before?: Date;
+  minTokenCount?: number;
+  allowMainSession: boolean;
+  apply: boolean;
+}): Promise<string> {
+  const lines = [
+    ...buildHeaderLines(),
+    "",
+    "🧹 Lossless Claw Purge (soft mode)",
+    "",
+    buildSection("📋 Criteria", [
+      buildStatLine(
+        "session-key",
+        params.sessionKey ? formatCommand(truncateMiddle(params.sessionKey, 44)) : "(none)",
+      ),
+      buildStatLine(
+        "summary-ids",
+        params.summaryIds && params.summaryIds.length > 0
+          ? `${params.summaryIds.length} ids`
+          : "(none)",
+      ),
+      buildStatLine("since", params.since ? params.since.toISOString() : "(none)"),
+      buildStatLine("before", params.before ? params.before.toISOString() : "(none)"),
+      buildStatLine(
+        "min-token-count",
+        params.minTokenCount != null ? String(params.minTokenCount) : "(none)",
+      ),
+      buildStatLine("reason", params.reason || "(EMPTY)"),
+      buildStatLine("allow main session", formatBoolean(params.allowMainSession)),
+      buildStatLine("apply", formatBoolean(params.apply)),
+    ]),
+    "",
+  ];
+
+  if (!params.reason || params.reason.trim().length === 0) {
+    lines.push(
+      buildSection("🛠️ Outcome", [
+        buildStatLine("status", "rejected"),
+        buildStatLine("kind", "missing_reason"),
+        buildStatLine(
+          "fix",
+          `Pass \`--reason "free text describing why this is being purged"\``,
+        ),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const opts: PurgeOptions = {
+    reason: params.reason,
+    sessionKey: params.sessionKey,
+    summaryIds: params.summaryIds,
+    since: params.since,
+    before: params.before,
+    minTokenCount: params.minTokenCount,
+    allowMainSession: params.allowMainSession,
+  };
+
+  // Dry-run preview: count what WOULD be affected without actually
+  // suppressing. We re-implement the resolveTargetLeafIds logic here
+  // since purge.ts doesn't export it; this is a deliberately
+  // best-effort preview, not a transactional snapshot.
+  if (!params.apply) {
+    let previewCount = 0;
+    try {
+      if (opts.summaryIds && opts.summaryIds.length > 0) {
+        previewCount = opts.summaryIds.length;
+      } else {
+        const where: string[] = ["kind = 'leaf'", "suppressed_at IS NULL"];
+        const binds: unknown[] = [];
+        if (opts.sessionKey) {
+          where.push("session_key = ?");
+          binds.push(opts.sessionKey);
+        }
+        if (opts.since) {
+          where.push("datetime(created_at) >= datetime(?)");
+          binds.push(opts.since.toISOString());
+        }
+        if (opts.before) {
+          where.push("datetime(created_at) < datetime(?)");
+          binds.push(opts.before.toISOString());
+        }
+        if (typeof opts.minTokenCount === "number") {
+          where.push("token_count >= ?");
+          binds.push(opts.minTokenCount);
+        }
+        const sql = `SELECT COUNT(*) AS n FROM summaries WHERE ${where.join(" AND ")}`;
+        const row = params.db.prepare(sql).all(...binds) as Array<{ n: number }>;
+        previewCount = row[0]?.n ?? 0;
+      }
+    } catch (e) {
+      lines.push(
+        buildSection("🛠️ Outcome", [
+          buildStatLine("status", "preview_failed"),
+          buildStatLine("reason", formatFailureReason(e)),
+        ]),
+      );
+      return lines.join("\n");
+    }
+    lines.push(
+      buildSection("🛠️ Preview", [
+        buildStatLine("would-affect-leaves", formatNumber(previewCount)),
+        buildStatLine(
+          "to apply",
+          `Re-run with the same flags plus \`--apply\` to actually suppress.`,
+        ),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  // --apply path
+  try {
+    const result = runPurge(params.db, opts);
+    lines.push(
+      buildSection("🛠️ Apply", [
+        buildStatLine("status", "completed"),
+        buildStatLine("mode", result.mode),
+        buildStatLine("affected leaves", formatNumber(result.affectedLeafIds.length)),
+        buildStatLine("purge session id", result.purgeSessionId),
+      ]),
+    );
+  } catch (e) {
+    if (e instanceof PurgeError) {
+      lines.push(
+        buildSection("🛠️ Apply", [
+          buildStatLine("status", "failed"),
+          buildStatLine("kind", e.kind),
+          buildStatLine("reason", e.message),
+        ]),
+      );
+      return lines.join("\n");
+    }
+    lines.push(
+      buildSection("🛠️ Apply", [
+        buildStatLine("status", "failed"),
+        buildStatLine("reason", formatFailureReason(e)),
+      ]),
+    );
+  }
+  return lines.join("\n");
+}
+
 async function buildDoctorCleanersApplyText(params: {
   db: DatabaseSync;
   config: LcmConfig;
@@ -2300,6 +2589,20 @@ export function createLcmCommand(params: {
               mode: parsed.mode,
               querySetName: parsed.querySetName,
               querySetVersion: parsed.querySetVersion,
+            }),
+          };
+        case "purge":
+          return {
+            text: await buildPurgeText({
+              db: await getDb(),
+              reason: parsed.reason,
+              sessionKey: parsed.sessionKey,
+              summaryIds: parsed.summaryIds,
+              since: parsed.since,
+              before: parsed.before,
+              minTokenCount: parsed.minTokenCount,
+              allowMainSession: parsed.allowMainSession,
+              apply: parsed.apply,
             }),
           };
         case "help":

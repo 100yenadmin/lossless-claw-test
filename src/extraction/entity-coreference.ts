@@ -190,36 +190,62 @@ export async function runCoreferenceTick(
         let entityId: string;
         if (existing) {
           entityId = existing.entity_id;
-          db.prepare(
-            `UPDATE lcm_entities
-               SET occurrence_count = occurrence_count + 1,
-                   last_seen_at = datetime('now')
-               WHERE entity_id = ?`,
-          ).run(entityId);
+          // Wave-1 Auditor #7 finding #7: occurrence_count was bumped
+          // unconditionally even on idempotent re-processing. The
+          // mention-side has dedup via deterministic mention_id, but
+          // the entity-side did not. Bump occurrence_count ONLY when a
+          // NEW mention row is actually inserted (we'll do that below
+          // and bump retroactively).
         } else {
+          // Wave-1 Auditor #7 finding #4: previous code did plain INSERT,
+          // which threw UNIQUE constraint violation on concurrent ticks
+          // processing different leaves with the same canonical surface.
+          // ROLLBACK + retry forever was the result. Use INSERT OR IGNORE
+          // and re-SELECT to find the winner — race-safe.
           entityId = `ent_${randomSuffix()}`;
-          db.prepare(
-            `INSERT INTO lcm_entities
-               (entity_id, session_key, canonical_text, entity_type,
-                first_seen_at, last_seen_at, first_seen_in_summary_id, occurrence_count)
-             VALUES (?, ?, ?, ?, datetime('now'), datetime('now'), ?, 1)`,
-          ).run(entityId, item.session_key, canonical, ent.entityType, item.leaf_id);
-          entityCountThisItem++;
-          // Update type registry (PK = type_name)
-          db.prepare(
-            `INSERT INTO lcm_entity_type_registry (type_name, first_seen_at, occurrence_count)
-             VALUES (?, datetime('now'), 1)
-             ON CONFLICT(type_name) DO UPDATE SET
-               occurrence_count = occurrence_count + 1`,
-          ).run(ent.entityType);
+          const insertRes = db
+            .prepare(
+              `INSERT OR IGNORE INTO lcm_entities
+                 (entity_id, session_key, canonical_text, entity_type,
+                  first_seen_at, last_seen_at, first_seen_in_summary_id, occurrence_count)
+               VALUES (?, ?, ?, ?, datetime('now'), datetime('now'), ?, 0)`,
+            )
+            .run(entityId, item.session_key, canonical, ent.entityType, item.leaf_id);
+          if (Number(insertRes.changes) === 0) {
+            // Lost the race — another concurrent tick won. Re-SELECT.
+            const winner = db
+              .prepare(
+                `SELECT entity_id FROM lcm_entities
+                   WHERE session_key = ? AND canonical_text = ? COLLATE NOCASE`,
+              )
+              .get(item.session_key, canonical) as
+              | { entity_id: string }
+              | undefined;
+            if (winner) {
+              entityId = winner.entity_id;
+            }
+            // If somehow not found, fall through — the next mention insert
+            // will fail FK and the savepoint will roll back this entity's
+            // work. Safer than corrupting the catalog.
+          } else {
+            entityCountThisItem++;
+            // Update type registry (PK = type_name)
+            db.prepare(
+              `INSERT INTO lcm_entity_type_registry (type_name, first_seen_at, occurrence_count)
+               VALUES (?, datetime('now'), 1)
+               ON CONFLICT(type_name) DO UPDATE SET
+                 occurrence_count = occurrence_count + 1`,
+            ).run(ent.entityType);
+          }
         }
 
-        // Group E adversarial Gap 3 fix: TRULY deterministic mention_id
-        // (no random suffix — was defeating the INSERT OR IGNORE
-        // idempotency guarantee, causing duplicate mentions on re-runs).
-        // Same surface in same leaf for same entity = SAME mention_id =
-        // INSERT OR IGNORE no-ops (correct semantics).
-        const mentionId = `men_${entityId}_${item.leaf_id}_${truncateForId(ent.surface, 16)}`;
+        // Group E adversarial Gap 3 fix + Wave-1 Auditor #7 finding #2:
+        // Deterministic mention_id with FNV-1a content hash of the FULL
+        // surface (instead of 16-char truncation). Same surface in same
+        // leaf for same entity = SAME mention_id = INSERT OR IGNORE
+        // no-ops (correct idempotency). Different surfaces with shared
+        // 16-char prefix no longer silently collide.
+        const mentionId = `men_${entityId}_${item.leaf_id}_${surfaceHashForId(ent.surface, 16)}`;
         const result_run = db
           .prepare(
             `INSERT OR IGNORE INTO lcm_entity_mentions
@@ -237,6 +263,15 @@ export async function runCoreferenceTick(
           );
         if (Number(result_run.changes) > 0) {
           mentionCountThisItem++;
+          // Bump occurrence count ONLY on truly-new mention insert.
+          // last_seen_at always advances (the latest leaf-write that
+          // mentions this entity is "seen now").
+          db.prepare(
+            `UPDATE lcm_entities
+               SET occurrence_count = occurrence_count + 1,
+                   last_seen_at = datetime('now')
+               WHERE entity_id = ?`,
+          ).run(entityId);
         }
       }
 
@@ -281,15 +316,54 @@ export function countPendingExtractions(
   return row.n;
 }
 
+// Wave-1 Auditor #7 finding #3: Math.random() gives only 32-bit space
+// (~64K collision probability after 65K entities). Switched to
+// crypto.randomUUID() prefix for ~128-bit collision-free space.
 function randomSuffix(): string {
-  return Math.floor(Math.random() * 0xffffffff)
+  // Take 12 hex chars from a UUID — 48 bits, ~16M docs before
+  // birthday-collision becomes plausible. Sufficient for realistic
+  // entity counts (~ low millions max).
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    const u = crypto.randomUUID().replace(/-/g, "");
+    return u.slice(0, 12);
+  }
+  // Fallback for environments without crypto: combine two Math.random
+  // values to get 53 effective bits.
+  const a = Math.floor(Math.random() * 0xffffffff)
     .toString(16)
     .padStart(8, "0");
+  const b = Math.floor(Math.random() * 0xffff)
+    .toString(16)
+    .padStart(4, "0");
+  return `${a}${b}`;
 }
 
-function truncateForId(s: string, maxLen: number): string {
-  // Strip non-alphanumerics for use in mention_id; truncate.
-  return s
+// Wave-1 Auditor #7 finding #2: 16-char truncation produced intra-leaf
+// collisions for surfaces sharing the first 16 alphanumerics (e.g.
+// "PR #71676 (rebase target)" vs "PR #71676 (current)"). Use a content
+// hash of the FULL surface so collisions only happen on identical
+// surfaces (which is the desired idempotency property).
+function surfaceHashForId(surface: string, maxBytes = 16): string {
+  // Deterministic short hash (FNV-1a 32-bit, hex). Cheap, no crypto
+  // dependency. Collision probability for distinct surfaces in the
+  // same (entity_id, leaf_id) bucket: ~1 in 2^32, vastly safer than
+  // 16-char prefix on long shared surfaces.
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < surface.length; i++) {
+    hash ^= surface.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  const hex = (hash >>> 0).toString(16).padStart(8, "0");
+  // Combine with a sanitized prefix of the surface so debugging is
+  // legible in the DB ("men_..._PR_71676__a1b2c3d4").
+  const prefix = surface
     .replace(/[^A-Za-z0-9]/g, "_")
-    .slice(0, maxLen);
+    .slice(0, Math.max(0, maxBytes - hex.length - 1));
+  return prefix.length > 0 ? `${prefix}_${hex}` : hex;
+}
+
+// Kept for backward compatibility in any helper that still calls it
+// with semantic "truncation, not hashing" intent (not used for IDs).
+function truncateForId(s: string, maxLen: number): string {
+  return s.replace(/[^A-Za-z0-9]/g, "_").slice(0, maxLen);
 }

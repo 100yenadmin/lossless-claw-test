@@ -587,40 +587,134 @@ export function createLcmSynthesizeAroundTool(input: {
       }
       const initialPromptId = promptCheckRow.prompt_id;
 
+      // Wave-1 Auditor #3 fix #1+#5: single-flight via INSERT OR IGNORE on
+      // the UNIQUE lookup index (session_key, range_start, range_end,
+      // leaf_fingerprint, COALESCE(grep_filter,'')).
+      //
+      // Pre-write janitor: reap zombie 'building' rows older than 10 min
+      // (process killed mid-dispatch can leave them blocking the latch).
+      // Mark them 'failed' so the new caller's INSERT OR IGNORE will be
+      // outshadowed by the cache lookup below — wait, actually, the row
+      // still occupies the UNIQUE slot. We DELETE zombie rows so the
+      // latch frees up. Audit row may have already been written by the
+      // dispatcher; FK ON DELETE CASCADE on lcm_synthesis_audit handles
+      // it (per migration.ts:1556).
+      const ZOMBIE_TTL_MIN = 10;
       try {
         db.prepare(
-          `INSERT INTO lcm_synthesis_cache
-             (cache_id, session_key, range_start, range_end, leaf_fingerprint,
-              entity_index, model_used, prompt_id, tier_label,
-              source_leaf_ids, source_token_count, output_token_count,
-              actual_range_covered, leaf_count_synthesized,
-              status, building_started_at)
-           VALUES (?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, ?, 0, ?, ?, 'building', datetime('now'))`,
-        ).run(
-          cacheId,
-          sessionKeyForCache,
-          rangeStartIso,
-          rangeEndIso,
-          leafFingerprint,
-          summarizerBuilt.model,
-          initialPromptId,
-          cacheTierLabel,
-          JSON.stringify(leafIds),
-          sourceTokenCount,
-          JSON.stringify({
-            mode: windowKind,
-            anchorSummaryId: targetSummary?.summary_id ?? null,
-            ...(windowKind === "time"
-              ? { hours: windowHours }
-              : { k: windowK, model: semanticMeta?.modelName ?? null }),
-            since: sinceBound?.toISOString() ?? null,
-            before: beforeBound?.toISOString() ?? null,
-          }),
-          leafIds.length,
-        );
+          `DELETE FROM lcm_synthesis_cache
+             WHERE status = 'building'
+               AND building_started_at IS NOT NULL
+               AND datetime(building_started_at) < datetime('now', ?)`,
+        ).run(`-${ZOMBIE_TTL_MIN} minutes`);
+      } catch {
+        // best-effort; if it fails the INSERT below will still proceed
+        // and the operator can manually clean.
+      }
+
+      // Audit GC (Auditor #3 #2): reap orphaned 'started' audit rows
+      // (>1 hour) and aged 'completed'/'failed' rows (>30 days). Both are
+      // documented retention policies in the schema. Cheap to do here
+      // since we're already in a write path.
+      try {
+        db.prepare(
+          `DELETE FROM lcm_synthesis_audit
+             WHERE (status = 'started' AND datetime(ran_at) < datetime('now', '-1 hour'))
+                OR (status IN ('completed','failed') AND datetime(ran_at) < datetime('now', '-30 days'))`,
+        ).run();
+      } catch {
+        // best-effort
+      }
+
+      // INSERT OR IGNORE — UNIQUE collision means another caller already
+      // started the same synthesis. We re-SELECT to see who won.
+      let weHoldTheCacheLatch = true;
+      try {
+        const insertResult = db
+          .prepare(
+            `INSERT OR IGNORE INTO lcm_synthesis_cache
+               (cache_id, session_key, range_start, range_end, leaf_fingerprint,
+                entity_index, model_used, prompt_id, tier_label,
+                source_leaf_ids, source_token_count, output_token_count,
+                actual_range_covered, leaf_count_synthesized,
+                status, building_started_at)
+             VALUES (?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, ?, 0, ?, ?, 'building', datetime('now'))`,
+          )
+          .run(
+            cacheId,
+            sessionKeyForCache,
+            rangeStartIso,
+            rangeEndIso,
+            leafFingerprint,
+            summarizerBuilt.model,
+            initialPromptId,
+            cacheTierLabel,
+            JSON.stringify(leafIds),
+            sourceTokenCount,
+            JSON.stringify({
+              mode: windowKind,
+              anchorSummaryId: targetSummary?.summary_id ?? null,
+              ...(windowKind === "time"
+                ? { hours: windowHours }
+                : { k: windowK, model: semanticMeta?.modelName ?? null }),
+              since: sinceBound?.toISOString() ?? null,
+              before: beforeBound?.toISOString() ?? null,
+            }),
+            leafIds.length,
+          );
+        // sqlite IGNORE returns changes=0 if a UNIQUE conflict was hit
+        if (insertResult.changes === 0) {
+          weHoldTheCacheLatch = false;
+        }
       } catch (insertErr) {
         return jsonResult({
           error: `Failed to insert synthesis cache row: ${insertErr instanceof Error ? insertErr.message : String(insertErr)}`,
+        });
+      }
+
+      // Latch lost — another concurrent caller is synthesizing the same
+      // (session_key, range, leaf_fingerprint) tuple. Look up their cache
+      // row and either return the cached result (status='ready') or
+      // surface a "building elsewhere" hint without re-LLM-ing.
+      if (!weHoldTheCacheLatch) {
+        const winner = db
+          .prepare(
+            `SELECT cache_id, status, output, output_token_count, building_started_at
+               FROM lcm_synthesis_cache
+               WHERE session_key = ? AND range_start = ? AND range_end = ?
+                 AND leaf_fingerprint = ? AND COALESCE(grep_filter, '') = ''
+               ORDER BY building_started_at DESC LIMIT 1`,
+          )
+          .get(
+            sessionKeyForCache,
+            rangeStartIso,
+            rangeEndIso,
+            leafFingerprint,
+          ) as
+          | {
+              cache_id: string;
+              status: string;
+              output: string | null;
+              output_token_count: number | null;
+              building_started_at: string | null;
+            }
+          | undefined;
+        if (winner?.status === "ready" && winner.output != null) {
+          // Cache hit — return the existing synthesis without re-LLM.
+          return jsonResult({
+            cache_id: winner.cache_id,
+            status: "cached",
+            text: winner.output,
+            output_token_count: winner.output_token_count ?? 0,
+            single_flight_outcome: "winner_already_ready",
+          });
+        }
+        return jsonResult({
+          status: "building_elsewhere",
+          cache_id: winner?.cache_id ?? "(unknown)",
+          building_started_at: winner?.building_started_at ?? null,
+          hint: "Another caller is synthesizing the same window. Retry in a few seconds.",
+          single_flight_outcome: "lost_latch",
         });
       }
 

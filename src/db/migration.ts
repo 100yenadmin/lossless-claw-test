@@ -1466,9 +1466,25 @@ export function runLcmMigrations(
       }
       // Old CHECK detected → rebuildable, just DROP. Cache rows are derivable
       // from primary sources (raw leaves + prompts).
+      //
+      // Wave-1 Auditor #1 finding #3 (HIGH): if `foreign_keys = OFF` during
+      // migration (the common pattern for ratchet steps), `lcm_synthesis_audit`
+      // rows referencing the dropped cache_ids become DANGLING — they survive
+      // the DROP but their target_cache_id no longer exists. Clean them up
+      // BEFORE the DROP so we never leave orphans pointing to recreated
+      // cache_ids that might be re-used. Audit rows are themselves
+      // rebuildable (re-run the synthesis pass and the new audits land).
+      try {
+        db.exec(
+          `DELETE FROM lcm_synthesis_audit WHERE target_cache_id IS NOT NULL`,
+        );
+      } catch {
+        // best-effort — if the audit table doesn't exist yet (first migration),
+        // nothing to clean.
+      }
       db.exec(`DROP TABLE IF EXISTS lcm_synthesis_cache`);
       log?.info?.(
-        "[migration] dropped lcm_synthesis_cache (old narrow CHECK; rebuildable; recreated next step with widened CHECK)",
+        "[migration] dropped lcm_synthesis_cache (old narrow CHECK; rebuildable; recreated next step with widened CHECK; orphaned audit rows pruned)",
       );
     });
 

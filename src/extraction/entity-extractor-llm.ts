@@ -83,7 +83,17 @@ export function createEntityExtractorLlm(
     // Cap input — per-leaf content can be ~4000 tokens (post A.10 cap).
     // Entity extraction works fine on truncated input; we strip mid-content
     // to avoid blowing token budget.
-    const trimmedContent = content.length > 16_000 ? content.slice(0, 16_000) + "…" : content;
+    // Wave-1 Auditor #7 finding #5: previously we silently truncated
+    // without telemetry. Surface a log line + return a structured signal
+    // so callers can flag leaves whose tail-content was never extracted.
+    const HARD_CAP = 16_000;
+    const wasTruncated = content.length > HARD_CAP;
+    const trimmedContent = wasTruncated ? content.slice(0, HARD_CAP) + "…" : content;
+    if (wasTruncated && config.deps.log?.warn) {
+      config.deps.log.warn(
+        `[entity-extractor-llm] truncated content from ${content.length} → ${HARD_CAP} chars (${content.length - HARD_CAP} chars dropped) — entities in the truncated tail will not be extracted`,
+      );
+    }
     const prompt = ENTITY_EXTRACTION_PROMPT_TEMPLATE
       .replace("{{content}}", trimmedContent)
       .replace("{{tokenCount}}", String(Math.ceil(trimmedContent.length / 4)));

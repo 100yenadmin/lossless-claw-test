@@ -143,12 +143,25 @@ export function heartbeatLock(
   ttlMs?: number,
 ): boolean {
   const ttlSeconds = Math.round((ttlMs ?? WORKER_LOCK_TTL_MS) / 1000);
+  // Wave-1 Auditor #2 finding #2: previous version had no `expires_at`
+  // predicate. If our 90s lock had already expired (worker was blocked
+  // in a long Voyage call), but no other worker had yet stolen it via
+  // acquireLock's lazy-DELETE, this UPDATE would silently re-extend an
+  // EXPIRED lock — making it look alive again. A concurrent autostart
+  // tick that started just before our heartbeat could then GC + acquire
+  // in between, both holding "the" lock simultaneously.
+  //
+  // Fix: require `expires_at > now` AND `worker_id = ?`. If our lock has
+  // expired we report `false` (caller MUST abort) and DO NOT extend it —
+  // the lazy-GC in acquireLock will then clean up.
   const result = db
     .prepare(
       `UPDATE lcm_worker_lock
          SET last_heartbeat_at = datetime('now'),
              expires_at = datetime('now', '+' || ? || ' seconds')
-         WHERE job_kind = ? AND worker_id = ?`,
+         WHERE job_kind = ?
+           AND worker_id = ?
+           AND expires_at > datetime('now')`,
     )
     .run(ttlSeconds, jobKind, workerId);
   return Number(result.changes) > 0;

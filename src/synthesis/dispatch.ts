@@ -309,7 +309,12 @@ export async function dispatchSynthesis(
       // hallucinating. Relaxed to `^OK\b` so "OK" on its own OR followed by
       // a colon/whitespace passes; "OK!" or "OKAY" would still match (close
       // enough for a fidelity-checker — the precision loss is acceptable).
-      hallucinationFlagged = !/^\s*OK\b/i.test(verifyResult.output);
+      //
+      // Wave-1 Auditor #3 finding #4: anchored at start-of-string only meant
+      // any preamble ("Here is the fidelity report:\n\nOK: ...") false-
+      // positive flagged. Allow `OK\b` at start-of-string OR start of any
+      // line so model preambles don't break clean syntheses.
+      hallucinationFlagged = !/(?:^|\n)\s*OK\b/i.test(verifyResult.output);
     }
     // If no verify prompt registered, skip silently — caller can decide
     // to enforce its presence via /lcm health.

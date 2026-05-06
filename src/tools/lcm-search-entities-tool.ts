@@ -57,7 +57,11 @@ const LcmSearchEntitiesSchema = Type.Object({
   entityType: Type.Optional(
     Type.String({
       description:
-        "Optional entity_type filter (e.g. 'person', 'project', 'pr', 'commit', 'file').",
+        "Optional entity_type filter. Common values produced by the entity-coreference extractor: " +
+        "'person_name', 'pr_number', 'agent_id', 'session_key', 'command', 'file_path', 'date'. " +
+        "Wave-1 Auditor #7 finding #8: the extractor uses snake_case canonical types; older docs " +
+        "incorrectly listed 'person'/'project'/'pr' which never matched. Use lcm_search_entities " +
+        "without an entityType filter first to discover what's actually in the catalog.",
     }),
   ),
   limit: Type.Optional(

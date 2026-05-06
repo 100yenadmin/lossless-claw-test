@@ -62,11 +62,19 @@ export const MAX_TOKENS_PER_EMBED_BATCH = 80_000;
 
 /**
  * Per-document token budget for {@link embedTexts}. Voyage embeddings cap
- * is 32K tokens per document for `voyage-4-large`; we use 30K margin.
+ * is 32K tokens per document for `voyage-4-large`. Voyage's tokenizer
+ * counts ~9.5% higher than the DB-stored token_count (different tokenizer
+ * than ours). 30K stored × 1.095 = ~32.85K Voyage tokens — would 400 at
+ * the per-doc cap. Use 27K stored as the safety budget: 27K × 1.095 ≈
+ * 29.6K, comfortably under the 32K Voyage cap.
+ *
+ * Wave-1 Auditor #2 finding #3: previous 30K value was right at the edge
+ * and observed 400s in production on 28-30K stored-token leaves.
+ *
  * Caller MUST pre-filter documents over this size — this client does not
  * silently drop or truncate them, it sends them and lets Voyage 400.
  */
-export const MAX_TOKENS_PER_EMBED_DOC = 30_000;
+export const MAX_TOKENS_PER_EMBED_DOC = 27_000;
 
 /**
  * Reranker per-call budget (Voyage `rerank-2.5`). 600K tokens total across
@@ -76,7 +84,11 @@ export const MAX_TOKENS_PER_RERANK_CALL = 600_000;
 
 const DEFAULT_MAX_RETRIES = 3;
 const BACKOFF_BASE_MS = 500;
-const BACKOFF_CAP_MS = 30_000;
+// Per-attempt backoff cap. Wave-1 Auditor #2 finding #1: previous value
+// (30s) plus 30s timeout × 2 attempts = 90s == WORKER_LOCK_TTL_MS. Drop
+// to 25s so worst-case retry path is 25s + 30s + 30s = 85s, leaving 5s
+// of margin under the 90s lock TTL.
+const BACKOFF_CAP_MS = 25_000;
 const DEFAULT_TIMEOUT_MS = 60_000;
 
 const VOYAGE_API_BASE = "https://api.voyageai.com/v1";

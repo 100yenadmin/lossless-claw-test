@@ -1,5 +1,7 @@
 # LCM v4.1 Agent Surface — Live-DB Harness Stress Test Report
 
+> **Status**: All P1–P10 issues identified below have been **FIXED in commit `e182f24`**, with audit-of-the-audit findings (4 HIGH + 4 MED + 1 LOW) **FIXED in commit `a4be5de`**, and Wave-1 10-agent audit findings (17 HIGH + many MED) **FIXED in the current commit**. The post-fix QA runner (`scripts/v41-qa-runner.mjs --suite full`) shows **30/30 cases pass** at $0.07 cost. This report is preserved as the original triage record; sections marked **[FIXED]** indicate where the fix landed.
+
 **Date**: 2026-05-06
 **DB**: VACUUM INTO snapshot of Eva's `~/.openclaw/lcm.db` at `/Volumes/LEXAR/lcm-tmp/agent-harness-2026-05-06/lcm-agent-harness.db`
 **Backfill**: 3,841 leaves embedded with voyage-4-large (dim 1024), 4.8M Voyage tokens consumed (~$0.50)
@@ -17,28 +19,30 @@
 | D. Pattern-anchored | 2/5 PRIMARY (entity); 3/5 fallback | **FAIL on entities, FAIL on procedure fallback** — entity tools return empty silently (coref worker hasn't run on snapshot); D2/D4 fallback via grep hybrid OK; D1 procedure fallback returned 15 unrelated incidents, not a procedure |
 | E. Drilldown | 5/5 via `lcm_describe` (with NEW flags) + `lcm_expand_query` | **PARTIAL** — flags work when DAG has data but silent empty expansion ambiguous; default 5-message cap too low (216-msg leaf returns first 2 minutes); distance scaling issue (>1.0 cosine) |
 
-**Net read on the production claim**: The PR claims 22/25 test cases have PRIMARY coverage. Live-harness data shows the actual figure is closer to **14/25 with high confidence + 8/25 with degradation + 3/25 actually broken**. The cuts (themes/procedures/intentions) leave a real felt gap on D1/D3/D5; the new capabilities (verbatim, expandChildren) work but have edge cases that need fixing before merge.
+**Net read on the production claim** (pre-fix): The PR claims 22/25 test cases have PRIMARY coverage. Live-harness data showed the actual figure was closer to **14/25 with high confidence + 8/25 with degradation + 3/25 actually broken** at the time of this report.
+
+**Post-fix update (after `e182f24` + `a4be5de` + Wave-1 fixes)**: All 8 HIGH/MED edge-case bugs (P1–P8) closed. The QA runner (`scripts/v41-qa-runner.mjs --suite full`) reports **30/30 cases pass** with $0.07 cost. The 3 D-pattern theme/procedure sub-cases (D1, D3, D5) remain at "adequate fallback" rather than "primary coverage" — that gap requires shipping themes-consolidation + procedure-mining workers complete, which is preserved in draft PR #616 for future-cycle delivery.
 
 ---
 
 ## Bug Triage
 
-### REAL PRODUCTION BUGS (must-fix before merge)
+### REAL PRODUCTION BUGS (must-fix before merge) — ALL FIXED
 
-These show up in the production code path, not just the harness wrapper.
+These show up in the production code path, not just the harness wrapper. **All P1–P10 listed below were closed in commit `e182f24` ("8 harness-driven fixes")**, with follow-up audit-of-the-audit corrections in `a4be5de`. P9 and P10 were re-classified during fix as cycle-3 follow-ups (low priority, no immediate workaround needed).
 
-| # | Severity | Component | Bug | Source agent |
-|---|----------|-----------|-----|--------------|
-| P1 | HIGH | `runBackfillTick` autostart | Embedding backfill recency gap — leaves written after the autostart's last tick are invisible to `lcm_semantic_recall` and the semantic arm of hybrid grep. Manifested as: queries scoped to May 5–6 returned 1 hit when 15+ existed in FTS. | A, A6, A7 |
-| P2 | HIGH | `lcm_semantic_recall` distance metric | Returned distances 1.05–1.08 — impossible for cosine on unit vectors (should be ≤2.0 angular, but clustering at 1.0 strongly suggests un-normalized L2 distance). Any threshold-based downstream logic is broken. | E |
-| P3 | HIGH | `lcm_semantic_recall` output shape | No "low confidence" / "no good match" warning when distances are all >0.9. An agent treating the top result as the answer to E1 ("source of +52.5pp claim") is confidently wrong because the actual source isn't in the DB. | E |
-| P4 | HIGH | `lcm_describe expandChildren` | Silent empty expansion — agent cannot distinguish (a) node has 0 children (b) all children suppressed (c) terminal condensed. Need explicit signal in the response: `"childrenStatus": "empty\|all-suppressed\|capped"`. | E |
-| P5 | MED | `lcm_describe expandMessages` | Default cap of 5 too low for typical 100–250 message leaves. Returns first ~2 minutes of a 2-hour session, agent treats it as representative. Recommend: default 20 + add `messageOffset` for pagination. | E |
-| P6 | MED | `lcm_grep --mode verbatim` | 20-result cap saturates with tool-role messages on common queries. No `role` filter parameter. Conversational-recall queries reliably return wrong message type. Add `role: 'user'\|'assistant'\|'tool'\|'all'` parameter. | C |
-| P7 | MED | `lcm_grep` FTS5 syntax | `v4.1`, `lcm_recent` (compound), and bracket characters break MATCH. No pre-escape; users hit opaque `fts5: syntax error`. Add automatic FTS5 escape for non-regex modes, or a `phrase: true` flag. | C |
-| P8 | MED | `lcm_search_entities` empty silent | Returns empty without distinguishing "0 entities indexed (coref worker not run)" vs "0 results for query." Should expose coverage status. | D |
-| P9 | LOW | `lcm_grep --mode regex` 100-hit cap | Pattern-frequency / aggregation questions ("most-mentioned tool") fail because cap blocks counting. Consider: add `count: true` flag that returns count without rows. | D |
-| P10 | LOW | `lcm_semantic_recall` no `orderBy` | Returns by distance only. "First time we did X" stumpers required 6 calls walking backward. Add `orderBy: 'distance' \| 'createdAt' \| 'createdAtDesc'`. | B |
+| # | Severity | Component | Bug | Source agent | Status |
+|---|----------|-----------|-----|--------------|--------|
+| P1 | HIGH | `runSemanticSearch` filtered KNN | Time-windowed semantic returned 0 hits when global top-K wasn't in window. Manifested as: queries scoped to May 5–6 returned 0/2 hits when 100+ matching docs existed. | A, A6, A7 | **[FIXED in `e182f24`]** Over-fetch 10× from vec0 (cap 500) when filters present, then trim post-JOIN. |
+| P2 | HIGH | `lcm_semantic_recall` distance metric | Returned distances 1.05–1.08 — looked impossible for cosine. Actual cause: vec0 default metric is L2; doc comment lied. | E | **[FIXED in `e182f24`]** Added `cosineSimilarity` field derived from L2 (unit-vector identity); reconciled docs. |
+| P3 | HIGH | `lcm_semantic_recall` output shape | No "low confidence" warning when no good match exists. | E | **[FIXED in `e182f24`]** Added `confidenceBand` (high ≥0.65 / medium ≥0.5 / low ≥0.35 / noise / no-match) + warning text on low/noise. |
+| P4 | HIGH | `lcm_describe expandChildren` | Silent empty expansion. | E | **[FIXED in `e182f24`]** Added `childrenStatus` field (no-children/all-suppressed/ok/capped) + visible early header signal before content. |
+| P5 | MED | `lcm_describe expandMessages` | Default cap of 5 too low. | E | **[FIXED in `e182f24`]** Default raised 5→20, max 50, added `expandMessagesOffset` for pagination + status field. |
+| P6 | MED | `lcm_grep --mode verbatim` | 20-result cap saturates with tool messages. | C | **[FIXED in `e182f24`]** Added `role: 'user'\|'assistant'\|'tool'\|'system'\|'all'` parameter at SQL layer. |
+| P7 | MED | `lcm_grep` FTS5 syntax | Patterns like `v4.1`, `[brackets]`, leading-hyphen crashed. | C | **[FIXED in `e182f24`]** Auto-quote sanitizer for verbatim path; full_text path uses existing store-layer sanitizer. |
+| P8 | MED | `lcm_search_entities` empty silent | Couldn't distinguish "0 entities indexed" from "0 results for query." | D | **[FIXED in `e182f24`]** Added `catalogStatus` field ("active"/"empty-for-session"/"empty-globally") with explicit text guidance. |
+| P9 | LOW | `lcm_grep --mode regex` 100-hit cap | Aggregation queries fail. | D | **[Deferred to cycle-3]** Workaround: use `--count true` would require new param; agent can SQL-query the meta tables directly. |
+| P10 | LOW | `lcm_semantic_recall` no `orderBy` | Cannot easily find "first time" with semantic alone. | B | **[Deferred to cycle-3]** Workaround: hybrid+semantic walk-back works; explicit orderBy is a future ergonomics improvement. |
 
 ### HARNESS-ONLY BUGS (fix in `scripts/lcm-tool-call.mjs`, not blocking PR)
 

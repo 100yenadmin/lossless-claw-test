@@ -213,6 +213,14 @@ export function createLcmDescribeTool(input: {
             `created=${formatDisplayTime(s.createdAt, timezone)} ` +
             `budgetCap=${resolvedTokenCap}`,
         );
+        // Wave-1 Auditor #5 finding #3: when delegated grant is exhausted
+        // resolvedTokenCap=0 and every node shows budget=over with no
+        // explanation. Surface the exhaustion explicitly.
+        if (resolvedTokenCap === 0 && typeof delegatedRemainingBudget === "number") {
+          lines.push(
+            "budget exhausted: delegated grant has 0 tokens remaining; expansion is blocked. Re-issue the grant via lcm_expand_query with a higher remainingTokens before drilling further.",
+          );
+        }
         if (s.parentIds.length > 0) {
           lines.push(`parents ${s.parentIds.join(" ")}`);
         }

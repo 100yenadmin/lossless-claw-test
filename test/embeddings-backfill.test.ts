@@ -421,10 +421,13 @@ describe.skipIf(!VEC0_AVAILABLE)("embeddings-backfill — single-flight via work
 
 describe.skipIf(!VEC0_AVAILABLE)("embeddings-backfill — batching (token budget)", () => {
   it("packs batches that respect maxBatchTokens", async () => {
+    // Wave-1 Auditor #2 finding #3: MAX_TOKENS_PER_EMBED_DOC dropped 30K→27K
+    // to absorb Voyage's ~9.5% tokenizer inflation. Use 25K-token leaves
+    // here so the per-doc filter doesn't drop them before batching.
     const db = setupDb();
-    insertLeaf(db, "leaf_a", 30_000);
-    insertLeaf(db, "leaf_b", 30_000);
-    insertLeaf(db, "leaf_c", 30_000);
+    insertLeaf(db, "leaf_a", 25_000);
+    insertLeaf(db, "leaf_b", 25_000);
+    insertLeaf(db, "leaf_c", 25_000);
 
     const seenBatchSizes: number[] = [];
     const fetchMock = (async (_url: string, init: RequestInit) => {
@@ -432,7 +435,7 @@ describe.skipIf(!VEC0_AVAILABLE)("embeddings-backfill — batching (token budget
       seenBatchSizes.push(body.input.length);
       return mockResponse({
         data: body.input.map((_, i) => ({ embedding: [0.1, 0.2, 0.3], index: i })),
-        usage: { total_tokens: 30_000 * body.input.length },
+        usage: { total_tokens: 25_000 * body.input.length },
       });
     }) as unknown as typeof fetch;
 
@@ -443,11 +446,11 @@ describe.skipIf(!VEC0_AVAILABLE)("embeddings-backfill — batching (token budget
       voyageApiKey: "k",
       voyageFetch: fetchMock,
       maxRequestsPerSecond: 1000,
-      maxBatchTokens: 70_000, // → batches of 2 + 1 (or 1+1+1 depending on order)
+      maxBatchTokens: 60_000, // → batches of 2 + 1
     });
 
-    // 90K total tokens, 70K limit per batch — must be at least 2 batches.
-    // Bin packing is greedy: 30+30=60≤70, then add 30 → 90>70, flush, new batch with 30.
+    // 75K total tokens, 60K limit per batch — must be at least 2 batches.
+    // Bin packing is greedy: 25+25=50≤60, then add 25 → 75>60, flush, new batch with 25.
     // So 2 batches: [2 docs, 1 doc].
     expect(seenBatchSizes).toEqual([2, 1]);
     db.close();

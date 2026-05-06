@@ -29,8 +29,11 @@ describe("voyage client — token budget constants (v4.1 §13)", () => {
   it("MAX_TOKENS_PER_EMBED_BATCH is 80K (Voyage server cap 120K minus tokenizer-mismatch margin)", () => {
     expect(MAX_TOKENS_PER_EMBED_BATCH).toBe(80_000);
   });
-  it("MAX_TOKENS_PER_EMBED_DOC is 30K (voyage-4-large per-doc cap is 32K)", () => {
-    expect(MAX_TOKENS_PER_EMBED_DOC).toBe(30_000);
+  it("MAX_TOKENS_PER_EMBED_DOC is 27K (voyage-4-large per-doc cap is 32K; ~9.5% tokenizer inflation forces 27K margin)", () => {
+    // Wave-1 Auditor #2 finding #3: 30K stored × 1.095 inflation =
+    // ~32.85K Voyage tokens, would 400 at the per-doc cap. 27K × 1.095
+    // ≈ 29.6K, comfortably under.
+    expect(MAX_TOKENS_PER_EMBED_DOC).toBe(27_000);
   });
   it("MAX_TOKENS_PER_RERANK_CALL is 600K (Voyage rerank-2.5 limit)", () => {
     expect(MAX_TOKENS_PER_RERANK_CALL).toBe(600_000);
