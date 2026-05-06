@@ -90,6 +90,16 @@ type ExpandQueryReply = {
   truncated: boolean;
   conversationBreakdown?: ConversationBreakdown[];
   sourceConversationId?: number;
+  /**
+   * Wave-9 Agent #5 P1 fix: surface fabrication validation results to
+   * the agent. Previously runDelegatedExpandQuery computed these counts
+   * (Wave-4 P1-02 + Wave-6 P2) but buildExpandQueryReply silently dropped
+   * them, leaving the agent with NO programmatic signal that the LLM
+   * hallucinated IDs - empty `citedIds: []` looked identical to "no
+   * citations" vs "all citations were fabricated and dropped".
+   */
+  citedIdsRejectedAsFabricated?: number;
+  citedIdsExceededValidationCap?: number;
 };
 
 type DelegatedExpandQueryReply = {
@@ -415,6 +425,9 @@ function buildExpandQueryReply(params: {
   totalSourceTokens: number;
   truncated: boolean;
   conversationBreakdown?: ConversationBreakdown[];
+  /** Wave-9 Agent #5 P1 fix: thread fabrication-validation counts. */
+  citedIdsRejectedAsFabricated?: number;
+  citedIdsExceededValidationCap?: number;
 }): ExpandQueryReply {
   const sourceConversationIds = [...params.sourceConversationIds].sort((left, right) => left - right);
 
@@ -429,6 +442,15 @@ function buildExpandQueryReply(params: {
     totalSourceTokens: params.totalSourceTokens,
     truncated: params.truncated,
     ...(params.conversationBreakdown ? { conversationBreakdown: params.conversationBreakdown } : {}),
+    // Wave-9 Agent #5 P1 fix: surface fabrication-validation counts only
+    // when non-zero so successful well-cited replies don't include zero
+    // chaff in their JSON.
+    ...(params.citedIdsRejectedAsFabricated && params.citedIdsRejectedAsFabricated > 0
+      ? { citedIdsRejectedAsFabricated: params.citedIdsRejectedAsFabricated }
+      : {}),
+    ...(params.citedIdsExceededValidationCap && params.citedIdsExceededValidationCap > 0
+      ? { citedIdsExceededValidationCap: params.citedIdsExceededValidationCap }
+      : {}),
   };
 }
 
@@ -1273,6 +1295,11 @@ export function createLcmExpandQueryTool(input: {
               expandedSummaryCount: delegatedReply.expandedSummaryCount,
               totalSourceTokens: delegatedReply.totalSourceTokens,
               truncated: delegatedReply.truncated,
+              // Wave-9 Agent #5 P1 fix: thread fabrication-validation
+              // counts so the agent has a programmatic signal that the
+              // LLM hallucinated IDs.
+              citedIdsRejectedAsFabricated: delegatedReply.citedIdsRejectedAsFabricated,
+              citedIdsExceededValidationCap: delegatedReply.citedIdsExceededValidationCap,
             }),
           );
         }
@@ -1394,6 +1421,19 @@ export function createLcmExpandQueryTool(input: {
               successfulResults.some((result) => result.reply.truncated)
               || bucketResults.some((result) => result.status !== "success"),
             conversationBreakdown,
+            // Wave-9 Agent #5 P1 fix: SUM fabrication-validation counts
+            // across buckets so one rogue bucket's hallucinations are
+            // visible in the rolled-up reply.
+            citedIdsRejectedAsFabricated: successfulResults.reduce(
+              (total, result) =>
+                total + (result.reply.citedIdsRejectedAsFabricated ?? 0),
+              0,
+            ),
+            citedIdsExceededValidationCap: successfulResults.reduce(
+              (total, result) =>
+                total + (result.reply.citedIdsExceededValidationCap ?? 0),
+              0,
+            ),
           }),
         );
       } catch (error) {

@@ -2600,11 +2600,63 @@ export function createLcmCommand(params: {
           return { text: buildHealthText({ db: await getDb() }) };
         case "worker_status":
           return { text: buildWorkerStatusText({ db: await getDb() }) };
-        case "worker_tick_backfill":
+        case "worker_tick_backfill": {
+          // Wave-9 Agent #10 P1 fix: same gate as `case "purge"` — non-owner
+          // agents calling /lcm worker tick embedding-backfill burn Voyage
+          // quota at-will (200 paid embeddings per invocation × intervalMs).
+          // DoS-by-billing on the operator's account. Gate on senderIsOwner.
+          if (!ctx.senderIsOwner) {
+            return {
+              text: [
+                ...buildHeaderLines(),
+                "",
+                "⚙️  Worker tick — operator-only",
+                "",
+                buildSection("🚫 Rejected", [
+                  buildStatLine("status", "operator-only"),
+                  buildStatLine(
+                    "reason",
+                    "/lcm worker tick requires owner privileges (ctx.senderIsOwner=true). Embedding backfill makes paid Voyage calls — non-owner callers cannot invoke it.",
+                  ),
+                ]),
+              ].join("\n"),
+            };
+          }
           return { text: await buildWorkerTickBackfillText({ db: await getDb() }) };
+        }
         case "reconcile_session_keys_list":
           return { text: buildReconcileListText({ db: await getDb() }) };
-        case "reconcile_session_keys_apply":
+        case "reconcile_session_keys_apply": {
+          // Wave-9 Agent #10 P0 fix: same gate as `case "purge"`.
+          //
+          // /lcm reconcile-session-keys --apply is destructive: it UPDATEs
+          // both `conversations.session_key` AND `summaries.session_key`
+          // for matching rows, plus inserts audit rows. With
+          // --allow-main-session it can target `agent:main:main` (Eva's
+          // primary thread). Without an owner gate, any agent that can
+          // issue /lcm slash commands could re-key the operator's primary
+          // thread into an attacker-controlled bucket → cross-session
+          // data theft + audit-trail confusion.
+          //
+          // Wave-7 P0-1 added the gate to `case "purge"` ONLY. This is
+          // the missed sister-case at the same severity.
+          if (!ctx.senderIsOwner) {
+            return {
+              text: [
+                ...buildHeaderLines(),
+                "",
+                "🔄 Reconcile session keys — operator-only",
+                "",
+                buildSection("🚫 Rejected", [
+                  buildStatLine("status", "operator-only"),
+                  buildStatLine(
+                    "reason",
+                    "/lcm reconcile-session-keys --apply requires owner privileges (ctx.senderIsOwner=true). It rewrites session_key on conversations + summaries — non-owner callers cannot invoke it.",
+                  ),
+                ]),
+              ].join("\n"),
+            };
+          }
           return {
             text: buildReconcileApplyText({
               db: await getDb(),
@@ -2614,6 +2666,7 @@ export function createLcmCommand(params: {
               allowMainSession: parsed.allowMainSession,
             }),
           };
+        }
         case "eval":
           return {
             text: await buildEvalText({

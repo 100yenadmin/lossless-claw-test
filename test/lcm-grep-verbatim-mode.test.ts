@@ -317,4 +317,45 @@ describe("createLcmGrepTool — verbatim mode", () => {
 
     db.close();
   });
+
+  // Wave-9 Agent #4 P1 regression: messages_fts is created with
+  // tokenize='porter unicode61' which can't segment CJK ideographs.
+  // FTS5 MATCH on CJK queries returns 0 rows WITHOUT throwing, so the
+  // exception-driven LIKE fallback never triggers. The fix detects CJK
+  // at the JS layer and routes directly to LIKE substring match.
+  it("Wave-9 P1: matches CJK queries via LIKE fallback (FTS5 unicode61 can't segment ideographs)", async () => {
+    const db = setupDb();
+    insertMessage(db, {
+      messageId: 1,
+      content: "Eva said about 机器学习 (machine learning) yesterday",
+    });
+    insertMessage(db, {
+      messageId: 2,
+      content: "Discussion of 机器学习 algorithms",
+    });
+    insertMessage(db, {
+      messageId: 3,
+      content: "Unrelated English-only message",
+    });
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine(db) as never,
+      sessionKey: "agent:main:main",
+    });
+    const r = await tool.execute("c", {
+      pattern: "机器学习",
+      mode: "verbatim",
+      conversationId: 1,
+    });
+    const details = r.details as {
+      totalMatches: number;
+      hits: Array<{ messageId: number; content: string }>;
+    };
+    expect(details.totalMatches).toBe(2);
+    const ids = details.hits.map((h) => h.messageId).sort();
+    expect(ids).toEqual([1, 2]);
+
+    db.close();
+  });
 });

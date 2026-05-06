@@ -121,79 +121,81 @@ export function reconcileSessionKeys(
     );
   }
 
-  // Final review Finding #5 fix: pre-check for active-session UNIQUE
-  // collision. The `conversations_active_session_key_idx` partial UNIQUE
-  // index over (session_key) WHERE active=1 AND session_key IS NOT NULL
-  // would fire mid-UPDATE with a raw SQLite error. Operators see a
-  // clear typed error instead, with a workaround.
+  // Wave-9 Agent #10 P1 fix: TOCTOU race. Previously the active-conflict
+  // pre-check + the affectedConvs snapshot ran OUTSIDE the BEGIN IMMEDIATE.
+  // A concurrent INSERT/UPDATE between snapshot and tx-acquire could land
+  // a row that the UPDATE moves but the audit loop doesn't see, silently
+  // dropping its audit-row -> loss-of-undo on a destructive op (no way
+  // to /lcm undo-session-key-rekey a conv that has no audit entry).
+  // Mirror the Wave-8 P1 runSoftPurgeAtomic fix: resolve everything
+  // INSIDE the transaction.
   const fromPlaceholders = args.fromSessionKeys.map(() => "?").join(",");
-  const activeFromCount = (
-    db
-      .prepare(
-        `SELECT COUNT(*) AS n FROM conversations
-           WHERE session_key IN (${fromPlaceholders}) AND active = 1`,
-      )
-      .get(...args.fromSessionKeys) as { n: number }
-  ).n;
-  const activeToCount = (
-    db
-      .prepare(
-        `SELECT COUNT(*) AS n FROM conversations
-           WHERE session_key = ? AND active = 1`,
-      )
-      .get(args.toSessionKey) as { n: number }
-  ).n;
-  // After-merge active count = activeFromCount + activeToCount; UNIQUE
-  // partial index requires this be ≤ 1.
-  if (activeFromCount + activeToCount > 1) {
-    throw new ReconcileError(
-      "active_conflict",
-      `[reconcile] cannot merge ${activeFromCount} active conversation(s) from ` +
-        `${args.fromSessionKeys.join(",")} into ${args.toSessionKey} (already has ${activeToCount} active) — ` +
-        `the conversations.session_key UNIQUE-active partial index requires at most 1 active per session_key. ` +
-        `Workaround: archive all but one conv first via ` +
-        `UPDATE conversations SET active=0, archived_at=datetime('now') WHERE conversation_id=?, ` +
-        `then re-run reconcile.`,
-    );
-  }
 
-  const appliedBy = args.appliedBy ?? "operator";
-
-  // Snapshot the affected conversations BEFORE the UPDATE so we can
-  // record per-conv audit rows referencing the ORIGINAL session_key.
-  // The audit table requires (conversation_id, original_session_key,
-  // new_session_key) — we lose original_session_key once the UPDATE
-  // runs, so capture it first.
-  const placeholders = args.fromSessionKeys.map(() => "?").join(",");
-  const affectedConvs = db
-    .prepare(
-      `SELECT conversation_id, session_key
-         FROM conversations
-         WHERE session_key IN (${placeholders})`,
-    )
-    .all(...args.fromSessionKeys) as Array<{
-    conversation_id: number;
-    session_key: string;
-  }>;
-
-  if (affectedConvs.length === 0) {
-    // No matching conversations — likely already-migrated or typo. The
-    // SUMMARIES update may still have orphan rows to migrate (e.g. if
-    // an earlier reconcile partially committed) but in the common case
-    // both UPDATEs produce 0 rows; skip the transaction to avoid noise.
-    const orphanSummaryCount = countSummariesAtKeys(db, args.fromSessionKeys);
-    if (orphanSummaryCount === 0) {
-      return { conversationsMoved: 0, summariesMoved: 0, auditEntries: 0 };
+  const performReconcile = (): {
+    conversationsMoved: number;
+    summariesMoved: number;
+    auditEntries: number;
+  } => {
+    const activeFromCount = (
+      db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM conversations
+             WHERE session_key IN (${fromPlaceholders}) AND active = 1`,
+        )
+        .get(...args.fromSessionKeys) as { n: number }
+    ).n;
+    const activeToCount = (
+      db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM conversations
+             WHERE session_key = ? AND active = 1`,
+        )
+        .get(args.toSessionKey) as { n: number }
+    ).n;
+    if (activeFromCount + activeToCount > 1) {
+      throw new ReconcileError(
+        "active_conflict",
+        `[reconcile] cannot merge ${activeFromCount} active conversation(s) from ` +
+          `${args.fromSessionKeys.join(",")} into ${args.toSessionKey} (already has ${activeToCount} active) - ` +
+          `the conversations.session_key UNIQUE-active partial index requires at most 1 active per session_key. ` +
+          `Workaround: archive all but one conv first via ` +
+          `UPDATE conversations SET active=0, archived_at=datetime('now') WHERE conversation_id=?, ` +
+          `then re-run reconcile.`,
+      );
     }
-    // Fall through to the orphan-summaries cleanup path. Conv-side has
-    // nothing to do, but summaries still need their session_key updated.
-  }
 
-  let conversationsMoved = 0;
-  let summariesMoved = 0;
-  let auditEntries = 0;
-  db.exec("BEGIN IMMEDIATE");
-  try {
+    const appliedBy = args.appliedBy ?? "operator";
+    const placeholders = fromPlaceholders;
+    const affectedConvs = db
+      .prepare(
+        `SELECT conversation_id, session_key
+           FROM conversations
+           WHERE session_key IN (${placeholders})`,
+      )
+      .all(...args.fromSessionKeys) as Array<{
+      conversation_id: number;
+      session_key: string;
+    }>;
+
+    if (affectedConvs.length === 0) {
+      const orphanSummaryCount = (
+        db
+          .prepare(
+            `SELECT COUNT(*) AS n FROM summaries
+               WHERE session_key IN (${placeholders})`,
+          )
+          .get(...args.fromSessionKeys) as { n: number }
+      ).n;
+      if (orphanSummaryCount === 0) {
+        return { conversationsMoved: 0, summariesMoved: 0, auditEntries: 0 };
+      }
+      // Fall through to summaries-only path.
+    }
+
+    let conversationsMoved = 0;
+    let summariesMoved = 0;
+    let auditEntries = 0;
+
     if (affectedConvs.length > 0) {
       const convResult = db
         .prepare(
@@ -212,11 +214,6 @@ export function reconcileSessionKeys(
       .run(args.toSessionKey, ...args.fromSessionKeys);
     summariesMoved = Number(sumResult.changes);
 
-    // Per-conversation audit rows. Note: lcm_session_key_audit has
-    // conversation_id NOT NULL (see migration schema), so we cannot
-    // collapse this into one row per `from` key — the per-conv grain
-    // is also more useful (operator can /lcm undo-session-key-rekey
-    // a single conv without rolling back the whole batch).
     const auditStmt = db.prepare(
       `INSERT INTO lcm_session_key_audit
          (audit_id, conversation_id, original_session_key, new_session_key, reason, applied_by)
@@ -235,13 +232,18 @@ export function reconcileSessionKeys(
       auditEntries += 1;
     }
 
+    return { conversationsMoved, summariesMoved, auditEntries };
+  };
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const result = performReconcile();
     db.exec("COMMIT");
+    return result;
   } catch (e) {
-    db.exec("ROLLBACK");
+    try { db.exec("ROLLBACK"); } catch {}
     throw e;
   }
-
-  return { conversationsMoved, summariesMoved, auditEntries };
 }
 
 /**

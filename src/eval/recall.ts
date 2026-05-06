@@ -188,12 +188,24 @@ export async function runRecallEval(
   const perQuery: RecallResult[] = [];
   for (const q of queries) {
     const expected = q.expectedSummaryIds ?? [];
-    const hits = await Promise.race([
-      adapter.search(q),
-      new Promise<typeof TIMEOUT_SENTINEL>((resolve) =>
-        setTimeout(() => resolve(TIMEOUT_SENTINEL), perQueryTimeoutMs),
-      ),
-    ]);
+    // Wave-9 Agent #10 P1 fix: previously the setTimeout was never
+    // cleared when the adapter resolved first, leaving a pending
+    // timer in the event loop for `perQueryTimeoutMs` per query. For
+    // an N=1000 baseline run that's 1000 pending timers + a 30s tail-
+    // latency floor before the process can exit. Clear the timer in
+    // a finally so neither path leaks it.
+    let timerId: NodeJS.Timeout | undefined;
+    let hits: string[] | typeof TIMEOUT_SENTINEL;
+    try {
+      hits = await Promise.race([
+        adapter.search(q),
+        new Promise<typeof TIMEOUT_SENTINEL>((resolve) => {
+          timerId = setTimeout(() => resolve(TIMEOUT_SENTINEL), perQueryTimeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timerId !== undefined) clearTimeout(timerId);
+    }
     // Adapter exceptions still bubble (Promise.race rejects on first rejection)
     const resolvedHits = hits === TIMEOUT_SENTINEL ? [] : hits;
     perQuery.push(computePerQuery(q.queryId, resolvedHits, expected, kValues));

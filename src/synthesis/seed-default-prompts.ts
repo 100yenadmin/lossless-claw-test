@@ -40,9 +40,17 @@ interface SeedPromptDef {
  *     for the source bundle (leaves concatenated, or condensed-summary
  *     bundle, depending on tier).
  *   - `{{tier}}` substitutes the tier name (daily / weekly / monthly / etc).
- *   - `{{date_range}}` substitutes a human-readable range string.
- *   - `{{target_length}}` is the per-tier target token length.
- *   - `{{draft}}` and `{{source_leaves}}` are used by the verify-fidelity pass.
+ *   - `{{memory_type}}` substitutes the memory type (episodic-condensed /
+ *     yearly-synthesis / etc).
+ *   - `{{draft}}`, `{{candidate_summary}}`, and `{{source_leaves}}` are used
+ *     by the verify-fidelity and best-of-N judge passes.
+ *
+ * Wave-9 Agent #2/#7 P1 fix: removed `{{date_range}}` and `{{target_length}}`
+ * placeholders that were declared in this docstring but NOT substituted by
+ * `renderPrompt` in dispatch.ts. The seeded prompts no longer reference
+ * those placeholders directly; if a caller wants to inject date-range
+ * context, they bake it into `sourceText` (or pre-render the template
+ * before calling dispatch). Same class as Final.review.3 Loop 4 Bug 4.2.
  *
  * The exact substitution syntax is enforced by dispatchSynthesis; this seed
  * uses placeholders matching the test fixtures. If dispatch ever changes the
@@ -85,7 +93,7 @@ SUMMARY:`,
     passKind: "single",
     template: `You are a meticulous summarizer condensing leaf-level summaries into a daily summary.
 
-Input is N leaf summaries from {{date_range}}. Produce a daily summary that:
+Input is N leaf summaries from a single day. Produce a daily summary that:
 - Preserves every distinct decision (reference original leaf IDs in citations)
 - Preserves every concrete action (file paths, PRs, commits) — DO NOT abstract these away
 - Identifies recurring themes and patterns
@@ -110,7 +118,7 @@ DAILY SUMMARY:`,
     passKind: "single",
     template: `You are a meticulous summarizer condensing daily summaries into a weekly summary.
 
-Input is 7 (or fewer) daily summaries from {{date_range}}. Produce a weekly summary that:
+Input is 7 (or fewer) daily summaries from a single week. Produce a weekly summary that:
 - Preserves every distinct decision (reference original daily IDs in citations)
 - Preserves every concrete action (file paths, PRs, commits) — DO NOT abstract these away
 - Identifies recurring themes and patterns
@@ -135,7 +143,7 @@ WEEKLY SUMMARY:`,
     passKind: "single",
     template: `You are a meticulous summarizer condensing weekly summaries into a monthly summary.
 
-Input is 4-5 weekly summaries from {{date_range}}. Produce a monthly summary that:
+Input is 4-5 weekly summaries from a single month. Produce a monthly summary that:
 - Preserves every distinct decision (reference original weekly IDs in citations)
 - Preserves every concrete action (file paths, PRs, commits) — DO NOT abstract these away
 - Identifies the month's overarching themes (3-5 max)

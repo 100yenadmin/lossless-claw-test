@@ -91,7 +91,22 @@ if (!existsSync(VEC0_PATH)) {
 }
 
 // ── Open DB + load extensions ─────────────────────────────────────
-process.chdir("/tmp/lossless-claw-upstream");
+// Wave-9 Agent #11 P1 fix: previously hardcoded `process.chdir("/tmp/...")`,
+// which broke the harness on every machine except the one with that exact
+// path checkout. Now the script must be run from the repo root (same as
+// every other v41-* harness) — error fast with a clear message instead of
+// silently chdir'ing to a non-existent path.
+{
+  const cwd = process.cwd();
+  const sentinel = `${cwd}/src/embeddings/store.ts`;
+  if (!existsSync(sentinel)) {
+    console.error(
+      `[v41-qa-runner] Run from the repo root (couldn't find ${sentinel}). ` +
+        `cwd=${cwd}`,
+    );
+    process.exit(1);
+  }
+}
 
 const db = new DatabaseSync(dbPath, { allowExtension: true });
 db.exec("PRAGMA foreign_keys=ON;");
@@ -471,13 +486,34 @@ const SUITES = {
       id: "adv-lcm-expand-query-smoke",
       questionType: "E",
       description:
-        "lcm_expand_query (main wrapper for sub-agent expand) accepts query + returns dispatch handle",
+        "lcm_expand_query (main wrapper for sub-agent expand) accepts query + prompt; returns dispatch handle or graceful error",
       tool: "lcm_expand_query",
-      args: { query: "voyage embeddings backfill", allConversations: true },
+      // Wave-9 Agent #11 P1 fix: previously omitted `prompt` (required by
+      // schema), so test only hit the schema-validation early-return.
+      // Now exercise the full dispatch path with a real prompt + query.
+      args: {
+        query: "voyage embeddings backfill",
+        prompt: "What work has been done on Voyage embeddings backfill?",
+        allConversations: true,
+      },
       expect: (r) => {
-        // expand_query delegates to subagent — without LLM creds it should
-        // return a graceful error/skip, not a crash. We only check for
-        // catastrophic crash (uncaught) here.
+        // Wave-9 Agent #11 P1 fix: actual predicate that distinguishes
+        // graceful-degraded (LLM/grant missing) from catastrophic-crash.
+        if (r.error) {
+          // Graceful errors mention LLM, provider, delegated, subagent,
+          // grant, prompt, or session. Anything else is unexpected.
+          if (
+            /LLM|provider|delegated|subagent|grant|prompt|sessionKey|caller|complete is unavailable|VOYAGE_API/i.test(
+              String(r.error),
+            )
+          ) {
+            return null;
+          }
+          return `unexpected error: ${r.error}`;
+        }
+        // Success path: should return answer + citedIds.
+        if (typeof r.details?.answer !== "string") return "missing details.answer";
+        if (!Array.isArray(r.details?.citedIds)) return "missing details.citedIds";
         return null;
       },
       severity: "important",
@@ -617,6 +653,93 @@ const SUITES = {
         return null;
       },
       severity: "critical",
+    },
+    // Wave-9 Agent #11 P1 fix: cover the regex + full_text grep modes
+    // that previously had ZERO harness coverage. They return a different
+    // shape (totalMatches/messageCount/summaryCount, not details.hits)
+    // so the predicate validates that distinct contract.
+    {
+      id: "adv-grep-mode-regex-shape",
+      questionType: "B",
+      description: "lcm_grep mode='regex' returns totalMatches/messageCount/summaryCount shape (not hits)",
+      tool: "lcm_grep",
+      args: { pattern: "rebase", mode: "regex", limit: 5, allConversations: true },
+      expect: (r) => {
+        if (r.error) return `regex mode errored: ${r.error}`;
+        if (typeof r.details?.totalMatches !== "number") return "missing details.totalMatches";
+        if (typeof r.details?.messageCount !== "number") return "missing details.messageCount";
+        if (typeof r.details?.summaryCount !== "number") return "missing details.summaryCount";
+        return null;
+      },
+      severity: "important",
+    },
+    {
+      id: "adv-grep-mode-fulltext-shape",
+      questionType: "B",
+      description: "lcm_grep mode='full_text' returns FTS-shape result (not hits)",
+      tool: "lcm_grep",
+      args: { pattern: "voyage embedding", mode: "full_text", limit: 5, allConversations: true },
+      expect: (r) => {
+        if (r.error) return `full_text mode errored: ${r.error}`;
+        if (typeof r.details?.totalMatches !== "number") return "missing details.totalMatches";
+        if (typeof r.details?.messageCount !== "number") return "missing details.messageCount";
+        if (typeof r.details?.summaryCount !== "number") return "missing details.summaryCount";
+        return null;
+      },
+      severity: "important",
+    },
+    // Wave-9 Agent #11 P1 fix: period mode is the lcm_recent replacement
+    // and was never exercised by any harness. Cover the shortcut parser
+    // and the period-mode dispatch path.
+    {
+      id: "adv-synthesize-period-yesterday",
+      questionType: "A",
+      description: "lcm_synthesize_around period='yesterday' (lcm_recent replacement)",
+      tool: "lcm_synthesize_around",
+      args: {
+        period: "yesterday",
+        windowK: 5,
+        allConversations: true,
+      },
+      expect: (r) => {
+        // Same graceful-error shape as full-A1..A5: LLM unavailable OK,
+        // crash / unexpected error not OK. Also accept "no leaves in
+        // window" since a fresh corpus may legitimately have nothing
+        // for "yesterday".
+        if (
+          r.error &&
+          !/summary model|provider|LLM|complete is unavailable|VOYAGE_API|no synthesis|not configured|no leaves|period|empty/i.test(
+            String(r.error),
+          )
+        ) {
+          return `unexpected error: ${r.error}`;
+        }
+        return null;
+      },
+      severity: "important",
+    },
+    {
+      id: "adv-synthesize-period-last-7d",
+      questionType: "A",
+      description: "lcm_synthesize_around period='last-7d' (hyphenated short form)",
+      tool: "lcm_synthesize_around",
+      args: {
+        period: "last-7d",
+        windowK: 5,
+        allConversations: true,
+      },
+      expect: (r) => {
+        if (
+          r.error &&
+          !/summary model|provider|LLM|complete is unavailable|VOYAGE_API|no synthesis|not configured|no leaves|period|empty/i.test(
+            String(r.error),
+          )
+        ) {
+          return `unexpected error: ${r.error}`;
+        }
+        return null;
+      },
+      severity: "important",
     },
   ],
 };

@@ -571,6 +571,35 @@ export function createLcmDescribeTool(input: {
           }
         }
 
+        // Wave-9 Agent #5 P1 fix: lcm_describe expandChildren/expandMessages
+        // were a side channel that bypassed the grant token cap. The grant's
+        // delegatedRemainingBudget was CHECKED (budgetExhausted detection
+        // above) but never DECREMENTED — sub-agents could call
+        // lcm_describe ... expandChildren=true expandMessages=true
+        // expandChildrenLimit=50 expandMessagesLimit=50 back-to-back, each
+        // returning up to ~100K tokens, and the grant cap (default 4K)
+        // never decreased. This defeated the W4/W6 expansion-budget
+        // design — a runaway sub-agent could drain raw verbatim content
+        // without auth manager seeing it. Now we sum the token costs of
+        // any expanded payload and consume them from the grant.
+        if (delegatedGrantId !== "") {
+          const expandedChildrenTokens = expandedChildren.reduce(
+            (total, c) => total + (c.tokenCount ?? 0),
+            0,
+          );
+          const expandedMessagesTokens = expandedMessages.reduce(
+            (total, m) => total + (m.tokenCount ?? 0),
+            0,
+          );
+          const consumedTokens = expandedChildrenTokens + expandedMessagesTokens;
+          if (consumedTokens > 0) {
+            getRuntimeExpansionAuthManager().consumeTokenBudget(
+              delegatedGrantId,
+              consumedTokens,
+            );
+          }
+        }
+
         return {
           content: [{ type: "text", text: lines.join("\n") }],
           details: {

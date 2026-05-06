@@ -15,6 +15,7 @@ import {
   SemanticSearchUnavailableError,
 } from "../embeddings/semantic-search.js";
 import { VoyageError } from "../voyage/client.js";
+import { containsCjk } from "../store/full-text-fallback.js";
 
 const MAX_RESULT_CHARS = 40_000; // ~10k tokens
 
@@ -731,10 +732,22 @@ async function runSemanticLcmGrep(input: HybridGrepInput) {
           "Semantic search unavailable: vec0 extension not loaded or no embedding profile registered. Use mode='regex' or mode='full_text' instead.",
       });
     }
-    if (e instanceof VoyageError && e.kind === "auth") {
+    if (e instanceof VoyageError) {
+      // Wave-9 Agent #4 P1 fix: previously only `auth` was caught; the
+      // other transient kinds (`rate_limit`, `server_error`, `network`,
+      // `bad_request`, `unexpected`) propagated as raw exceptions. Sister
+      // tool `lcm_semantic_recall` correctly catches all VoyageError
+      // kinds. Mirror that catch shape so two surfaces routed the same
+      // way (Question B) have the same error contract.
+      if (e.kind === "auth") {
+        return jsonResult({
+          error:
+            "Voyage API key is missing or invalid (set VOYAGE_API_KEY) - semantic mode requires it. Use mode='regex' or mode='full_text' instead.",
+        });
+      }
       return jsonResult({
-        error:
-          "Voyage API key is missing or invalid (set VOYAGE_API_KEY) — semantic mode requires it. Use mode='regex' or mode='full_text' instead.",
+        error: `Voyage embed call failed (${e.kind}). Try mode='full_text' or wait and retry.`,
+        detail: e.message,
       });
     }
     throw e;
@@ -854,17 +867,34 @@ async function runVerbatimLcmGrep(input: HybridGrepInput) {
   const filters: string[] = ["m.suppressed_at IS NULL"];
   const binds: (string | number)[] = [];
 
+  // Wave-9 Agent #4 P1 fix: detect CJK queries and route directly through
+  // LIKE substring match. messages_fts is created with `tokenize='porter
+  // unicode61'` which can't segment CJK ideographs - `messages_fts MATCH
+  // '<chinese characters>'` returns 0 rows WITHOUT throwing, so the
+  // existing exception-driven LIKE fallback never triggers. There is no
+  // messages_fts_cjk trigram table for messages (only for summaries).
+  // For Chinese/Japanese/Korean conversations every Question-C verbatim
+  // query was returning "No verbatim matches" silently. By detecting CJK
+  // at the JS layer and skipping FTS entirely we get correct LIKE-based
+  // verbatim recall on CJK content.
+  const useLikeForCjk = containsCjk(pattern);
+
   // FTS5 join: messages_fts virtual table indexed on content
   // (we use FTS5 here since it's faster than LIKE for natural-language patterns)
   // P7 fix: sanitize the pattern so dots/brackets/hyphens don't trigger
-  // "fts5: syntax error". Always-on for verbatim — by definition you want
+  // "fts5: syntax error". Always-on for verbatim - by definition you want
   // literal text.
   // Wave-8 P1 fix: track ftsBindIndex AT THE PUSH SITE so future refactors
   // that move the FTS bind don't break the LIKE-fallback substitution.
   // Previously hard-coded to 0 with a comment that's brittle to refactor.
   const ftsBindIndex = binds.length;
-  filters.push("messages_fts MATCH ?");
-  binds.push(sanitizeFts5Pattern(pattern));
+  if (useLikeForCjk) {
+    filters.push("m.content LIKE ?");
+    binds.push(`%${pattern}%`);
+  } else {
+    filters.push("messages_fts MATCH ?");
+    binds.push(sanitizeFts5Pattern(pattern));
+  }
 
   // P6 fix: role filter — at SQL layer so it composes with FTS5 and doesn't
   // burn the 20-result cap on tool-message blobs when the agent wants user
@@ -908,15 +938,23 @@ async function runVerbatimLcmGrep(input: HybridGrepInput) {
     created_at: string;
   }>;
   try {
-    rows = db
-      .prepare(
-        `SELECT m.message_id, m.conversation_id, m.role, m.content, m.token_count, m.created_at
+    // Wave-9 Agent #4 P1 fix: when CJK detected at the JS layer above,
+    // skip the messages_fts JOIN entirely - the filter is already a
+    // direct `m.content LIKE ?` substring match.
+    const sql = useLikeForCjk
+      ? `SELECT m.message_id, m.conversation_id, m.role, m.content, m.token_count, m.created_at
+           FROM messages m
+           WHERE ${filters.join(" AND ")}
+           ORDER BY datetime(m.created_at) DESC
+           LIMIT ?`
+      : `SELECT m.message_id, m.conversation_id, m.role, m.content, m.token_count, m.created_at
            FROM messages m
            JOIN messages_fts ON messages_fts.rowid = m.rowid
            WHERE ${filters.join(" AND ")}
            ORDER BY datetime(m.created_at) DESC
-           LIMIT ?`,
-      )
+           LIMIT ?`;
+    rows = db
+      .prepare(sql)
       .all(...binds, limit) as Array<{
       message_id: number;
       conversation_id: number;
