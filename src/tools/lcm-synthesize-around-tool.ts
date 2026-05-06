@@ -49,28 +49,47 @@ const MAX_WINDOW_K = 200;
 const MAX_SOURCE_TEXT_TOKENS = 50_000; // dispatch-side cap
 
 const LcmSynthesizeAroundSchema = Type.Object({
-  target: Type.String({
-    description:
-      "Target to anchor the window on. Pass a `sum_xxx` summary_id (works in both " +
-      "modes — anchors on the summary's created_at OR content), OR a free-text query " +
-      "string (semantic mode only — used as the query embedding directly).",
-  }),
+  target: Type.Optional(
+    Type.String({
+      description:
+        "Target to anchor the window on. REQUIRED for window_kind='time' and " +
+        "'semantic'. OPTIONAL (acts as a label) for window_kind='period'. " +
+        "Pass a `sum_xxx` summary_id (works in 'time' and 'semantic' modes — anchors " +
+        "on the summary's created_at OR content), OR a free-text query string " +
+        "(semantic mode only — used as the query embedding directly).",
+    }),
+  ),
   window_kind: Type.String({
-    enum: ["time", "semantic"],
+    enum: ["time", "semantic", "period"],
     description:
-      "Window selection: 'time' (±windowHours around target timestamp) or 'semantic' " +
-      "(top-windowK most-similar leaves to target content/query).",
+      "Window selection. 'time' = ±windowHours around target timestamp (target REQUIRED). " +
+      "'semantic' = top-windowK most-similar leaves to target content/query (target REQUIRED). " +
+      "'period' = direct date-range or period-shortcut selection (target OPTIONAL — agent " +
+      "can ask 'what did we work on yesterday?' without first discovering an anchor leaf).",
   }),
+  // Reviewer P1 fix: 'period' mode supports both explicit ranges (since/before)
+  // AND human-readable shortcuts (yesterday/today/last-week/last-month/last-Nh/last-Nd).
+  // This restores `lcm_recent`-style direct period recall.
+  period: Type.Optional(
+    Type.String({
+      description:
+        "Period shortcut for window_kind='period' (case-insensitive). Accepted: " +
+        "'today' | 'yesterday' | 'this-week' | 'last-week' | 'this-month' | 'last-month' | " +
+        "'last-7-days' | 'last-30-days' | 'last-Nh' (e.g. 'last-12h' = past 12 hours) | " +
+        "'last-Nd' (e.g. 'last-3d' = past 3 days). Mutually exclusive with explicit " +
+        "since/before bounds (use either-or, not both).",
+    }),
+  ),
   windowHours: Type.Optional(
     Type.Number({
-      description: `Half-window for time mode (default ${DEFAULT_WINDOW_HOURS}, range ${MIN_WINDOW_HOURS}-${MAX_WINDOW_HOURS}). Ignored for semantic mode.`,
+      description: `Half-window for time mode (default ${DEFAULT_WINDOW_HOURS}, range ${MIN_WINDOW_HOURS}-${MAX_WINDOW_HOURS}). Ignored for semantic + period modes.`,
       minimum: MIN_WINDOW_HOURS,
       maximum: MAX_WINDOW_HOURS,
     }),
   ),
   windowK: Type.Optional(
     Type.Number({
-      description: `Top-K size for semantic mode (default ${DEFAULT_WINDOW_K}, range ${MIN_WINDOW_K}-${MAX_WINDOW_K}). Ignored for time mode.`,
+      description: `Top-K size for semantic mode (default ${DEFAULT_WINDOW_K}, range ${MIN_WINDOW_K}-${MAX_WINDOW_K}). Ignored for time + period modes.`,
       minimum: MIN_WINDOW_K,
       maximum: MAX_WINDOW_K,
     }),
@@ -116,6 +135,80 @@ const LcmSynthesizeAroundSchema = Type.Object({
 
 interface SummariesScopeFilter {
   conversationIds?: number[];
+}
+
+/**
+ * Reviewer P1 fix: parse a "period" shortcut into a (since, before) range.
+ * Anchored at "now" UTC. All ranges are half-open [since, before).
+ *
+ * Returns null + error string if the period is unrecognized.
+ */
+function parsePeriodShortcut(
+  raw: string,
+  nowMs: number = Date.now(),
+): { since: Date; before: Date; label: string } | { error: string } {
+  const period = raw.trim().toLowerCase();
+  const now = new Date(nowMs);
+  // Anchor at UTC midnight of "today"
+  const utcMidnight = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
+  );
+  const dayMs = 24 * 60 * 60 * 1000;
+
+  if (period === "today") {
+    return { since: utcMidnight, before: new Date(utcMidnight.getTime() + dayMs), label: "today" };
+  }
+  if (period === "yesterday") {
+    return {
+      since: new Date(utcMidnight.getTime() - dayMs),
+      before: utcMidnight,
+      label: "yesterday",
+    };
+  }
+  if (period === "this-week") {
+    // ISO week: Monday = day 1
+    const dow = utcMidnight.getUTCDay() || 7; // Sun=0 -> 7
+    const monday = new Date(utcMidnight.getTime() - (dow - 1) * dayMs);
+    return { since: monday, before: new Date(monday.getTime() + 7 * dayMs), label: "this-week" };
+  }
+  if (period === "last-week") {
+    const dow = utcMidnight.getUTCDay() || 7;
+    const thisMonday = new Date(utcMidnight.getTime() - (dow - 1) * dayMs);
+    const lastMonday = new Date(thisMonday.getTime() - 7 * dayMs);
+    return { since: lastMonday, before: thisMonday, label: "last-week" };
+  }
+  if (period === "this-month") {
+    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+    const nextMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+    return { since: monthStart, before: nextMonthStart, label: "this-month" };
+  }
+  if (period === "last-month") {
+    const lastMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+    const thisMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+    return { since: lastMonthStart, before: thisMonthStart, label: "last-month" };
+  }
+  // last-Nh / last-Nd patterns
+  const hMatch = period.match(/^last-(\d+)h$/);
+  if (hMatch) {
+    const hours = Math.min(24 * 90, Math.max(1, parseInt(hMatch[1]!, 10)));
+    return {
+      since: new Date(now.getTime() - hours * 60 * 60 * 1000),
+      before: now,
+      label: `last-${hours}h`,
+    };
+  }
+  const dMatch = period.match(/^last-(\d+)-?d(ays?)?$/);
+  if (dMatch) {
+    const days = Math.min(366, Math.max(1, parseInt(dMatch[1]!, 10)));
+    return {
+      since: new Date(now.getTime() - days * dayMs),
+      before: now,
+      label: `last-${days}d`,
+    };
+  }
+  return {
+    error: `Unrecognized period shortcut: '${raw}'. Accepted: today | yesterday | this-week | last-week | this-month | last-month | last-Nh (e.g. last-12h) | last-Nd (e.g. last-3d) | last-7-days | last-30-days.`,
+  };
 }
 
 interface LeafRow {
@@ -313,19 +406,22 @@ export function createLcmSynthesizeAroundTool(input: {
       const timezone = lcm.timezone;
       const p = params as Record<string, unknown>;
 
-      // 1. Validate target
-      const target = typeof p.target === "string" ? p.target.trim() : "";
-      if (target.length === 0) {
+      // 2. Validate window_kind FIRST so we can enforce target-required
+      //    semantics correctly per mode (period mode allows missing target).
+      const windowKind = typeof p.window_kind === "string" ? p.window_kind.trim() : "";
+      if (windowKind !== "time" && windowKind !== "semantic" && windowKind !== "period") {
         return jsonResult({
-          error: "`target` is required (sum_xxx summary_id OR free-text query).",
+          error: "`window_kind` must be 'time', 'semantic', or 'period'.",
         });
       }
 
-      // 2. Validate window_kind
-      const windowKind = typeof p.window_kind === "string" ? p.window_kind.trim() : "";
-      if (windowKind !== "time" && windowKind !== "semantic") {
+      // 1. Validate target — REQUIRED for time + semantic, OPTIONAL for period.
+      // Reviewer P1 fix: period mode is the lcm_recent replacement —
+      // "what did we work on yesterday?" should not require an anchor.
+      const target = typeof p.target === "string" ? p.target.trim() : "";
+      if (target.length === 0 && windowKind !== "period") {
         return jsonResult({
-          error: "`window_kind` must be 'time' or 'semantic'.",
+          error: "`target` is required for window_kind='time' or 'semantic' (sum_xxx summary_id OR free-text query). For period mode, target is optional.",
         });
       }
 
@@ -415,7 +511,67 @@ export function createLcmSynthesizeAroundTool(input: {
         (typeof input.sessionKey === "string" && input.sessionKey.trim()) ||
         "";
 
-      if (windowKind === "time") {
+      if (windowKind === "period") {
+        // Reviewer P1 fix: direct date-range / period-shortcut selection.
+        // No target required. The caller can pass (a) `period: "yesterday"`,
+        // (b) explicit since/before, or (c) both — the period derives the
+        // base bounds and since/before further constrain them.
+        const periodRaw = typeof p.period === "string" ? p.period.trim() : "";
+        let periodSince: Date | undefined;
+        let periodBefore: Date | undefined;
+        let periodLabel = "custom-range";
+        if (periodRaw.length > 0) {
+          const parsed = parsePeriodShortcut(periodRaw);
+          if ("error" in parsed) {
+            return jsonResult({ error: parsed.error });
+          }
+          periodSince = parsed.since;
+          periodBefore = parsed.before;
+          periodLabel = parsed.label;
+        }
+        // Combine period bounds + explicit since/before. Tightest wins.
+        let rangeStart =
+          sinceBound && periodSince
+            ? new Date(Math.max(sinceBound.getTime(), periodSince.getTime()))
+            : sinceBound ?? periodSince;
+        let rangeEnd =
+          beforeBound && periodBefore
+            ? new Date(Math.min(beforeBound.getTime(), periodBefore.getTime()))
+            : beforeBound ?? periodBefore;
+        if (!rangeStart || !rangeEnd) {
+          return jsonResult({
+            error:
+              "window_kind='period' requires either `period` (shortcut) or both `since` and `before` (explicit range).",
+            hint:
+              "Examples: {window_kind:'period', period:'yesterday'} | {window_kind:'period', period:'last-7-days'} | {window_kind:'period', since:'2026-05-01T00:00:00Z', before:'2026-05-02T00:00:00Z'}",
+          });
+        }
+        if (rangeStart.getTime() >= rangeEnd.getTime()) {
+          return jsonResult({
+            error:
+              "Effective period window is empty after combining period + since/before bounds.",
+          });
+        }
+        rangeStartIso = rangeStart.toISOString();
+        rangeEndIso = rangeEnd.toISOString();
+
+        leafRows = selectTimeWindowLeaves(db, {
+          rangeStart: rangeStartIso,
+          rangeEnd: rangeEndIso,
+          scope: summariesScope,
+          // No exclude in period mode — there's no "anchor" leaf to drop.
+          excludeSummaryId: targetSummary?.summary_id,
+        });
+
+        if (leafRows.length === 0) {
+          return jsonResult({
+            error: `No leaves found in period ${periodLabel} (${rangeStartIso} → ${rangeEndIso}).`,
+            hint:
+              "Widen the period (e.g. 'last-7-days' instead of 'yesterday') or set allConversations=true if leaves live elsewhere.",
+            window: { kind: "period", label: periodLabel, since: rangeStartIso, before: rangeEndIso },
+          });
+        }
+      } else if (windowKind === "time") {
         // targetSummary is non-null here (validated above)
         const anchor = parseSqliteUtcTimestamp(targetSummary!.created_at);
         if (Number.isNaN(anchor.getTime())) {
@@ -528,12 +684,16 @@ export function createLcmSynthesizeAroundTool(input: {
           hint:
             windowKind === "time"
               ? "Widen windowHours, or set allConversations=true if leaves live elsewhere."
-              : "Increase windowK, or relax since/before bounds.",
+              : windowKind === "period"
+                ? "Widen the period (e.g. 'last-30-days' instead of 'yesterday'), or set allConversations=true."
+                : "Increase windowK, or relax since/before bounds.",
           window: {
             kind: windowKind,
             ...(windowKind === "time"
               ? { hours: windowHours, since: rangeStartIso, before: rangeEndIso }
-              : { k: windowK }),
+              : windowKind === "period"
+                ? { since: rangeStartIso, before: rangeEndIso }
+                : { k: windowK }),
           },
         });
       }
@@ -728,7 +888,14 @@ export function createLcmSynthesizeAroundTool(input: {
               anchorSummaryId: targetSummary?.summary_id ?? null,
               ...(windowKind === "time"
                 ? { hours: windowHours }
-                : { k: windowK, model: semanticMeta?.modelName ?? null }),
+                : windowKind === "period"
+                  ? {
+                      period:
+                        typeof p.period === "string" ? p.period.trim() || null : null,
+                      rangeStart: rangeStartIso,
+                      rangeEnd: rangeEndIso,
+                    }
+                  : { k: windowK, model: semanticMeta?.modelName ?? null }),
               since: sinceBound?.toISOString() ?? null,
               before: beforeBound?.toISOString() ?? null,
             }),
@@ -916,6 +1083,9 @@ export function createLcmSynthesizeAroundTool(input: {
       lines.push(`**Mode:** ${windowKind}`);
       if (windowKind === "time") {
         lines.push(`**Window:** ±${windowHours}h around ${formatDisplayTime(targetSummary!.created_at, timezone)}`);
+      } else if (windowKind === "period") {
+        const periodLabel = typeof p.period === "string" && p.period.trim().length > 0 ? p.period.trim() : "custom-range";
+        lines.push(`**Window:** period='${periodLabel}' (direct date-range — no anchor required)`);
       } else {
         lines.push(`**Window:** top-${windowK} semantic neighbours`);
         if (semanticMeta?.modelName) {

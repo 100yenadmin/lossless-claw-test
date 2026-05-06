@@ -108,7 +108,9 @@ Three modes available:
 
 `runPurge(leafIds, reason)` flips `summaries.suppressed_at` and `messages.suppressed_at`. From that single flip, cascade triggers (enforced at 10+ read paths — FTS5, LIKE, CJK trigram, CJK LIKE, regex, vec0 metadata, vec0 KNN, summary getById, message getById, raw message search) make the leaf invisible to every read surface. Context items get cleaned. Entity mentions cascade-delete. Parent condensed summaries get `contains_suppressed_leaves=1` so the next idle pass rebuilds them clean.
 
-The leaf row itself is *not* deleted — the lossless bedrock principle. `runPurge --immediate` (with hard-delete drainer worker) was preserved in draft PR #616 for future cycle. For GDPR-grade byte-level removal until then, run SQL VACUUM after suppression has cascaded.
+The leaf row itself is *not* deleted — the lossless bedrock principle. The current shipping behavior is **soft suppression only (agent-visible)**: `suppressed_at` is set on summaries + messages, downstream read paths filter on it, vec0 metadata cascades, and the assemble() pyramid sees `contains_suppressed_leaves`. The DB rows themselves remain — they are NOT byte-deleted. SQL VACUUM alone does NOT remove the underlying data because the rows still exist (just with suppressed_at set).
+
+`runPurge --immediate` (with hard-delete drainer worker) was preserved in draft PR #616 for future cycle and remains the path to true byte-level erasure. Until that ships, any GDPR/erasure obligation requiring physical removal must be handled out-of-band: an operator running raw `DELETE FROM messages/summaries WHERE summary_id IN (...)` followed by `VACUUM`. The current `/lcm purge` command is correct for "agent must not see this content in any read path" but is NOT a substitute for hard-delete.
 
 ### Scenario 5: "Tell me about all the work I've done with Voyage"
 

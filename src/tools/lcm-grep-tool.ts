@@ -665,6 +665,10 @@ async function runSemanticLcmGrep(input: HybridGrepInput) {
         : conversationScope.conversationId != null
           ? deriveSessionKeysFromConversationIds(db, [conversationScope.conversationId])
           : undefined;
+    // Reviewer Wave-3 fix: cap Voyage wall-time on agent hot path. Parity
+    // with the hybrid mode at line 538-539. Without this cap, default
+    // Voyage client (3×60s) could block an agent turn for minutes if
+    // Voyage throttles. 15s × 1 retry ≈ 30s worst case.
     semResult = await runSemanticSearch(db, {
       query: pattern,
       sessionKeys,
@@ -673,6 +677,8 @@ async function runSemanticLcmGrep(input: HybridGrepInput) {
       before,
       embeddedKinds: ["summary"],
       excludeSuppressed: true,
+      voyageMaxRetries: 1,
+      voyageTimeoutMs: 15_000,
     });
   } catch (e: unknown) {
     if (e instanceof SemanticSearchUnavailableError) {

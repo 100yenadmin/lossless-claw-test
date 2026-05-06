@@ -15,8 +15,21 @@
  * lcm_purge_rebuild_queue) was REMOVED in first-principles pass —
  * the drainer worker (~20-40h work, HIGH risk to assemble-pyramid
  * invariants) was never built. Implementation + queue schema preserved
- * in deferred-features draft PR (#616). For GDPR-compliant byte-level
- * removal, run SQL VACUUM after suppression has cascaded.
+ * in deferred-features draft PR (#616).
+ *
+ * IMPORTANT — soft purge is AGENT-VISIBLE SUPPRESSION ONLY:
+ * - The leaf row, message row, and any embedding metadata stay in the
+ *   DB. Only `suppressed_at` is set; downstream read paths filter on it.
+ * - SQL VACUUM by itself does NOT byte-delete the suppressed content
+ *   because the rows still exist (just with suppressed_at set).
+ * - Byte-level deletion requires the cycle-3 hard-delete drainer
+ *   (preserved in #616). Until that ships, any GDPR/erasure obligation
+ *   that requires *physical* removal must be handled out-of-band by
+ *   running raw `DELETE FROM messages/summaries WHERE summary_id IN
+ *   (...)` followed by `VACUUM` (operator-only manual SQL).
+ * - The current design is correct for "agent must not see this content
+ *   in any read path" — which is the contract of soft purge — but it
+ *   is NOT a substitute for a hard-delete process.
  *
  * Criteria — caller specifies one of:
  *   - summaryIds: explicit list
@@ -52,10 +65,13 @@ export interface PurgeOptions extends PurgeCriteria {
    * mode (with hard-delete drainer worker) was REMOVED in first-principles
    * pass (2026-05-06) to honor "no Phase 2" mandate — the drainer worker
    * was never built (~20-40h work, HIGH risk to assemble-pyramid invariants).
-   * runPurge always operates in soft mode now. The hard-delete drainer +
-   * lcm_purge_rebuild_queue schema preserved in deferred-features draft PR
-   * (#616). For GDPR-compliant byte deletion until then, use SQL VACUUM
-   * after suppression.
+   * runPurge always operates in soft mode now (agent-visible suppression
+   * only — byte-level deletion is deferred). The hard-delete drainer +
+   * lcm_purge_rebuild_queue schema are preserved in deferred-features
+   * draft PR (#616). For GDPR-compliant byte erasure until that ships,
+   * the operator must run raw SQL DELETE + VACUUM out-of-band; soft
+   * purge alone (even followed by VACUUM) does NOT remove the underlying
+   * row data because the rows remain — only suppressed_at is set.
    */
   /**
    * Free-text reason. Required (no default). Recorded in
