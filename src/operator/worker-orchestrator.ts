@@ -147,9 +147,17 @@ export async function tickExtraction(
     };
   }
   try {
+    // Wave-4 Auditor #12 P0-1 + #13 P1 fix: pass an onItemHeartbeat
+    // closure so runCoreferenceTick can extend the worker lock TTL
+    // between items. Without this, a 50-item tick × 30s/item = 25 min
+    // would blow past the 90s WORKER_LOCK_TTL_MS, allowing a second
+    // gateway's autostart to GC + re-acquire and double-process the
+    // queue — directly causing the duplicate-mention scenario the
+    // INSERT OR IGNORE path was fixed for in Wave-1.
     const result = await runCoreferenceTick(db, args.extractor, {
       ...args,
       passId: args.passId ?? `tick-${Date.now()}`,
+      onItemHeartbeat: () => heartbeatLock(db, "extraction", workerId),
     });
     return { ...result, lockAcquired: true };
   } finally {
@@ -174,7 +182,20 @@ export async function tickExtraction(
 export function forceReleaseLock(
   db: DatabaseSync,
   jobKind: WorkerJobKind,
+  opts: { expectedWorkerId?: string } = {},
 ): boolean {
+  // Wave-4 Auditor #13 P1 fix: when expectedWorkerId is provided, scope
+  // the DELETE to that worker so an operator slip doesn't evict a
+  // healthy holder mid-tick (which would cascade into double-processing
+  // the queue exactly as the Wave-1 INSERT OR IGNORE protections aim
+  // to prevent). When omitted, behavior matches the legacy escape-hatch
+  // semantic (delete by kind only) — caller takes responsibility.
+  if (opts.expectedWorkerId) {
+    const r = db
+      .prepare(`DELETE FROM lcm_worker_lock WHERE job_kind = ? AND worker_id = ?`)
+      .run(jobKind, opts.expectedWorkerId);
+    return Number(r.changes) > 0;
+  }
   const r = db
     .prepare(`DELETE FROM lcm_worker_lock WHERE job_kind = ?`)
     .run(jobKind);
@@ -192,12 +213,29 @@ export function forceReleaseLock(
 export function heartbeatAllHeldLocks(
   db: DatabaseSync,
   workerIdsByKind: Partial<Record<WorkerJobKind, string>>,
-): number {
+): { refreshed: number; perKind: Partial<Record<WorkerJobKind, "ok" | "lost" | "skipped">> } {
+  // Wave-4 Auditor #13 P1 fix: previously returned only a count, throwing
+  // away the per-kind boolean. A worker that lost its lock between ticks
+  // (stolen during a long LLM call) saw `refreshed=0` indistinguishable
+  // from "we never held it." Now returns per-kind status so callers can
+  // detect lock-loss and abort the in-flight tick. Also wraps each call
+  // in try/catch so one failed heartbeat doesn't abort the loop.
   let refreshed = 0;
+  const perKind: Partial<Record<WorkerJobKind, "ok" | "lost" | "skipped">> = {};
   for (const kind of WORKER_JOB_KINDS) {
     const wid = workerIdsByKind[kind];
-    if (!wid) continue;
-    if (heartbeatLock(db, kind, wid)) refreshed++;
+    if (!wid) {
+      perKind[kind] = "skipped";
+      continue;
+    }
+    try {
+      const ok = heartbeatLock(db, kind, wid);
+      perKind[kind] = ok ? "ok" : "lost";
+      if (ok) refreshed++;
+    } catch {
+      // DB closed mid-shutdown or transient SQLite error; treat as lost
+      perKind[kind] = "lost";
+    }
   }
-  return refreshed;
+  return { refreshed, perKind };
 }

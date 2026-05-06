@@ -74,6 +74,13 @@ export interface RecallReport {
 export interface RecallEvalOptions {
   /** K values to compute recall at. Default: [1, 5, 10, 20, 50]. */
   kValues?: number[];
+  /**
+   * Wave-4 Auditor #15 P1 fix: per-query timeout (ms). A pathological
+   * adapter (network hang, vec0 deadlock) without this would hang the
+   * whole eval indefinitely. Default 30s; queries that exceed this are
+   * reported as failed (zero recall) and the eval continues.
+   */
+  perQueryTimeoutMs?: number;
 }
 
 const DEFAULT_K_VALUES = [1, 5, 10, 20, 50] as const;
@@ -166,11 +173,24 @@ export async function runRecallEval(
     }
   }
 
+  // Wave-4 Auditor #15 P1 fix: per-query timeout. Default 30s.
+  // Only TIMEOUT errors are swallowed (recorded as zero recall);
+  // adapter-throws still propagate so the caller can debug a broken
+  // adapter rather than getting a silent zero-recall result.
+  const perQueryTimeoutMs = opts?.perQueryTimeoutMs ?? 30_000;
+  const TIMEOUT_SENTINEL = Symbol("recall-eval-timeout");
   const perQuery: RecallResult[] = [];
   for (const q of queries) {
-    const hits = await adapter.search(q);
     const expected = q.expectedSummaryIds ?? [];
-    perQuery.push(computePerQuery(q.queryId, hits, expected, kValues));
+    const hits = await Promise.race([
+      adapter.search(q),
+      new Promise<typeof TIMEOUT_SENTINEL>((resolve) =>
+        setTimeout(() => resolve(TIMEOUT_SENTINEL), perQueryTimeoutMs),
+      ),
+    ]);
+    // Adapter exceptions still bubble (Promise.race rejects on first rejection)
+    const resolvedHits = hits === TIMEOUT_SENTINEL ? [] : hits;
+    perQuery.push(computePerQuery(q.queryId, resolvedHits, expected, kValues));
   }
 
   // Aggregate over queries that have ≥1 expected ID (others contribute

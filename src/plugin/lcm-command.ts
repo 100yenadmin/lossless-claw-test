@@ -1005,6 +1005,14 @@ function buildHelpText(error?: string): string {
         "Show LCM v4.1 subsystem health: embeddings, workers, synthesis, eval, suppression.",
       ),
       buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} worker status`),
+        "Show worker locks (held by whom, expires when) + pending counts for backfill / extraction.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} worker tick embedding-backfill`),
+        "Manually run one backfill tick (useful when autostart is off or queue is bursting).",
+      ),
+      buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} reconcile-session-keys --list-candidates`),
         "List `legacy:conv_*` session keys that may be candidates for merging.",
       ),

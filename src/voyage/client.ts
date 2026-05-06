@@ -458,12 +458,20 @@ async function postWithRetry(
       );
     }
     if (status === 400) {
+      // Wave-4 Auditor #2 P1 fix: previously the raw `bodyText` was
+      // attached to the VoyageError as `responseBody`, bypassing the
+      // `summarizeBody` privacy filter that suppressed input echoes in
+      // the error message. Upstream loggers / Sentry capture the full
+      // exception object — so passing raw bodyText leaked the input
+      // texts even when the message was suppressed. Defense-in-depth:
+      // pass the SAME suppressed body to both fields.
+      const suppressedBody = summarizeBody(bodyText);
       throw new VoyageError(
         "bad_request",
-        `voyage_400: bad request on ${inputCount} inputs (${summarizeBody(bodyText)})`,
+        `voyage_400: bad request on ${inputCount} inputs (${suppressedBody})`,
         status,
         undefined,
-        bodyText,
+        suppressedBody,
       );
     }
     if (status === 429) {

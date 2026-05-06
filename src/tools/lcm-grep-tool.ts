@@ -623,11 +623,38 @@ async function runHybridLcmGrep(input: HybridGrepInput) {
       degradedToFtsOnly: hybridResult.degradedToFtsOnly,
       degradedSkippedRerank: hybridResult.degradedSkippedRerank,
       modelName: hybridResult.modelName,
+      // Wave-4 Auditor #21 P1 fix: emit confidenceBand for parity with
+      // semantic mode + lcm_semantic_recall. Hybrid's `score` is a rerank
+      // score (0..1 typically), not a cosine similarity, so we derive
+      // band from semanticDistance when present (it's in cosine-space
+      // for the non-reranked candidates) and fall back to "rerank" as a
+      // signal when score is the dominant signal.
+      confidenceBand: (() => {
+        const top = hybridResult.hits[0];
+        if (!top) return "no-match";
+        // Prefer semanticDistance when present (cosine-derivable)
+        if (typeof top.semanticDistance === "number") {
+          // L2 on unit vectors → cosine = 1 - L²/2
+          const cos = 1 - (top.semanticDistance * top.semanticDistance) / 2;
+          return cos >= 0.65 ? "high" : cos >= 0.5 ? "medium" : cos >= 0.35 ? "low" : "noise";
+        }
+        // Fallback: rerank score is normalized 0..1
+        const s = top.score;
+        return s >= 0.65 ? "high" : s >= 0.5 ? "medium" : s >= 0.35 ? "low" : "noise";
+      })(),
       hits: hybridResult.hits.map((h) => ({
         summaryId: h.summaryId,
         conversationId: h.conversationId,
         sessionKey: h.sessionKey,
         kind: h.kind,
+        // Wave-4 Auditor #21 P1: add cosineSimilarity (computed from
+        // semanticDistance when present) so hybrid hits have shape
+        // parity with semantic + recall hits. Fall back to null when
+        // the hit was FTS-only (no semantic distance).
+        cosineSimilarity:
+          typeof h.semanticDistance === "number"
+            ? 1 - (h.semanticDistance * h.semanticDistance) / 2
+            : null,
         score: h.score,
         fromFts: h.fromFts,
         fromSemantic: h.fromSemantic,

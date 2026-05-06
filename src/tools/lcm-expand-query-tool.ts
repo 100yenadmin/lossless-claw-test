@@ -98,6 +98,9 @@ type DelegatedExpandQueryReply = {
   expandedSummaryCount: number;
   totalSourceTokens: number;
   truncated: boolean;
+  /** Wave-4 Auditor #10 P1-02: count of citedIds the LLM emitted that
+   *  weren't found in the summaries table — i.e., fabricated. */
+  citedIdsRejectedAsFabricated?: number;
 };
 
 type ParsedExpandQueryReply =
@@ -881,6 +884,55 @@ async function runDelegatedExpandQuery(
       if (!parsed.ok) {
         throw new Error(parsed.error);
       }
+
+      // Wave-4 Auditor #10 P1-02 fix: validate citedIds against the
+      // database. Previously the LLM could fabricate `sum_xxx` strings
+      // that look real and the wrapper would surface them unchecked.
+      // Now we intersect with the set of summary_ids actually in the DB —
+      // any IDs not found are dropped + counted into a separate field
+      // so the caller can detect fabrication.
+      let citedIdsValidated: string[] = parsed.value.citedIds;
+      let citedIdsRejectedAsFabricated = 0;
+      if (parsed.value.citedIds.length > 0) {
+        try {
+          const dbForValidation = params.lcm.getDb();
+          const placeholders = parsed.value.citedIds.map(() => "?").join(",");
+          const rows = dbForValidation
+            .prepare(
+              `SELECT summary_id FROM summaries WHERE summary_id IN (${placeholders})`,
+            )
+            .all(...parsed.value.citedIds) as Array<{ summary_id: string }>;
+          const real = new Set(rows.map((r) => r.summary_id));
+          const filtered = parsed.value.citedIds.filter((id) => real.has(id));
+          citedIdsRejectedAsFabricated = parsed.value.citedIds.length - filtered.length;
+          citedIdsValidated = filtered;
+        } catch {
+          // best-effort; on validation error fall back to the unvalidated set
+        }
+      }
+
+      // Wave-4 Auditor #10 P1-03 fix: maxTokens was advisory-only ("target
+      // <= N tokens" in the prompt). Now ENFORCE post-hoc: truncate the
+      // answer to ~params.maxTokens × 4 chars (loose token estimate;
+      // tighter by truncating at a sentence boundary if possible).
+      let answerEnforced = parsed.value.answer;
+      let answerWasTruncated = false;
+      const maxAnswerChars = Math.max(256, params.maxTokens * 4);
+      if (answerEnforced.length > maxAnswerChars) {
+        // Truncate at the last sentence-ish boundary within the cap
+        const cut = answerEnforced.slice(0, maxAnswerChars);
+        const lastBoundary = Math.max(
+          cut.lastIndexOf(". "),
+          cut.lastIndexOf(".\n"),
+          cut.lastIndexOf("!\n"),
+          cut.lastIndexOf("?\n"),
+        );
+        answerEnforced =
+          (lastBoundary > maxAnswerChars * 0.7 ? cut.slice(0, lastBoundary + 1) : cut) +
+          `\n\n[Truncated by lcm_expand_query: answer exceeded maxTokens=${params.maxTokens}]`;
+        answerWasTruncated = true;
+      }
+
       recordExpansionDelegationTelemetry({
         deps: params.deps,
         component: "lcm_expand_query",
@@ -892,7 +944,13 @@ async function runDelegatedExpandQuery(
         runId,
       });
 
-      return parsed.value;
+      return {
+        ...parsed.value,
+        answer: answerEnforced,
+        citedIds: citedIdsValidated,
+        truncated: parsed.value.truncated || answerWasTruncated,
+        citedIdsRejectedAsFabricated,
+      };
     } finally {
       try {
         await params.deps.callGateway({

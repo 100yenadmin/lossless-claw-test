@@ -398,22 +398,39 @@ export function recordEmbedding(
   // module-level docs (vec0 sees JS number 0 as FLOAT and rejects).
   const suppressedBig = suppressed ? 1n : 0n;
 
-  // We DON'T enforce uniqueness on (embedded_id, embedded_kind) inside
-  // vec0 — auxiliary cols aren't UNIQUE-indexed. Caller responsibility:
-  // delete any prior row before inserting (or use the provided helper
-  // {@link replaceEmbedding}).
-  db.prepare(
-    `INSERT INTO ${tableName} (embedding, embedded_id, embedded_kind, suppressed)
-     VALUES (?, ?, ?, ?)`,
-  ).run(vecJson, embeddedId, embeddedKind, suppressedBig);
+  // Wave-4 Auditor #3 P0 fix: vec0 auxiliary cols aren't UNIQUE-indexed,
+  // so back-to-back recordEmbedding(...) calls on the same
+  // (embedded_id, embedded_kind) created DUPLICATE vec0 rows. The meta
+  // sidecar is INSERT OR REPLACE so it self-heals to one row, but vec0
+  // accumulates duplicates that surface as duplicate KNN hits at search
+  // time (semantic_recall returns the same summary multiple times).
+  // Defense-in-depth: DELETE any prior matching row before INSERT,
+  // wrapped with the meta INSERT in a SAVEPOINT so the pair is atomic
+  // (compounds with Wave-1's writeBatch SAVEPOINT-per-row in
+  // backfill.ts — that protects bulk paths; this protects all callers).
+  const sp = `re_${Math.floor(Math.random() * 0xffffff).toString(16)}`;
+  db.exec(`SAVEPOINT ${sp}`);
+  try {
+    db.prepare(
+      `DELETE FROM ${tableName} WHERE embedded_id = ? AND embedded_kind = ?`,
+    ).run(embeddedId, embeddedKind);
+    db.prepare(
+      `INSERT INTO ${tableName} (embedding, embedded_id, embedded_kind, suppressed)
+       VALUES (?, ?, ?, ?)`,
+    ).run(vecJson, embeddedId, embeddedKind, suppressedBig);
 
-  // Mirror in lcm_embedding_meta — sidecar for "is this thing embedded?"
-  // queries that don't need to load the vector.
-  db.prepare(
-    `INSERT OR REPLACE INTO lcm_embedding_meta
-       (embedded_id, embedded_kind, embedding_model, embedded_at, source_token_count, archived)
-     VALUES (?, ?, ?, datetime('now'), ?, 0)`,
-  ).run(embeddedId, embeddedKind, modelName, sourceTokenCount);
+    // Mirror in lcm_embedding_meta — sidecar for "is this thing embedded?"
+    // queries that don't need to load the vector.
+    db.prepare(
+      `INSERT OR REPLACE INTO lcm_embedding_meta
+         (embedded_id, embedded_kind, embedding_model, embedded_at, source_token_count, archived)
+       VALUES (?, ?, ?, datetime('now'), ?, 0)`,
+    ).run(embeddedId, embeddedKind, modelName, sourceTokenCount);
+    db.exec(`RELEASE ${sp}`);
+  } catch (e) {
+    try { db.exec(`ROLLBACK TO ${sp}`); db.exec(`RELEASE ${sp}`); } catch {}
+    throw e;
+  }
 }
 
 /**

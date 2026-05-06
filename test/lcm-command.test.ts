@@ -951,7 +951,7 @@ describe("lcm command", () => {
       conversationId: currentConversation.conversationId,
       kind: "condensed",
       depth: 1,
-      content: `${"[LCM fallback summary; truncated for context management]"}\nold parent`,
+      content: `${"[LCM fallback summary — model unavailable; raw source truncated for context management]"}\nold parent`,
       tokenCount: 9,
     });
     await fixture.summaryStore.linkSummaryToParents("sum_parent_fix", ["sum_leaf_fix"]);

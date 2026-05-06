@@ -212,8 +212,11 @@ describe("voyage client — embedTexts error handling", () => {
     expect(caught?.status).toBe(400);
     // Error message should NOT contain the secret
     expect(caught?.message).not.toContain("secret payload");
-    // ResponseBody field is preserved for caller to log carefully if needed
-    expect(caught?.responseBody).toContain("secret payload");
+    // Wave-4 Auditor #2 P1 fix: responseBody must ALSO suppress the
+    // input echo. Upstream Sentry/logger captures the exception object;
+    // raw bodyText was a privacy leak even when the message was clean.
+    expect(caught?.responseBody).not.toContain("secret payload");
+    expect(caught?.responseBody).toContain("input echoed in error body");
   });
 
   it("throws VoyageError(rate_limit) on persistent 429, exposes Retry-After in ms", async () => {

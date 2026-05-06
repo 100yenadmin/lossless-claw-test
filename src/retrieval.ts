@@ -304,7 +304,12 @@ export class RetrievalEngine {
       truncated: false,
     };
 
-    await this.expandRecursive(input.summaryId, depth, includeMessages, tokenCap, result);
+    // Wave-4 Auditor #7 P1 fix: cycle-guard. The DAG is acyclic by
+    // invariant, but if a doctor bug or migration produces a cycle, the
+    // recursion would loop forever (default tokenCap is Infinity in some
+    // call paths). Track visited summaryIds and short-circuit re-entry.
+    const visited = new Set<string>();
+    await this.expandRecursive(input.summaryId, depth, includeMessages, tokenCap, result, visited);
 
     return result;
   }
@@ -315,6 +320,7 @@ export class RetrievalEngine {
     includeMessages: boolean,
     tokenCap: number,
     result: ExpandResult,
+    visited: Set<string>,
   ): Promise<void> {
     if (depth <= 0) {
       return;
@@ -322,6 +328,11 @@ export class RetrievalEngine {
     if (result.truncated) {
       return;
     }
+    // Cycle guard
+    if (visited.has(summaryId)) {
+      return;
+    }
+    visited.add(summaryId);
 
     const summary = await this.summaryStore.getSummary(summaryId);
     if (!summary) {
@@ -356,7 +367,7 @@ export class RetrievalEngine {
 
         // Recurse into children if depth allows
         if (depth > 1) {
-          await this.expandRecursive(child.summaryId, depth - 1, includeMessages, tokenCap, result);
+          await this.expandRecursive(child.summaryId, depth - 1, includeMessages, tokenCap, result, visited);
         }
       }
     } else if (summary.kind === "leaf" && includeMessages) {

@@ -80,6 +80,20 @@ export interface CoreferenceTickOptions {
   perTickLimit?: number;
   /** Caller-supplied identifier for this pass (audit / telemetry). */
   passId: string;
+  /**
+   * Wave-4 Auditor #12 P0-1 + #13 P1 fix: optional per-item heartbeat
+   * callback. Caller passes a function that extends the worker lock TTL
+   * (and returns whether we still hold it). Without this, a 50-item tick
+   * with 30s/item LLM calls = 25 min total, far past the 90s
+   * WORKER_LOCK_TTL_MS — by which time another autostart on a second
+   * gateway will GC + re-acquire and double-process the queue.
+   *
+   * Returns false → caller has lost the lock; runCoreferenceTick aborts
+   * the loop, commits whatever's already done, and returns. The caller
+   * (tickExtraction in worker-orchestrator.ts) MUST acknowledge this
+   * outcome via `result.lockLostMidTick` (added below).
+   */
+  onItemHeartbeat?: () => boolean;
 }
 
 export interface CoreferenceTickResult {
@@ -90,6 +104,13 @@ export interface CoreferenceTickResult {
   newMentions: number;
   /** Queue items where the extractor threw. */
   extractorFailures: number;
+  /**
+   * Wave-4 Auditor #12 P0-1 + #13 P1 fix: signals the heartbeat callback
+   * returned false partway through the tick. Caller (orchestrator) MUST
+   * surface this so the autostart can adjust pacing — otherwise next tick
+   * will repeat from a stale spot.
+   */
+  lockLostMidTick?: boolean;
   /** Per-queue-item details for diagnostics. */
   perItem: Array<{
     queueId: string;
@@ -128,25 +149,45 @@ export async function runCoreferenceTick(
     perItem: [],
   };
 
-  // 1. Pull queued items (kind='entity') ordered by queued_at ASC
+  // 1. Pull queued items (kind='entity') ordered by queued_at ASC.
+  //
+  // Wave-4 Auditor #12 P1-1 fix: dead-letter the queue rows that have
+  // failed too many times. The schema has `attempts` + index for
+  // `attempts >= 5` (migration.ts:1322-1335) but neither was being used.
+  // Without this gate, an extractor that keeps throwing on the same
+  // pathological row burns the per-tick budget forever — and Wave-4
+  // Auditor #4 noted the same rows pile up under Voyage outages.
+  const MAX_ATTEMPTS = 5;
   const queueItems = db
     .prepare(
-      `SELECT q.queue_id, q.leaf_id, s.content, s.session_key
+      `SELECT q.queue_id, q.leaf_id, q.attempts, s.content, s.session_key
          FROM lcm_extraction_queue q
          JOIN summaries s ON s.summary_id = q.leaf_id
          WHERE q.kind = 'entity' AND q.completed_at IS NULL
+           AND q.attempts < ?
            AND s.suppressed_at IS NULL
          ORDER BY q.queued_at ASC
          LIMIT ?`,
     )
-    .all(perTickLimit) as Array<{
+    .all(MAX_ATTEMPTS, perTickLimit) as Array<{
     queue_id: string;
     leaf_id: string;
+    attempts: number;
     content: string;
     session_key: string;
   }>;
 
   for (const item of queueItems) {
+    // Wave-4 Auditor #12 P0-1: heartbeat at the start of each item.
+    // If lock-loss detected, abort the loop early and surface the signal.
+    if (opts.onItemHeartbeat) {
+      const stillHeld = opts.onItemHeartbeat();
+      if (!stillHeld) {
+        result.lockLostMidTick = true;
+        break;
+      }
+    }
+
     const itemDetail: CoreferenceTickResult["perItem"][number] = {
       queueId: item.queue_id,
       leafId: item.leaf_id,
@@ -161,10 +202,25 @@ export async function runCoreferenceTick(
         content: item.content,
       });
     } catch (e: unknown) {
-      itemDetail.error = e instanceof Error ? e.message : String(e);
+      const errMsg = e instanceof Error ? e.message : String(e);
+      itemDetail.error = errMsg;
       result.extractorFailures++;
       result.perItem.push(itemDetail);
-      continue; // don't mark queue row processed — next tick will retry
+      // Wave-4 Auditor #12 P1-1 fix: bump attempts + record last_error so
+      // the dead-letter gate (attempts < MAX_ATTEMPTS) actually fires
+      // after enough retries. Without this, the queue row attempts column
+      // stayed at 0 forever and the same poison row burned tick budgets.
+      try {
+        db.prepare(
+          `UPDATE lcm_extraction_queue
+             SET attempts = COALESCE(attempts, 0) + 1,
+                 last_error = ?
+             WHERE queue_id = ?`,
+        ).run(errMsg.slice(0, 500), item.queue_id);
+      } catch {
+        // best-effort; don't let this masking the original error
+      }
+      continue; // don't mark queue row processed — next tick will retry (until attempts >= MAX_ATTEMPTS)
     }
 
     let entityCountThisItem = 0;

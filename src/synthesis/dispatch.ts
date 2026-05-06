@@ -235,8 +235,15 @@ export async function dispatchSynthesis(
 
   // 3. Branch on tier
   if (tier === "yearly") {
+    // Wave-4 Auditor #5 P1 fix: hard-cap bestOfN to prevent unbounded
+    // cost. Yearly fires N parallel Opus-thinking candidates + 1 judge.
+    // Without a cap, a caller passing bestOfN=100 would spend ~$100+ per
+    // call on a clean DB. Realistic best-of-N is 3-5; cap at 5.
+    const HARD_CAP_BEST_OF_N = 5;
+    const requestedBestOfN = req.bestOfN ?? 3;
+    const cappedBestOfN = Math.max(1, Math.min(HARD_CAP_BEST_OF_N, requestedBestOfN));
     return await runBestOfNYearly(db, llmCall, req, primaryPrompt, model, {
-      bestOfN: req.bestOfN ?? 3,
+      bestOfN: cappedBestOfN,
       auditIds,
       addLatency: (ms) => (totalLatencyMs += ms),
       addCost: (c) => (totalCostCents += c ?? 0),
@@ -313,8 +320,19 @@ export async function dispatchSynthesis(
       // Wave-1 Auditor #3 finding #4: anchored at start-of-string only meant
       // any preamble ("Here is the fidelity report:\n\nOK: ...") false-
       // positive flagged. Allow `OK\b` at start-of-string OR start of any
-      // line so model preambles don't break clean syntheses.
-      hallucinationFlagged = !/(?:^|\n)\s*OK\b/i.test(verifyResult.output);
+      // line.
+      //
+      // Wave-4 Auditor #5 P0 fix: the Wave-2 relaxation over-corrected — a
+      // response with BOTH "UNSUPPORTED: claim X" AND a stray "OK on the
+      // rest" matched the regex and CLEARED the hallucination flag. The
+      // verify pass is meant to FLAG hallucinations; this regression let
+      // hallucinated monthlies land in the cache as 'ready'. Tighten:
+      // require absence of UNSUPPORTED / HALLUCINATION markers AS WELL AS
+      // presence of OK\b. Either marker present → flagged.
+      const hasNegativeMarker =
+        /(?:^|\n)\s*(?:UNSUPPORTED|HALLUCINATION)\s*:/i.test(verifyResult.output);
+      const hasOkMarker = /(?:^|\n)\s*OK\b/i.test(verifyResult.output);
+      hallucinationFlagged = hasNegativeMarker || !hasOkMarker;
     }
     // If no verify prompt registered, skip silently — caller can decide
     // to enforce its presence via /lcm health.
@@ -644,7 +662,14 @@ function parseJudgeOutput(output: string, n: number): number {
 }
 
 function pickModel(req: SynthesizeRequest, primaryPrompt: PromptRecord): string {
-  if (req.modelOverride && req.forceModel) return req.modelOverride;
+  // Wave-4 Auditor #5 P1 fix: forceModel without modelOverride was
+  // silently no-op (fell through to prompt's modelRecommendation).
+  // Now: forceModel without modelOverride forces the tier default,
+  // so callers can guarantee "default model regardless of prompt
+  // recommendation."
+  if (req.forceModel) {
+    return req.modelOverride ?? DEFAULT_MODEL_BY_TIER[req.tier];
+  }
   if (primaryPrompt.modelRecommendation) return primaryPrompt.modelRecommendation;
   return req.modelOverride ?? DEFAULT_MODEL_BY_TIER[req.tier];
 }

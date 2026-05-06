@@ -297,12 +297,53 @@ export function createLcmDescribeTool(input: {
           | "capped"
           | "skipped-non-summary"
           | undefined;
-        if (expandChildren) {
-          if (s.childIds.length === 0) {
+        // Wave-4 Auditor #9 P1 fix: when delegated-grant budget is
+        // exhausted (resolvedTokenCap === 0), refuse to expand AT ALL
+        // instead of just printing a warning. Previous behavior emitted
+        // "expansion is blocked" then silently expanded anyway —
+        // misleading, and can cost the grant beyond its budget.
+        const budgetExhausted =
+          resolvedTokenCap === 0 && typeof delegatedRemainingBudget === "number";
+
+        if (expandChildren && budgetExhausted) {
+          expandChildrenStatus = "skipped-non-summary"; // reuse status, but message is clear
+          lines.push("");
+          lines.push(
+            `expanded children: SKIPPED — delegated grant has 0 tokens remaining; expansion blocked. Re-issue the grant via lcm_expand_query with a higher remainingTokens to unblock.`,
+          );
+        } else if (expandChildren) {
+          // Wave-4 Auditor #9 P1 fix: `s.childIds` is already
+          // suppression-filtered upstream (getSummaryChildren defaults
+          // to includeSuppressed=false). When all children are
+          // suppressed, childIds.length === 0 — but that's
+          // indistinguishable from "no children at all". Re-query the
+          // RAW count via SQL to detect the all-suppressed case
+          // accurately. Cheap (single COUNT query).
+          let rawChildCount: number;
+          try {
+            const dbForCount = lcm.getDb();
+            const countRow = dbForCount
+              .prepare(
+                `SELECT COUNT(*) AS n FROM summary_parents
+                   WHERE parent_summary_id = ?`,
+              )
+              .get(id) as { n?: number } | undefined;
+            rawChildCount = countRow?.n ?? 0;
+          } catch {
+            rawChildCount = s.childIds.length;
+          }
+          if (s.childIds.length === 0 && rawChildCount === 0) {
             expandChildrenStatus = "no-children";
             lines.push("");
             lines.push(
               `expanded children: 0 (this node has no children — it is a terminal in the DAG; nothing to drill into)`,
+            );
+          } else if (s.childIds.length === 0 && rawChildCount > 0) {
+            // All children suppressed
+            expandChildrenStatus = "all-suppressed";
+            lines.push("");
+            lines.push(
+              `expanded children: 0/${rawChildCount} (this node has ${rawChildCount} children but ALL are suppressed — they exist in the DAG but have been removed from the agent surface)`,
             );
           } else {
             const requestedLimit =

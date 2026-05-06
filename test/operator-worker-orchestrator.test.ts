@@ -146,21 +146,29 @@ describe("worker-orchestrator — forceReleaseLock", () => {
 });
 
 describe("worker-orchestrator — heartbeatAllHeldLocks", () => {
-  it("refreshes only locks whose worker_id matches the supplied map", () => {
+  it("refreshes only locks whose worker_id matches the supplied map (per-kind status surfaced)", () => {
     const db = setupDb();
     acquireLock(db, "embedding-backfill", { workerId: "wA" });
     acquireLock(db, "extraction", { workerId: "wB" });
-    const refreshed = heartbeatAllHeldLocks(db, {
+    // Wave-4 Auditor #13 P1: returns {refreshed, perKind} so callers can
+    // distinguish "we never held it" from "we lost it" per kind.
+    const result = heartbeatAllHeldLocks(db, {
       "embedding-backfill": "wA",
       "extraction": "wRONG", // mismatched id — should NOT refresh
     });
-    expect(refreshed).toBe(1);
+    expect(result.refreshed).toBe(1);
+    expect(result.perKind["embedding-backfill"]).toBe("ok");
+    expect(result.perKind["extraction"]).toBe("lost");
     db.close();
   });
 
-  it("returns 0 when no kinds match", () => {
+  it("returns refreshed=0 + skipped per-kind when no workerIds supplied", () => {
     const db = setupDb();
-    expect(heartbeatAllHeldLocks(db, {})).toBe(0);
+    const result = heartbeatAllHeldLocks(db, {});
+    expect(result.refreshed).toBe(0);
+    // Both kinds should report "skipped"
+    expect(result.perKind["embedding-backfill"]).toBe("skipped");
+    expect(result.perKind["extraction"]).toBe("skipped");
     db.close();
   });
 });

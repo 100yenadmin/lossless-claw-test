@@ -32,6 +32,7 @@ import {
   vec0Version,
 } from "../embeddings/store.js";
 import { countPendingDocs } from "../embeddings/backfill.js";
+import { MAX_TOKENS_PER_EMBED_DOC } from "../voyage/client.js";
 import { listActivePrompts } from "../synthesis/prompt-registry.js";
 
 export interface ActiveEmbeddingProfile {
@@ -84,6 +85,15 @@ export interface SynthesisHealth {
   distinctMemoryTypeCount: number;
   /** Synthesis runs in lcm_synthesis_audit within the last 7 days. */
   recentSynthesisRuns7d: number;
+  /**
+   * Wave-4 Auditor #15 P1 fix: total row count + breakdown so operators
+   * can see whether the GC (orphan started >1h, completed/failed >30d)
+   * is actually keeping the table bounded. Pre-fix the 7-day window
+   * could read 0 while the table held millions of stale rows.
+   */
+  totalAuditRows: number;
+  startedRowsOlderThan1h: number;
+  completedOrFailedOlderThan30d: number;
 }
 
 export interface EvalHealth {
@@ -174,12 +184,16 @@ function getEmbeddingsHealth(db: DatabaseSync): EmbeddingsHealth {
   let overCapPending = 0;
   if (activeProfile) {
     try {
+      // Wave-4 Auditor #15 P1 fix: hardcoded 30000 was the pre-Wave-1
+      // value; Wave-1 dropped MAX_TOKENS_PER_EMBED_DOC to 27000 to
+      // absorb Voyage tokenizer inflation. Health was silently
+      // misreporting "over-cap" leaves under the new constant.
       const row = db
         .prepare(
           `SELECT COUNT(*) AS n FROM summaries s
              WHERE s.kind = 'leaf'
                AND s.suppressed_at IS NULL
-               AND s.token_count > 30000
+               AND s.token_count > ?
                AND NOT EXISTS (
                  SELECT 1 FROM lcm_embedding_meta m
                    WHERE m.embedded_id = s.summary_id
@@ -188,7 +202,7 @@ function getEmbeddingsHealth(db: DatabaseSync): EmbeddingsHealth {
                      AND m.archived = 0
                )`,
         )
-        .get(activeProfile.modelName) as { n?: number } | undefined;
+        .get(MAX_TOKENS_PER_EMBED_DOC, activeProfile.modelName) as { n?: number } | undefined;
       overCapPending = row?.n ?? 0;
     } catch {
       overCapPending = 0;
@@ -268,21 +282,39 @@ function getSynthesisHealth(db: DatabaseSync): SynthesisHealth {
   for (const p of activePrompts) distinctMemoryTypes.add(p.memoryType);
 
   let recentRuns = 0;
+  let totalAuditRows = 0;
+  let startedRowsOlderThan1h = 0;
+  let completedOrFailedOlderThan30d = 0;
   try {
     const row = db
       .prepare(
-        `SELECT COUNT(*) AS n FROM lcm_synthesis_audit
-           WHERE ran_at >= datetime('now', '-7 days')`,
+        `SELECT
+           COUNT(*) AS total,
+           SUM(CASE WHEN ran_at >= datetime('now', '-7 days') THEN 1 ELSE 0 END) AS recent,
+           SUM(CASE WHEN status = 'started' AND ran_at < datetime('now', '-1 hour') THEN 1 ELSE 0 END) AS stale_started,
+           SUM(CASE WHEN status IN ('completed', 'failed') AND ran_at < datetime('now', '-30 days') THEN 1 ELSE 0 END) AS stale_done
+         FROM lcm_synthesis_audit`,
       )
-      .get() as { n?: number } | undefined;
-    recentRuns = row?.n ?? 0;
+      .get() as {
+      total?: number;
+      recent?: number;
+      stale_started?: number;
+      stale_done?: number;
+    } | undefined;
+    totalAuditRows = row?.total ?? 0;
+    recentRuns = row?.recent ?? 0;
+    startedRowsOlderThan1h = row?.stale_started ?? 0;
+    completedOrFailedOlderThan30d = row?.stale_done ?? 0;
   } catch {
-    recentRuns = 0;
+    // Table may not exist yet (fresh DB before any synthesis); leave at 0
   }
   return {
     activePromptCount: activePrompts.length,
     distinctMemoryTypeCount: distinctMemoryTypes.size,
     recentSynthesisRuns7d: recentRuns,
+    totalAuditRows,
+    startedRowsOlderThan1h,
+    completedOrFailedOlderThan30d,
   };
 }
 

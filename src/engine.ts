@@ -6014,31 +6014,46 @@ export class LcmContextEngine implements ContextEngine {
       stored = rawPayloadIntercepted.stored;
     }
 
-    // Determine next sequence number
-    const maxSeq = await this.conversationStore.getMaxSeq(conversationId);
-    const seq = maxSeq + 1;
+    // Wave-4 Auditor #18 P0 fix: wrap the three-write ingest path in a
+    // single SQLite transaction. Previously these ran as separate ops:
+    //   1. getMaxSeq + createMessage
+    //   2. createMessageParts
+    //   3. appendContextMessage
+    // Failure modes if any one threw mid-sequence:
+    //   - createMessageParts throws after createMessage → orphan message
+    //     row with no parts → assembler emits malformed turn.
+    //   - appendContextMessage throws after the first two → message
+    //     persisted but invisible to assembler → permanent context gap.
+    //   - Concurrent ingest race: two callers both read seq=N, both INSERT
+    //     seq=N+1 → UNIQUE conflict, second caller's exception bubbles up
+    //     after partial writes were already committed.
+    // BEGIN IMMEDIATE locks SQLite for write so seq computation + message
+    // INSERT happen atomically; any throw rolls back the whole sequence.
+    return await this.conversationStore.withTransaction(async () => {
+      const maxSeq = await this.conversationStore.getMaxSeq(conversationId);
+      const seq = maxSeq + 1;
 
-    // Persist the message
-    const msgRecord = await this.conversationStore.createMessage({
-      conversationId,
-      seq,
-      role: stored.role,
-      content: stored.content,
-      tokenCount: stored.tokenCount,
+      const msgRecord = await this.conversationStore.createMessage({
+        conversationId,
+        seq,
+        role: stored.role,
+        content: stored.content,
+        tokenCount: stored.tokenCount,
+      });
+      await this.conversationStore.createMessageParts(
+        msgRecord.messageId,
+        buildMessageParts({
+          sessionId,
+          message: messageForParts,
+          fallbackContent: stored.content,
+        }),
+      );
+
+      // Append to context items so assembler can see it
+      await this.summaryStore.appendContextMessage(conversationId, msgRecord.messageId);
+
+      return { ingested: true };
     });
-    await this.conversationStore.createMessageParts(
-      msgRecord.messageId,
-      buildMessageParts({
-        sessionId,
-        message: messageForParts,
-        fallbackContent: stored.content,
-      }),
-    );
-
-    // Append to context items so assembler can see it
-    await this.summaryStore.appendContextMessage(conversationId, msgRecord.messageId);
-
-    return { ingested: true };
   }
 
   async ingest(params: {

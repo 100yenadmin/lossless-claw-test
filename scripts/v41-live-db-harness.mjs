@@ -70,10 +70,22 @@ async function main() {
   }
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
   const DST = join(DST_DIR, `lcm-harness-${ts}.db`);
-  log(`Copying ${SRC} → ${DST}`);
-  copyFileSync(SRC, DST);
+  // Wave-4 Auditor #19 P0 fix: copyFileSync against a live WAL-mode DB
+  // produces a malformed snapshot when the gateway is mid-checkpoint.
+  // The preflight script (scripts/v41-agent-harness-preflight.mjs) was
+  // updated to VACUUM INTO in Wave-1 reviewer-gate but this older harness
+  // wasn't migrated. Use VACUUM INTO here too — atomic snapshot, can't
+  // race with WAL writes. Slower (~4-8 min for 2.6GB) but correct.
+  log(`Creating atomic VACUUM INTO snapshot ${SRC} → ${DST} (~few minutes for large DBs)...`);
+  const { DatabaseSync: DbForSnap } = await import("node:sqlite");
+  const snapDb = new DbForSnap(SRC, { readOnly: true });
+  try {
+    snapDb.exec(`VACUUM INTO '${DST.replace(/'/g, "''")}'`);
+  } finally {
+    snapDb.close();
+  }
   const sizeMB = (statSync(DST).size / 1024 / 1024).toFixed(1);
-  log(`Copy done: ${sizeMB} MB`);
+  log(`Snapshot done: ${sizeMB} MB`);
 
   // ── Imports (dynamic so missing modules surface here, not on require) ─
   const { runLcmMigrations } = await import(`${process.cwd()}/src/db/migration.ts`);

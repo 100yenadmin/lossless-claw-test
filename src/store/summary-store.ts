@@ -771,6 +771,13 @@ export class SummaryStore {
   }
 
   async getSummarySubtree(summaryId: string): Promise<SummarySubtreeNodeRecord[]> {
+    // Wave-4 Auditor #7 P1 fix: cap recursion to prevent runaway memory
+    // on pathological subtrees (deep condensation chains, doctor-recovered
+    // DBs with cycles, stress-test artifacts). 10K nodes is ~10× the
+    // largest realistic synthesis tree in Eva's actual DB; beyond that
+    // we truncate and the caller (lcm_describe) sees the truncation in
+    // the manifest length vs claimed descendant_count.
+    const SUBTREE_HARD_CAP = 10_000;
     const rows = this.db
       .prepare(
         `WITH RECURSIVE subtree(summary_id, parent_summary_id, depth_from_root, path) AS (
@@ -812,9 +819,10 @@ export class SummaryStore {
          FROM subtree
          JOIN summaries s ON s.summary_id = subtree.summary_id
          WHERE s.suppressed_at IS NULL
-         ORDER BY subtree.depth_from_root ASC, subtree.path ASC, s.created_at ASC`,
+         ORDER BY subtree.depth_from_root ASC, subtree.path ASC, s.created_at ASC
+         LIMIT ?`,
       )
-      .all(summaryId) as unknown as SummarySubtreeRow[];
+      .all(summaryId, SUBTREE_HARD_CAP) as unknown as SummarySubtreeRow[];
 
     const seen = new Set<string>();
     const output: SummarySubtreeNodeRecord[] = [];
