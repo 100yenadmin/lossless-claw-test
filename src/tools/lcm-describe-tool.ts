@@ -46,6 +46,32 @@ const LcmDescribeSchema = Type.Object({
       minimum: 1,
     }),
   ),
+  expandChildren: Type.Optional(
+    Type.Boolean({
+      description:
+        "When true (and target is a sum_xxx), include the first-hop child summaries' full content inline (capped at expandChildrenLimit, default 5). For deeper / wider expansion use the sub-agent lcm_expand_query path. Ignored for file_xxx targets.",
+    }),
+  ),
+  expandChildrenLimit: Type.Optional(
+    Type.Number({
+      description: "Max child summaries to inline when expandChildren=true (default 5, max 20).",
+      minimum: 1,
+      maximum: 20,
+    }),
+  ),
+  expandMessages: Type.Optional(
+    Type.Boolean({
+      description:
+        "When true (and target is a sum_xxx leaf), include the first-hop source messages' full verbatim content inline (capped at expandMessagesLimit, default 5). Ignored for condensed summaries (no direct messages) and file_xxx targets. Suppressed messages are filtered out.",
+    }),
+  ),
+  expandMessagesLimit: Type.Optional(
+    Type.Number({
+      description: "Max source messages to inline when expandMessages=true (default 5, max 20).",
+      minimum: 1,
+      maximum: 20,
+    }),
+  ),
 });
 
 function normalizeRequestedTokenCap(value: unknown): number | undefined {
@@ -201,6 +227,125 @@ export function createLcmDescribeTool(input: {
         lines.push("content");
         lines.push(s.content);
 
+        // Phase 2.9 — one-hop expansion flags. Lets main agents see source
+        // children + messages WITHOUT delegating through lcm_expand_query
+        // (which paraphrases via sub-agent LLM call). The lcm_expand sub-
+        // agent gate stays intact for deeper traversal; this is the
+        // "describe is safe" mental model extension Agent 2 recommended.
+        // Hard-capped (default 5, max 20) to prevent runaway context loads.
+        const expandChildren = p.expandChildren === true;
+        const expandMessages = p.expandMessages === true;
+        const expandedChildren: Array<{
+          summaryId: string;
+          kind: string;
+          tokenCount: number;
+          createdAt: string;
+          content: string;
+        }> = [];
+        const expandedMessages: Array<{
+          messageId: number;
+          role: string;
+          tokenCount: number;
+          createdAt: string;
+          content: string;
+        }> = [];
+
+        if (expandChildren && s.childIds.length > 0) {
+          const requestedLimit =
+            typeof p.expandChildrenLimit === "number" && Number.isFinite(p.expandChildrenLimit)
+              ? Math.max(1, Math.min(20, Math.trunc(p.expandChildrenLimit)))
+              : 5;
+          const ids = s.childIds.slice(0, requestedLimit);
+          const placeholders = ids.map(() => "?").join(",");
+          const db = lcm.getDb();
+          const rows = db
+            .prepare(
+              `SELECT summary_id, kind, content, token_count, created_at
+                 FROM summaries
+                 WHERE summary_id IN (${placeholders})
+                   AND suppressed_at IS NULL
+                 ORDER BY created_at ASC`,
+            )
+            .all(...ids) as Array<{
+            summary_id: string;
+            kind: string;
+            content: string;
+            token_count: number;
+            created_at: string;
+          }>;
+          for (const r of rows) {
+            expandedChildren.push({
+              summaryId: r.summary_id,
+              kind: r.kind,
+              tokenCount: r.token_count,
+              createdAt: r.created_at,
+              content: r.content,
+            });
+          }
+          if (expandedChildren.length > 0) {
+            lines.push("");
+            lines.push(
+              `expanded children (${expandedChildren.length}/${s.childIds.length}; capped at limit=${requestedLimit}, suppressed filtered)`,
+            );
+            for (const child of expandedChildren) {
+              lines.push("");
+              lines.push(
+                `### child ${child.summaryId} (${child.kind}, ${child.tokenCount} tokens, ${formatDisplayTime(child.createdAt, timezone)})`,
+              );
+              lines.push("");
+              lines.push(child.content);
+            }
+          }
+        }
+
+        if (expandMessages && s.kind === "leaf") {
+          const requestedLimit =
+            typeof p.expandMessagesLimit === "number" && Number.isFinite(p.expandMessagesLimit)
+              ? Math.max(1, Math.min(20, Math.trunc(p.expandMessagesLimit)))
+              : 5;
+          const db = lcm.getDb();
+          const rows = db
+            .prepare(
+              `SELECT m.message_id, m.role, m.content, m.token_count, m.created_at
+                 FROM summary_messages sm
+                 JOIN messages m ON m.message_id = sm.message_id
+                 WHERE sm.summary_id = ?
+                   AND m.suppressed_at IS NULL
+                 ORDER BY m.created_at ASC
+                 LIMIT ?`,
+            )
+            .all(id, requestedLimit) as Array<{
+            message_id: number;
+            role: string;
+            content: string;
+            token_count: number;
+            created_at: string;
+          }>;
+          for (const r of rows) {
+            expandedMessages.push({
+              messageId: r.message_id,
+              role: r.role,
+              tokenCount: r.token_count,
+              createdAt: r.created_at,
+              content: r.content,
+            });
+          }
+          if (expandedMessages.length > 0) {
+            lines.push("");
+            lines.push(
+              `expanded source messages (${expandedMessages.length}; capped at limit=${requestedLimit}, suppressed filtered)`,
+            );
+            for (const msg of expandedMessages) {
+              lines.push("");
+              lines.push(
+                `### msg#${msg.messageId} (${msg.role}, ${msg.tokenCount} tokens, ${formatDisplayTime(msg.createdAt, timezone)})`,
+              );
+              lines.push("");
+              lines.push(msg.content);
+            }
+          }
+        }
+
         return {
           content: [{ type: "text", text: lines.join("\n") }],
           details: {
@@ -214,6 +359,10 @@ export function createLcmDescribeTool(input: {
                     ? "delegated_grant_remaining"
                     : "config_default",
               nodes: manifestNodes,
+            },
+            expansion: {
+              children: expandedChildren,
+              messages: expandedMessages,
             },
           },
         };

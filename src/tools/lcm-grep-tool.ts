@@ -10,6 +10,10 @@ import {
   type FtsHit,
   type HybridHit,
 } from "../embeddings/hybrid-search.js";
+import {
+  runSemanticSearch,
+  SemanticSearchUnavailableError,
+} from "../embeddings/semantic-search.js";
 import { VoyageError } from "../voyage/client.js";
 
 const MAX_RESULT_CHARS = 40_000; // ~10k tokens
@@ -36,8 +40,8 @@ const LcmGrepSchema = Type.Object({
   mode: Type.Optional(
     Type.String({
       description:
-        'Search mode: "regex" for regular expression matching, "full_text" for text search, or "hybrid" to blend FTS + semantic vector search via Voyage rerank. "hybrid" returns hits scoped to summaries only (semantic doesn\'t cover raw messages); use it when keyword matches alone are too narrow. Default: "regex".',
-      enum: ["regex", "full_text", "hybrid"],
+        'Search mode: "regex" for regular expression matching, "full_text" for text search, "hybrid" to blend FTS + semantic vector search via Voyage rerank, "semantic" for pure-vector recall (no FTS, no rerank — cheapest semantic mode), or "verbatim" to return FULL untruncated content of matched messages (for citation / quote-back use cases where the agent needs literal wording). "hybrid" and "semantic" return hits scoped to summaries only (semantic doesn\'t cover raw messages); "verbatim" returns full message rows and is hard-capped at 20 results. Default: "regex".',
+      enum: ["regex", "full_text", "hybrid", "semantic", "verbatim"],
     }),
   ),
   scope: Type.Optional(
@@ -121,9 +125,14 @@ export function createLcmGrepTool(input: {
 
       const p = params as Record<string, unknown>;
       const pattern = (p.pattern as string).trim();
-      const mode = (p.mode as "regex" | "full_text" | "hybrid") ?? "regex";
+      const mode =
+        (p.mode as "regex" | "full_text" | "hybrid" | "semantic" | "verbatim") ?? "regex";
       const scope = (p.scope as "messages" | "summaries" | "both") ?? "both";
-      const limit = typeof p.limit === "number" ? Math.trunc(p.limit) : 50;
+      // verbatim mode is hard-capped to 20 (full message rows can be large)
+      const VERBATIM_HARD_CAP = 20;
+      const requestedLimit = typeof p.limit === "number" ? Math.trunc(p.limit) : 50;
+      const limit =
+        mode === "verbatim" ? Math.min(requestedLimit, VERBATIM_HARD_CAP) : requestedLimit;
       const requestedSort = (p.sort as "recency" | "relevance" | "hybrid") ?? "recency";
       const effectiveSort = mode === "full_text" ? requestedSort : "recency";
       let since: Date | undefined;
@@ -157,6 +166,30 @@ export function createLcmGrepTool(input: {
 
       if (mode === "hybrid") {
         return runHybridLcmGrep({
+          lcm,
+          pattern,
+          conversationScope,
+          since,
+          before,
+          limit,
+          timezone,
+        });
+      }
+
+      if (mode === "semantic") {
+        return runSemanticLcmGrep({
+          lcm,
+          pattern,
+          conversationScope,
+          since,
+          before,
+          limit,
+          timezone,
+        });
+      }
+
+      if (mode === "verbatim") {
+        return runVerbatimLcmGrep({
           lcm,
           pattern,
           conversationScope,
@@ -506,4 +539,274 @@ function hitProvenanceTag(hit: HybridHit): string {
   if (hit.fromFts && hit.fromSemantic) return "[from FTS+semantic]";
   if (hit.fromFts) return "[from FTS only]";
   return "[from semantic only]";
+}
+
+/**
+ * Semantic-only lcm_grep path. Pure embedding KNN via runSemanticSearch
+ * (no rerank — that's the cost-profile distinction from mode='hybrid').
+ *
+ * Use case: "find me everything similar to X across all of time" without
+ * paying the rerank cost. Hits are summaries only (semantic doesn't cover
+ * raw messages — embeddedKinds defaults to ['summary']).
+ */
+async function runSemanticLcmGrep(input: HybridGrepInput) {
+  const { lcm, pattern, conversationScope, since, before, limit, timezone } = input;
+  const db = lcm.getDb();
+
+  let semResult;
+  try {
+    const sessionKeys = conversationScope.allConversations
+      ? undefined
+      : conversationScope.conversationIds && conversationScope.conversationIds.length > 0
+        ? deriveSessionKeysFromConversationIds(db, conversationScope.conversationIds)
+        : conversationScope.conversationId != null
+          ? deriveSessionKeysFromConversationIds(db, [conversationScope.conversationId])
+          : undefined;
+    semResult = await runSemanticSearch(db, {
+      query: pattern,
+      sessionKeys,
+      k: limit,
+      since,
+      before,
+      embeddedKinds: ["summary"],
+      excludeSuppressed: true,
+    });
+  } catch (e: unknown) {
+    if (e instanceof SemanticSearchUnavailableError) {
+      return jsonResult({
+        error:
+          "Semantic search unavailable: vec0 extension not loaded or no embedding profile registered. Use mode='regex' or mode='full_text' instead.",
+      });
+    }
+    if (e instanceof VoyageError && e.kind === "auth") {
+      return jsonResult({
+        error:
+          "Voyage API key is missing or invalid (set VOYAGE_API_KEY) — semantic mode requires it. Use mode='regex' or mode='full_text' instead.",
+      });
+    }
+    throw e;
+  }
+
+  const lines: string[] = [];
+  lines.push("## LCM Grep Results");
+  lines.push(`**Pattern:** \`${pattern}\``);
+  lines.push(`**Mode:** semantic | **Scope:** summaries (semantic doesn't index raw messages)`);
+  if (conversationScope.allConversations) {
+    lines.push("**Conversation scope:** all conversations");
+  } else if (conversationScope.conversationId != null) {
+    lines.push(`**Conversation scope:** ${conversationScope.conversationId}`);
+  }
+  if (since || before) {
+    lines.push(
+      `**Time filter:** ${since ? `since ${formatDisplayTime(since, timezone)}` : "since -∞"} | ${
+        before ? `before ${formatDisplayTime(before, timezone)}` : "before +∞"
+      }`,
+    );
+  }
+  lines.push(`**Total matches:** ${semResult.hits.length}`);
+  lines.push(`**Voyage tokens consumed:** ${semResult.voyageTokensConsumed}`);
+  lines.push(`**Model:** ${semResult.modelName ?? "unknown"}`);
+  lines.push("");
+
+  if (semResult.hits.length === 0) {
+    lines.push(
+      "_No semantic matches. Try mode='hybrid' for rerank-boosted recall, or mode='regex'/'full_text' for keyword-only._",
+    );
+  } else {
+    lines.push("### Hits (ranked by semantic distance — lower = more similar)");
+    lines.push("");
+    let currentChars = lines.join("\n").length;
+    for (const hit of semResult.hits) {
+      const snippet = truncateSnippet(hit.content);
+      const line = `- [${hit.summaryId}] (${hit.kind}, dist=${hit.distance.toFixed(3)}, ${formatDisplayTime(hit.createdAt, timezone)}): ${snippet}`;
+      if (currentChars + line.length > MAX_RESULT_CHARS) {
+        lines.push("*(truncated — more results available)*");
+        break;
+      }
+      lines.push(line);
+      currentChars += line.length;
+    }
+  }
+
+  return {
+    content: [{ type: "text" as const, text: lines.join("\n") }],
+    details: {
+      mode: "semantic",
+      pattern,
+      totalMatches: semResult.hits.length,
+      voyageTokensConsumed: semResult.voyageTokensConsumed,
+      modelName: semResult.modelName,
+      hits: semResult.hits.map((h) => ({
+        summaryId: h.summaryId,
+        sessionKey: h.sessionKey,
+        kind: h.kind,
+        distance: h.distance,
+        createdAt: h.createdAt,
+      })),
+    },
+  };
+}
+
+/**
+ * Verbatim lcm_grep path. Returns FULL untruncated message content for
+ * matches — for citation, quote-back, and "show me what was actually said"
+ * use cases where the literal wording matters and snippets aren't enough.
+ *
+ * Implementation: FTS5 over messages + return full m.content (not snippet).
+ * Hard-capped at 20 results because full message rows can be large.
+ * Filters suppressed_at IS NULL (per §10 invariant). Scope is messages only
+ * (verbatim is a raw-message concept; summaries are by definition paraphrased).
+ */
+async function runVerbatimLcmGrep(input: HybridGrepInput) {
+  const { lcm, pattern, conversationScope, since, before, limit, timezone } = input;
+  const db = lcm.getDb();
+
+  // Build the SQL query. Mirror conversation-store.searchFullText shape but
+  // return full m.content instead of snippet.
+  const filters: string[] = ["m.suppressed_at IS NULL"];
+  const binds: (string | number)[] = [];
+
+  // FTS5 join: messages_fts virtual table indexed on content
+  // (we use FTS5 here since it's faster than LIKE for natural-language patterns)
+  filters.push("messages_fts MATCH ?");
+  binds.push(pattern);
+
+  if (conversationScope.allConversations) {
+    // no conversation filter
+  } else if (
+    conversationScope.conversationIds &&
+    conversationScope.conversationIds.length > 0
+  ) {
+    const placeholders = conversationScope.conversationIds.map(() => "?").join(",");
+    filters.push(`m.conversation_id IN (${placeholders})`);
+    for (const id of conversationScope.conversationIds) binds.push(id);
+  } else if (conversationScope.conversationId != null) {
+    filters.push("m.conversation_id = ?");
+    binds.push(conversationScope.conversationId);
+  }
+
+  if (since) {
+    filters.push("datetime(m.created_at) >= datetime(?)");
+    binds.push(since.toISOString());
+  }
+  if (before) {
+    filters.push("datetime(m.created_at) < datetime(?)");
+    binds.push(before.toISOString());
+  }
+
+  // Best to detect FTS5 absence and fall back to LIKE
+  let rows: Array<{
+    message_id: number;
+    conversation_id: number;
+    role: string;
+    content: string;
+    token_count: number;
+    created_at: string;
+  }>;
+  try {
+    rows = db
+      .prepare(
+        `SELECT m.message_id, m.conversation_id, m.role, m.content, m.token_count, m.created_at
+           FROM messages m
+           JOIN messages_fts ON messages_fts.rowid = m.rowid
+           WHERE ${filters.join(" AND ")}
+           ORDER BY datetime(m.created_at) DESC
+           LIMIT ?`,
+      )
+      .all(...binds, limit) as Array<{
+      message_id: number;
+      conversation_id: number;
+      role: string;
+      content: string;
+      token_count: number;
+      created_at: string;
+    }>;
+  } catch (e: unknown) {
+    // FTS5 not available — fall back to LIKE on m.content
+    const fallbackFilters = filters.map((f) =>
+      f === "messages_fts MATCH ?" ? "m.content LIKE ?" : f,
+    );
+    const fallbackBinds = binds.map((b, i) =>
+      i === binds.findIndex((bb) => bb === pattern) ? `%${pattern}%` : b,
+    );
+    rows = db
+      .prepare(
+        `SELECT m.message_id, m.conversation_id, m.role, m.content, m.token_count, m.created_at
+           FROM messages m
+           WHERE ${fallbackFilters.join(" AND ")}
+           ORDER BY datetime(m.created_at) DESC
+           LIMIT ?`,
+      )
+      .all(...fallbackBinds, limit) as typeof rows;
+  }
+
+  const lines: string[] = [];
+  lines.push("## LCM Grep Results");
+  lines.push(`**Pattern:** \`${pattern}\``);
+  lines.push(`**Mode:** verbatim | **Scope:** messages | **Cap:** ${limit} (full message rows; hard limit 20)`);
+  if (conversationScope.allConversations) {
+    lines.push("**Conversation scope:** all conversations");
+  } else if (conversationScope.conversationId != null) {
+    lines.push(`**Conversation scope:** ${conversationScope.conversationId}`);
+  }
+  if (since || before) {
+    lines.push(
+      `**Time filter:** ${since ? `since ${formatDisplayTime(since, timezone)}` : "since -∞"} | ${
+        before ? `before ${formatDisplayTime(before, timezone)}` : "before +∞"
+      }`,
+    );
+  }
+  lines.push(`**Total matches:** ${rows.length}`);
+  lines.push("");
+
+  if (rows.length === 0) {
+    lines.push("_No verbatim matches in raw messages. Try mode='regex' or mode='full_text' for broader search._");
+  } else {
+    let currentChars = lines.join("\n").length;
+    for (const row of rows) {
+      const header = `### [msg#${row.message_id}] ${row.role} — ${formatDisplayTime(row.created_at, timezone)} (${row.token_count} tokens)`;
+      const block = `${header}\n\n${row.content}\n`;
+      if (currentChars + block.length > MAX_RESULT_CHARS) {
+        lines.push("*(truncated — increase limit or narrow time range to see more)*");
+        break;
+      }
+      lines.push(block);
+      currentChars += block.length;
+    }
+  }
+
+  return {
+    content: [{ type: "text" as const, text: lines.join("\n") }],
+    details: {
+      mode: "verbatim",
+      pattern,
+      totalMatches: rows.length,
+      hits: rows.map((r) => ({
+        messageId: r.message_id,
+        conversationId: r.conversation_id,
+        role: r.role,
+        content: r.content,
+        tokenCount: r.token_count,
+        createdAt: r.created_at,
+      })),
+    },
+  };
+}
+
+/**
+ * Look up session_keys for a list of conversation_ids. Used by semantic
+ * mode to scope KNN to the agent's session family.
+ */
+function deriveSessionKeysFromConversationIds(
+  db: import("node:sqlite").DatabaseSync,
+  conversationIds: number[],
+): string[] {
+  if (conversationIds.length === 0) return [];
+  const placeholders = conversationIds.map(() => "?").join(",");
+  const rows = db
+    .prepare(
+      `SELECT DISTINCT session_key FROM conversations WHERE conversation_id IN (${placeholders}) AND session_key IS NOT NULL`,
+    )
+    .all(...conversationIds) as Array<{ session_key: string }>;
+  return rows.map((r) => r.session_key);
 }

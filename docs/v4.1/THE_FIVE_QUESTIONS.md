@@ -58,7 +58,54 @@ Before adding any tool, capability, worker, or schema change to LCM, demonstrate
 
 Every PR that touches LCM must show how it affects each test case below. PRs that improve tests pass; PRs that regress them must justify the trade-off.
 
-> Note: this section is populated by `agent_3` (scenario-driven feature scoring) — see `/tmp/lossless-claw-upstream/docs/v4.1/FIRST_PRINCIPLES_PLAN.md` for the 25 concrete test queries (5 per type) and the tool × test-case scoring matrix.
+### Type A — Time-anchored (5/5 PRIMARY: lcm_synthesize_around)
+
+- **A1**: "What did we ship to PR #613 yesterday?"
+- **A2**: "What did Eva and I work on last Monday afternoon?"
+- **A3**: "Give me a recap of everything from the week of April 26-May 2."
+- **A4**: "What was happening around the time the rebase fix landed (commit `1081067476`)?"
+- **A5**: "Show me the work we did between the v2026.4.24 cut and the race-fix commit."
+
+### Type B — Topic-anchored (5/5 PRIMARY: lcm_grep --mode hybrid + lcm_semantic_recall)
+
+- **B1**: "Have we ever discussed worker_threads heartbeat isolation?"
+- **B2**: "What work has been done on hybrid search rerank?"
+- **B3**: "Have we hit a race condition like this empty-plan-body one before?"
+- **B4**: "What have we said about Voyage rate limiting?"
+- **B5**: "Did we ever debate whether to keep lcm_recent or replace it?"
+
+### Type C — Verbatim (5/5 PRIMARY: lcm_grep --mode verbatim, NEW)
+
+- **C1**: "What exactly did Eva say about why she rejected `lcm_recent`?"
+- **C2**: "Quote me the original wording of the decision to throw out rollups."
+- **C3**: "Show me Eva's exact words from the operator-VM customer escalation."
+- **C4**: "What was the literal error message we got from the backfill autostart pre-flight failure?"
+- **C5**: "Quote the original commit message for the empty-plan-body race fix (`1081067476`)."
+
+### Type D — Pattern-anchored (2/5 PRIMARY entity sub-cases; 3/5 fallback)
+
+PRIMARY (entity): `lcm_get_entity` + `lcm_search_entities`
+- **D2**: "What's the history of conversations with the operator-VM customer?" (entity)
+- **D4**: "Tell me about all the work I've done with Voyage." (entity)
+
+FALLBACK (theme/procedure sub-cases — preserved in draft PR #616 for future cycle):
+- **D1**: "What's the standard procedure for rebuilding the gateway?" (procedure → fallback via `lcm_grep --mode hybrid`)
+- **D3**: "What themes have dominated this month?" (theme → fallback via `lcm_synthesize_around` window=month)
+- **D5**: "What's the standard procedure when a pre-commit hook fails mid-amend?" (procedure → fallback via `lcm_grep --mode hybrid`)
+
+### Type E — Drilldown (5/5 PRIMARY: lcm_describe + lcm_expand_query)
+
+- **E1**: "Where did the +52.5pp recall claim come from? Show me the source."
+- **E2**: "This synthesized summary mentions a 'pivot from upstream/main' — show me the original conversation."
+- **E3**: "lcm_get_entity('Voyage') showed 47 mentions — drill into the most recent 5 to see context."
+- **E4**: "Show me the source leaves for this synthesis."
+- **E5**: "The yearly synthesis claims 'Eva approved the disable smarter-claw step' — find the source leaf."
+
+For Type E with main-agent access (no sub-agent delegation needed), use `lcm_describe` with the new `expandChildren=true` or `expandMessages=true` flags (one-hop, capped at 20). For deeper traversal, fall back to `lcm_expand_query` (which delegates to a sub-agent).
+
+### Coverage summary
+
+22/25 test cases have PRIMARY tool coverage. The 3 D-pattern theme/procedure sub-cases (D1, D3, D5) have adequate-fallback coverage. Themes consolidation worker + procedure mining worker are preserved in draft PR #616 for a focused future-cycle PR.
 
 ---
 

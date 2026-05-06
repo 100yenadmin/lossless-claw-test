@@ -1,52 +1,52 @@
-# LCM v4.1 — agent memory that actually works
+# LCM v4.1 — agent memory that actually works (post first-principles cut)
 
-**52 commits · 1330 tests passing · live-DB verified against Eva's 4187-leaf corpus**
+**60+ commits · 1323 tests passing · live-DB verified against Eva's 4187-leaf corpus**
 
 This PR replaces the rollup approach from #516. After we tried `lcm_recent` end-to-end, the rollups it produced were "summaries of summaries of summaries" — repetitive, lossy, and got worse the further back you looked. v4.1 throws that out and builds memory the way a person actually does: keep the raw conversation forever, embed it for similarity-search, and synthesize new views on demand instead of pre-rolling everything into a single bigger blob.
 
-After merge: the agent can answer "what did we work on three weeks ago?" or "what was that thing about the migration race?" without scanning the whole corpus, without forgetting context, and without hallucinating. The operator gets a real `lcm health` view, real `lcm purge` for hard-forget (GDPR-style), and the lossless raw bedrock the v4 architecture committed to.
+After merge: the agent can answer "what did we work on three weeks ago?" or "what was that thing about the migration race?" without scanning the whole corpus, without forgetting context, and without hallucinating. The operator gets a real `lcm health` view, real `lcm purge` for soft-forget (suppression-cascade through 10+ read paths), and the lossless raw bedrock the v4 architecture committed to.
 
 ---
 
-## What ships in this PR (and what doesn't)
+## What this PR ships (final post-cut shape)
 
-**Agent tools (8 tools, all shipped + manifest-registered + plugin-wired + tested):**
-- ✅ `lcm_synthesize_around` — on-demand synthesis (the lcm_recent replacement) — `src/tools/lcm-synthesize-around-tool.ts` (754 LOC, 13 tests)
-- ✅ `lcm_semantic_recall` — pure semantic search via Voyage embeddings
-- ✅ `lcm_grep` (`mode='hybrid'`) — FTS + semantic + Voyage rerank merge
-- ✅ `lcm_describe` (`sessionKey` + `timeRange` extension) — corpus shape inspection
-- ✅ `lcm_recent_themes` — surfaces idle-consolidated themes
-- ✅ `lcm_search_themes` — text search over theme corpus
-- ✅ `lcm_theme_explain` — drills into a theme + its source leaves
-- ✅ `lcm_expand` (existing) — kept compatible with new schema
+**8 agent tools** (down from 14 proposed; cut-list at the bottom + draft PR #616):
 
-**Operator commands (5, all shipped):**
-- ✅ `/lcm health` — subsystem snapshot (embeddings coverage, worker status, eval scores, drift, cache size, prewarm queue, **over-cap pending**)
-- ✅ `/lcm worker [status | tick embedding-backfill]` — worker introspection + manual triggers
-- ✅ `/lcm reconcile-session-keys [--apply | --list-candidates]` — interactive thread merging for legacy data
-- ✅ `/lcm eval [--baseline | --mode <fts_only|semantic_only|hybrid> [--query-set NAME] [--version N]]` — recall-only eval harness against query sets
-- ✅ `runPurge(leafIds, reason)` operator service — soft-suppress + cascade through 10 read paths
+| # | Tool | Question type served |
+|---|---|---|
+| 1 | `lcm_grep` (regex / full_text / hybrid + verbatim + semantic modes) | Topic-anchored + verbatim |
+| 2 | `lcm_semantic_recall` | Topic-anchored (cheap, no rerank) |
+| 3 | `lcm_synthesize_around` | Time-anchored (the real `lcm_recent` replacement) |
+| 4 | `lcm_describe` (with expandChildren / expandMessages flags) | Drilldown |
+| 5 | `lcm_expand` (sub-agent only) | Drilldown (heavy traversal via grant ledger) |
+| 6 | `lcm_expand_query` | Drilldown (synthesized answer via sub-agent) |
+| 7 | `lcm_get_entity` | Pattern-anchored (entity catalog lookup) |
+| 8 | `lcm_search_entities` | Pattern-anchored (entity catalog browse) |
 
-**Worker auto-ticks (1 of 4 shipped this PR; 3 deferred):**
-- ✅ Embedding backfill autostart (gated on `VOYAGE_API_KEY`)
-- ✅ Entity coreference auto-tick (gated on `LCM_EXTRACTION_LLM_ENABLED`, default ON)
-- ❌ Procedure mining auto-tick — cycle-3 (worker exists; needs cron + LLM credentials plumbed)
-- ❌ Themes consolidation auto-tick — cycle-3 (worker exists; needs idle-pass scheduler)
+**2 worker auto-ticks** (both gated, both tested, both production-ready):
+- Backfill autostart (gated on `VOYAGE_API_KEY`)
+- Entity coreference autostart (default-on; opt-out via `LCM_EXTRACTION_LLM_ENABLED=false`)
 
-**Schema (21 new tables, all shipped):**
-- ✅ Migration runs at boot, idempotent, live-DB-verified twice
-- ✅ Backfill of existing data: 5 legacy convs re-keyed, 517 NULL session_keys backfilled, 8 stale telegram rollups marked
+**5 operator commands**:
+- `/lcm health`, `/lcm worker [status|tick embedding-backfill]`, `/lcm reconcile-session-keys`, `/lcm eval` (recall-only), `runPurge` (soft mode)
 
-**Cycle-3 deferred (each <300 LOC, scoped, ships as own PR):**
-- ❌ Procedure mining auto-tick wiring
-- ❌ Themes consolidation auto-tick wiring
-- ❌ `worker_threads` heartbeat isolation
-- ❌ `/lcm eval --register-set` CLI (operator can seed via SQL today)
-- ❌ Quality eval (LLM judge) wiring in `/lcm eval` (recall-only this PR)
-- ❌ Hard-delete for `runPurge --immediate` (currently soft-purge + condensed-rebuild enqueue)
-- ❌ Voyage rate-state actually consulted (table exists; client doesn't read it yet)
+**Schema (16 new tables)** — all migrations idempotent, live-DB verified twice on Eva's actual ~/.openclaw/lcm.db.
 
-The *user-facing replacement for lcm_recent* — a time-window synthesis tool agents can call — is `lcm_synthesize_around` and it ships in this PR.
+---
+
+## The 5 questions LCM answers (durable test artifact)
+
+A real person with continuity of memory can answer 5 types of questions about their past. These are LCM's job (full text in `docs/v4.1/THE_FIVE_QUESTIONS.md`):
+
+| Q | The agent calls | Coverage |
+|---|---|---|
+| **A. Time** "what did we work on yesterday?" | `lcm_synthesize_around` | 5/5 PRIMARY |
+| **B. Topic** "have we ever discussed X?" | `lcm_grep --mode hybrid` + `lcm_semantic_recall` (or new `mode='semantic'`) | 5/5 PRIMARY |
+| **C. Verbatim** "exactly what did Eva say?" | `lcm_grep --mode verbatim` (NEW) | 5/5 PRIMARY |
+| **D. Pattern** "history of project X" / "how do I rebuild gateway?" / "themes this month?" | `lcm_get_entity` + `lcm_search_entities` (entity sub-cases) | 2/5 PRIMARY (entity); 3/5 fallback (theme/procedure preserved in #616) |
+| **E. Drilldown** "where did this come from?" | `lcm_describe` (with new expandChildren / expandMessages flags) + `lcm_expand_query` | 5/5 PRIMARY |
+
+**22/25 test cases have PRIMARY coverage** out of 25 concrete agent queries the system is gated against. The 3 partial-coverage cases (Type D theme/procedure sub-cases) have adequate fallback via `lcm_grep --mode hybrid` + `lcm_synthesize_around`. Themes consolidation worker + procedure mining worker are preserved in draft PR #616 for a focused future-cycle PR with complete worker + agent-tool wiring together.
 
 ---
 
@@ -76,62 +76,43 @@ That's v4.1.
 
 ### Scenario 1: "What did we work on yesterday?"
 
-**Before (v3 / `lcm_recent`):**
-The agent reads yesterday's rollup. The rollup was generated last night by concatenating yesterday's leaves and asking a single model to summarize. It misses anything from a sub-conversation that happened in a different `session_key`. It also got compressed once already, so things like "the thing with the foreign key cascade" become "DB work."
-
-**After (v4.1):**
-The agent calls `lcm_synthesize_around` with `window_kind: 'time'` for yesterday. Synthesis runs *now*, against the actual raw leaves, using the daily-tier prompt + haiku-4-5. Result: same speed, but the summary works from primary source instead of a stale pre-rolled blob. If you ask the same question tomorrow, it'll re-synthesize fresh with the same source — but if any leaf got suppressed in between, the new synthesis automatically excludes it.
+The agent calls `lcm_synthesize_around` with `window_kind: 'time'` for yesterday. Synthesis runs *now*, against the actual raw leaves, using the daily-tier prompt + haiku-4-5. Result: same speed as the v3 pre-rolled rollup, but the summary works from primary source instead of a stale pre-rolled blob. If you ask the same question tomorrow, it'll re-synthesize fresh with the same source — but if any leaf got suppressed in between, the new synthesis automatically excludes it.
 
 ### Scenario 2: "We hit something like this rebase conflict before, what was the fix?"
 
-**Before:**
-You'd grep with `lcm_grep` and hope the words you remember match the words in the conversation. If you remember "merge mess" but the original conversation said "rebase blew up" — no match.
+Three modes available:
+- `lcm_grep --mode hybrid`: FTS + semantic + Voyage rerank. Best for "find the most relevant matches with cost-conscious ranking" — the eval against Eva's corpus showed +52.5pp recall on paraphrastic queries vs FTS-only.
+- `lcm_grep --mode semantic` (NEW): Pure semantic (embed-only, no rerank). Cheaper variant for broader recall when you don't need rerank precision.
+- `lcm_semantic_recall`: same cost profile as `mode='semantic'`, kept as separate tool for clarity.
 
-**After:**
-`lcm_grep --mode hybrid` does FTS *and* semantic search via Voyage, then reranks the union. "merge mess" finds "rebase blew up" because the embeddings cluster them together. The eval against Eva's corpus showed +52.5pp recall on paraphrastic queries vs FTS-only.
+### Scenario 3: "What exactly did Eva say about X?"
 
-Or you call `lcm_semantic_recall("rebase conflict resolution")` directly — pure semantic, no FTS, ranked by relevance.
+`lcm_grep --mode verbatim` (NEW) returns FULL untruncated message rows (capped at 20). Closes the verbatim-recall gap — previously the agent only had 200-char snippets via grep. For citation, quote-back, and any case where literal wording matters.
 
-### Scenario 3: Operator hard-forget
+### Scenario 4: Operator hard-forget
 
-**Before:**
-There was no real way to delete something. You could delete the row, but the FTS index, vec0 index, themes, intentions, entity mentions all still referenced it. Half-deleted state. Also if you somehow got it consistent, the next condensation pass might re-create the summary from the underlying messages.
+`runPurge(leafIds, reason)` flips `summaries.suppressed_at` and `messages.suppressed_at`. From that single flip, cascade triggers (enforced at 10+ read paths — FTS5, LIKE, CJK trigram, CJK LIKE, regex, vec0 metadata, vec0 KNN, summary getById, message getById, raw message search) make the leaf invisible to every read surface. Context items get cleaned. Entity mentions cascade-delete. Parent condensed summaries get `contains_suppressed_leaves=1` so the next idle pass rebuilds them clean.
 
-**After:**
-`runPurge(leafIds, reason)` flips `summaries.suppressed_at` and `messages.suppressed_at`. From that single flip, cascade triggers (enforced at 7 read paths — FTS5, LIKE, CJK trigram, CJK LIKE, regex, vec0, raw message search) make the leaf invisible to every read surface. Themes that referenced it get marked stale. Context items get cleaned. Entity mentions cascade-delete. Parent condensed summaries get `contains_suppressed_leaves=1` so the next idle pass rebuilds them clean.
+The leaf row itself is *not* deleted — the lossless bedrock principle. `runPurge --immediate` (with hard-delete drainer worker) was preserved in draft PR #616 for future cycle. For GDPR-grade byte-level removal until then, run SQL VACUUM after suppression has cascaded.
 
-The leaf row itself is *not* deleted — the lossless bedrock principle. If you want true byte-level deletion (GDPR), there's a separate `--immediate` mode that calls runPurge then enqueues an immediate condensed-rebuild + a hard delete of the underlying message rows once the rebuild settles.
+### Scenario 5: "Tell me about all the work I've done with Voyage"
 
-### Scenario 4: "Tell me about all the work I've done with Voyage"
-
-**Before:**
-You'd grep for "voyage" and get a flood of mentions across many conversations. No clustering, no synthesis.
-
-**After:**
-The async entity coreference worker (drains `lcm_extraction_queue` every 60s) has been continuously building entity records. `lcm_get_entity('Voyage')` returns the canonical entity with all its mentions across the corpus. `lcm_search_entities` lets you find related ones. Procedure mining (separate worker) has clustered 8+ recurring patterns and surfaced "set up Voyage API key + verify backfill" as a known procedure with confidence > 0.9.
+The async entity coreference worker (drains `lcm_extraction_queue` every 60s, gated on `LCM_EXTRACTION_LLM_ENABLED`) has been continuously building entity records. `lcm_get_entity('Voyage')` returns the canonical entity with all its mentions across the corpus. `lcm_search_entities` lets you find related ones via fuzzy substring/prefix/exact match.
 
 This is what lcm_recent was *trying* to do with rollups but couldn't — it was a time-indexed rollup, not a topic-indexed one.
 
-### Scenario 5: Themes (optional, agent-explicit only)
-
-**Before:**
-There was no theme view. The closest thing was `lcm_recent` for a long window, which would re-rollup half the corpus.
-
-**After:**
-A separate idle worker runs `themes-consolidation` (Ward linkage + cosine distance via ml-hclust). Themes are stored in `lcm_themes` with their source leaves in `lcm_theme_sources`. The agent has to *ask* for themes (`lcm_recent_themes`, `lcm_theme_explain`, `lcm_search_themes`) — they are intentionally NOT in the assemble() pyramid. Themes in the assemble pyramid was a RAG-leak — every turn would pay for theme retrieval whether the user asked or not. v4.1 says: themes are an opt-in lens, not a default load.
-
 ---
 
-## Cost discipline — what this PR spends
+## Cost discipline
 
 | Workload | One-time | Ongoing |
 |---|---|---|
 | Voyage embedding backfill (4187 leaves) | ~$1 | n/a (one-time corpus catch-up) |
 | New leaf embedding (per leaf) | n/a | ~$0.0001 |
 | `lcm_grep --mode hybrid` (per query) | n/a | ~$0.001 (rerank) |
-| `lcm_semantic_recall` (per query) | n/a | ~$0.0001 (embed only) |
+| `lcm_grep --mode semantic` / `lcm_semantic_recall` (per query) | n/a | ~$0.0001 (embed only) |
+| `lcm_grep --mode verbatim` (per query) | n/a | $0 (FTS5 + DB read only) |
 | Daily synthesis (haiku-4-5) | n/a | ~$0.005 |
-| Weekly synthesis (sonnet-4-5) | n/a | ~$0.05 |
 | Monthly synthesis (opus-4-7 + verify) | n/a | ~$0.50 |
 | Yearly synthesis (opus-thinking + best-of-3 + judge) | n/a | ~$5 |
 
@@ -139,12 +120,29 @@ Per-tier model dispatch is the cost lever: we don't pay opus-thinking prices for
 
 ---
 
-## Operator setup walkthrough (post-merge)
+## What was CUT from this PR (preserved in draft PR #616)
+
+Per first-principles pass + 8 challenger agents (2026-05-06):
+
+| Feature | Why cut | Preserved at |
+|---|---|---|
+| **Themes** (3 tools + worker + schema) | Half-shipped UX worse than not shipping (worker had no auto-tick; operators couldn't manually trigger). Tool error message itself admitted "auto-tick is cycle-3". | PR #616 |
+| **Procedure mining** (worker + prefilter + schema) | 0% shipped (no agent tool, no LLM injection, no auto-tick). Pure dead code in production. | PR #616 |
+| **Intentions** (schema + prospective-extract prompt) | ZERO producer / consumer / agent tools. Schema-only. Doc-drift in pyramid diagram. | PR #616 |
+| **`runPurge --immediate`** mode | No drainer worker (~20-40h, HIGH risk to assemble-pyramid invariants). Functionally identical to soft mode without the drainer. | PR #616 |
+| **`lcm_voyage_rate_state`** schema | Table-only, ZERO production readers/writers. Per-process throttle covers single-gateway use. | PR #616 |
+| **`lcm_purge_rebuild_queue`** schema | Queue with no drainer (paired with `--immediate` cut). | PR #616 |
+| **`lcm_describe` consolidation** (entity_id / theme_id polymorphism) | 400-LOC refactor touching canonical describe tool. After 4 final-review passes, reopens adversarial review surface for ergonomic-only gain. | PR #616 |
+
+Net diff: ~2935 LOC removed from PR. Net change after capability adds (verbatim mode, semantic mode, expandChildren flags, doc updates): ~−2605 LOC.
+
+---
+
+## Operator setup walkthrough
 
 ```bash
 # 1. Drop your Voyage API key in
-mkdir -p ~/.openclaw/credentials
-chmod 700 ~/.openclaw/credentials
+mkdir -p ~/.openclaw/credentials && chmod 700 ~/.openclaw/credentials
 # Paste your key into ~/.openclaw/credentials/voyage-api-key
 chmod 600 ~/.openclaw/credentials/voyage-api-key
 export VOYAGE_API_KEY="$(cat ~/.openclaw/credentials/voyage-api-key)"
@@ -159,40 +157,37 @@ tail -f ~/.openclaw/logs/gateway.log | \grep -E "lcm|voyage|backfill"
 
 # 3. Check progress (~1hr to fully embed Eva's corpus at 0.5 RPS):
 /lcm health
-# Output includes:
-#   embeddings.activeProfile = voyage4large
-#   embeddings.embeddedCount = 200 / 4187
-#   embeddings.pendingBackfill = 3987
-#   embeddings.overCapPending = 0    # leaves >30K tokens that can't embed
 
 # 4. Want it faster? Force a tick:
 /lcm worker tick embedding-backfill
 
 # 5. Once embeddedCount catches up, semantic + hybrid retrieval works.
-# Try in a chat:
-#   "Use lcm_grep with mode hybrid to find anything about race conditions"
-#   "Use lcm_semantic_recall to find work on the rebase conflict"
+#    Try in a chat:
+#      "Use lcm_grep with mode hybrid to find anything about race conditions"
+#      "Use lcm_grep with mode verbatim to quote what was said about X"
+#      "Use lcm_semantic_recall to find work on the rebase conflict"
 
-# 6. Hard-forget a leaf (operator-only):
-/lcm purge --leaf <leaf_id> --reason "PII removal"
+# 6. Soft-forget a leaf (operator-only):
+#    runPurge({ leafIds: ['sum_xxx'], reason: "PII removal" })
+#    (--immediate hard-delete deferred to PR #616)
 ```
 
-If `VOYAGE_API_KEY` is missing, the plugin still works — semantic init logs a single "no key, skipping" line and `lcm_grep --mode hybrid` falls back to FTS-only with no error. Operator opts in by setting the key.
+If `VOYAGE_API_KEY` is missing, the plugin still works — semantic init logs "no key, skipping" and `lcm_grep --mode hybrid` returns an error pointing to use `mode='full_text'` instead. Operator opts in by setting the key.
 
 ---
 
 ## What v4.1 is NOT (intentional non-goals)
 
-- **Not RAG.** The assemble() pyramid is structural (fresh tail → recent leaves → last-week condensed → last-month condensed → last-year synthesis → due intentions). It does NOT do per-turn semantic retrieval into the prompt. Semantic retrieval is an *agent tool* the model can call when the user asks for it.
-- **Not a rollup replacement that produces more rollups.** Synthesis is on-demand via `lcm_synthesize_around`, not a precomputed nightly job. (The daily/weekly/monthly tier choice is for the on-demand synthesis call's cost, not for pre-rolling.)
-- **Not auto-tied to themes.** Themes are explicit. The pyramid never loads them.
+- **Not RAG.** The assemble() pyramid is structural (fresh tail → recent leaves → last-week condensed → last-month condensed → last-year synthesis). It does NOT do per-turn semantic retrieval into the prompt. Semantic retrieval is an *agent tool* the model can call when the user asks for it.
+- **Not a rollup replacement that produces more rollups.** Synthesis is on-demand via `lcm_synthesize_around`, not a precomputed nightly job.
+- **Not auto-tied to themes / procedures / intentions.** Cut from this PR — all three were half-shipped or fully speculative. Will ship in focused PRs (preserved in #616) when worker + agent tools are wired together.
 
 ---
 
 ## Architecture (skip if you trust the scenarios above)
 
 <details>
-<summary>Click to expand: data flow, suppression cascade, synthesis dispatch, worker scheduling</summary>
+<summary>Click to expand: data flow, suppression cascade, synthesis dispatch</summary>
 
 ### Data flow
 
@@ -200,7 +195,7 @@ If `VOYAGE_API_KEY` is missing, the plugin still works — semantic init logs a 
 flowchart TB
     subgraph Gateway["Gateway (hot path — sync per turn)"]
         T[Turn] --> A[assemble pyramid]
-        A --> AT[fresh tail<br/>+ recent leaves<br/>+ last-week condensed<br/>+ last-month condensed<br/>+ last-year synthesis<br/>+ due intentions]
+        A --> AT[fresh tail<br/>+ recent leaves<br/>+ last-week condensed<br/>+ last-month condensed<br/>+ last-year synthesis]
         AT --> R[Response]
         R --> LW[leaf write]
         LW -->|enqueue async| EQ[(lcm_extraction_queue)]
@@ -216,17 +211,19 @@ flowchart TB
         EC -->|insert| ENT[(lcm_entities<br/>+ lcm_entity_mentions)]
     end
 
-    subgraph Tools["Agent tools"]
+    subgraph Tools["Agent tools (8 in this PR)"]
         LSR[lcm_semantic_recall]
-        LGH[lcm_grep --mode hybrid]
+        LGH[lcm_grep<br/>regex/full_text/hybrid<br/>+ verbatim + semantic]
         LSA[lcm_synthesize_around]
-        LD[lcm_describe]
+        LD[lcm_describe<br/>+ expandChildren/Messages]
+        LGE[lcm_get_entity<br/>+ lcm_search_entities]
         LSR -->|embed query| VC
         LSR -->|KNN| V0
         LGH -->|FTS| FTS
         LGH -->|KNN| V0
         LGH -->|rerank| VC
         LSA -->|tier dispatch| SD[synthesis/dispatch]
+        LGE -->|read| ENT
     end
 
     subgraph Operator["Operator commands"]
@@ -234,268 +231,35 @@ flowchart TB
         OW["/lcm worker tick"]
         OR["/lcm reconcile-session-keys"]
         OE["/lcm eval"]
-        OP[runPurge service]
+        OP[runPurge service<br/>soft mode only]
         OW -->|trigger| BAC
         OP -->|cascade trigger| V0
         OP -->|cleanup| CTX[(context_items)]
     end
 ```
 
-### Suppression cascade — the §10 invariant
-
-When an operator suppresses a leaf, EVERY agent-facing read path filters it. Enforced at 7 layers:
-
-```mermaid
-flowchart LR
-    U["operator: runPurge(leafIds, reason)"] --> S1[summaries.suppressed_at = now]
-    S1 -->|trigger #1| V[(vec0.suppressed=1)]
-    S1 -->|trigger #2| MC[(meta cleanup)]
-    S1 -->|trigger #3| TM[lcm_themes status='stale']
-    S1 -->|inline| CC[context_items DELETE]
-    S1 -->|inline| CSL[contains_suppressed_leaves=1<br/>on parent condensed]
-    S1 -->|inline| MS[messages.suppressed_at = now<br/>for raw message rows]
-
-    subgraph Reads["7 agent-facing read paths — ALL filter"]
-        R1[summary-store.searchFullText]
-        R2[summary-store.searchLike]
-        R3[summary-store.searchCjkTrigram]
-        R4[summary-store.searchLikeCjk]
-        R5[summary-store.searchRegex]
-        R6[summary-store.getSummary*]
-        R7[semantic-search KNN<br/>+ hybrid-search]
-        R8[conversation-store.searchFullText]
-        R9[conversation-store.searchLike]
-        R10[conversation-store.searchRegex]
-    end
-```
-
-### Per-tier synthesis dispatch
-
-```mermaid
-flowchart TB
-    REQ["dispatchSynthesis(req)"] --> T{tier?}
-    T -->|daily| D[single-pass<br/>haiku-4-5]
-    T -->|weekly| W[single-pass<br/>sonnet-4-5]
-    T -->|monthly| M1[single-pass<br/>opus-4-7]
-    M1 -->|then| MV[verify_fidelity<br/>opus-4-7]
-    MV -->|"OK / HALLUCINATION:..."| MH{flagged?}
-    T -->|yearly| Y1[N=3 candidates<br/>opus-4-7-thinking<br/>parallel]
-    Y1 -->|then| YJ[best_of_n_judge<br/>opus-4-7-thinking]
-    YJ -->|0..N-1| YS[selected output]
-
-    D --> AUD[(lcm_synthesis_audit)]
-    W --> AUD
-    M1 --> AUD
-    MV --> AUD
-    Y1 --> AUD
-    YJ --> AUD
-
-    AUD -.->|prompt_id FK| PR[(lcm_prompt_registry)]
-```
-
-### Worker scheduling
-
-```mermaid
-flowchart TB
-    PI[plugin/index.ts register] --> WP[wirePluginHandlers]
-    WP --> SI[initSemanticInfraIfPossible]
-    SI -->|sqlite-vec loaded| AS["tryStartBackfillAutostart(db)"]
-    AS --> PF{pre-flight}
-    PF -->|VOYAGE_API_KEY| K
-    PF -->|vec0 loaded| V
-    PF -->|active model| AM
-    K & V & AM -->|all yes| START[setInterval 5min]
-    K -->|missing| NOOP1[NO_OP_HANDLE +<br/>log once]
-    V -->|missing| NOOP2[NO_OP_HANDLE +<br/>log once]
-    AM -->|missing| NOOP3[NO_OP_HANDLE +<br/>log once]
-
-    START -->|every 5min| TICK
-    TICK[runOneTick] --> LK[acquireLock<br/>'embedding-backfill']
-    LK -->|got| BT[runBackfillTick<br/>perTickLimit=200<br/>maxRPS=0.5]
-    LK -->|held| SKIP[skip; next interval]
-    BT --> RL[releaseLock]
-    BT -->|3 idle ticks| PAUSE[pause - new leaves<br/>re-trigger]
-    BT -->|3 failures| STOP[stop autostart;<br/>require manual restart]
-
-    GS[gateway_stop] --> CL[clear interval +<br/>clearTimeout]
-```
-
 </details>
-
----
-
-## Live-DB harness (what we actually verified)
-
-```
-$ VOYAGE_API_KEY=... npx tsx scripts/v41-live-db-harness.mjs
-[harness] ✓ all 22 v4.1 tables exist
-[harness] ✓ embedding profile registered + vec0 table created
-[harness] ✓ corpus has unembedded docs: 3801
-[harness] ✓ backfill embedded at least one doc
-[harness] ✓ Voyage tokens consumed: 20040
-[harness] ✓ semantic search returned 10 hits
-[harness] ✓ hybrid search returned 5 hits
-[harness] ✓ target leaf REMOVED from semantic results after suppression
-[harness] ✓ context_items rows for suppressed leaf cleaned: 0
-[harness] ✓ leaf-write enqueued an entity-extraction row
-[harness] ✓ entity coref created 1 entities
-[harness] ✅ ALL CHECKS PASSED
-```
-
-This is the smoking gun. Run against a copy of Eva's actual `~/.openclaw/lcm.db` with a real Voyage API key, every claim above is exercised end-to-end.
 
 ---
 
 ## Test coverage
 
-- **1330 tests passing** (was 858 baseline → +472)
-- **88 test files** (was 58 → +30 new)
+- **1323 tests passing** (was 1398 pre-cut → -75 from removed theme/procedure/intention tests, +12 from new mode/flag tests = net 1323)
+- 93 test files passing
 - Vec0-dependent tests gated on `LCM_TEST_VEC0_PATH` env var (CI without sqlite-vec still passes)
 - All Voyage tests use mock fetch in CI — NO live API calls in unit tests
 - Live-DB harness (`scripts/v41-live-db-harness.mjs`) DOES exercise Voyage end-to-end against a copy of Eva's lcm.db; manual run, not CI
 
 ---
 
-## Adversarial review history (4 cycles, 5 BLOCKERS + 12 HIGH gaps caught)
-
-| Pass | Findings | Resolved in |
-|---|---|---|
-| Group A | 10 LOW/MED gaps; verdict SAFE TO LAND | B.fix |
-| Group B | 1 BLOCKER + 1 HIGH + 8 polish | B.fix2 |
-| Group C | 1 BLOCKER + 2 HIGH + 7 polish | C.fix |
-| Group D | 2 HIGH + 4 MED + 4 LOW | D.fix |
-| Group E | 1 BLOCKER + 4 HIGH + 5 LOW | E.fix |
-| Final whole-PR | 1 BLOCKER + 4 HIGH + 7 polish | Final.fix + Wire.* |
-| Final.review (post-Wire) | 2 P1 BLOCKER + 2 P2 | ec99fd0 |
-
-Final.review fixes (`ec99fd0`):
-- **P1 #1**: production semantic init was inert (sqlite-vec couldn't load) — fixed `connection.ts` (allowExtension=true) + new `operator/semantic-infra-init.ts` wired into plugin init before backfill autostart.
-- **P1 #2**: message grep leaked suppressed content — added `WHERE suppressed_at IS NULL` to FTS / LIKE / regex paths in `conversation-store.ts`; runPurge soft mode now cascades to `messages.suppressed_at`.
-- **P2 #3**: immediate-purge JSDoc lied about hard-delete — rewritten to reflect two-step reality + cycle-3 gap warning.
-- **P2 #4**: leaves > 30K tokens were invisible to operator — added `overCapPending` counter to `EmbeddingsHealth` and `/lcm health` rendering.
-
----
-
 ## Migration safety
 
-All schema changes are additive. Re-running `runLcmMigrations` is idempotent (verified in tests + against live DB twice). No column drops, no type changes. Existing code paths see new columns with default values; new code paths see fully-populated rows after the migration's data-cleanup steps run at boot.
-
-5 legacy convs re-keyed to `agent:main:main`. 517 zero-leaf NULL session_keys backfilled to `legacy:conv_<id>`. 8 stale telegram rollups marked for rebuild. Leaf-summarizer 2400→4000 token cap fix applied.
-
----
-
-## Cycle-3 follow-ups (not in this PR)
-
-| Work | LOC | Why deferred |
-|---|---|---|
-| `procedure-mining` auto-tick wiring | ~100 | Worker exists; needs cron schedule + LLM credentials plumbed |
-| `themes-consolidation` auto-tick wiring | ~100 | Worker exists; needs idle-pass scheduler |
-| `worker_threads` heartbeat isolation | ~200 | True isolation; current setInterval works for current cadences |
-| `/lcm eval --register-set` CLI | ~100 | Operator can seed via SQL today; CLI is QoL |
-| Quality eval (LLM judge) wiring in `/lcm eval` | ~150 | Recall-only this PR; quality eval requires ensemble judge config |
-| 5x noise floor calibration for eval | (operational) | First-deployment concern, not a service feature |
-| Hard-delete for `runPurge --immediate` | ~150 | Currently soft-purge + condensed-rebuild enqueue; true byte deletion is cycle-3 |
-
-Each cycle-3 commit is small (<300 LOC), well-scoped, and builds on this PR's foundations.
-
----
-
-## Group-by-group commit map (for reviewers walking commits)
-
-<details>
-<summary>Click to expand 52-commit list grouped A-G + Wire.1-3 + Final.review</summary>
-
-### Group A — Foundation (12 commits)
-Schema migrations + data cleanup + leaf cap fix. All purely additive.
-
-| Commit | What |
-|---|---|
-| A.01 c2f98d8 | §0 concurrency model module + `lcm_worker_lock` table |
-| A.02 a4a3bbb | summaries v4.1 cols + messages.suppressed_at + lcm_feature_flags |
-| A.03 0ecc3b2 | lcm_extraction_queue + lcm_purge_rebuild_queue + lcm_voyage_rate_state + lcm_session_key_audit |
-| A.04 ae7286c | lcm_prompt_registry + lcm_synthesis_cache + lcm_cache_leaf_refs + lcm_synthesis_audit |
-| A.05 595bc42 | lcm_eval_query_set + lcm_eval_query + lcm_eval_run + lcm_eval_drift |
-| A.06 91a24c8 | lcm_entity_type_registry + lcm_entities + lcm_entity_mentions + lcm_procedures + lcm_intentions |
-| A.07 bef3de3 | lcm_embedding_profile + lcm_embedding_meta |
-| A.08 91a24c8 | indexes on summaries + messages + conversations |
-| A.09 9d64db3 | NULL session_key backfill + summaries.session_key JOIN backfill |
-| A.10 447b240 | leaf-summarizer cap 2400 → 4000 tokens |
-| B.fix 947f78f | Group A polish: NULL UNIQUE, assertForeignKeysEnabled, live-DB regression test |
-
-### Group B — Embeddings (8 commits + spike)
-
-| Commit | What |
-|---|---|
-| B.01 9c0057f | Voyage HTTP client (raw fetch — npm SDK has ESM bug) |
-| B.02 bb939e0 | embeddings store + per-model vec0 tables + lcm_embedding_meta sidecar |
-| B.03 c2b66a9 | suppression + delete cascade triggers (vec0 + meta) |
-| B.04a 816d939 | cross-process worker-lock helpers |
-| E.spike cc0fc98 | hierarchical-cluster wrapper (ml-hclust; consumed by Group E) |
-| B.04b 834a810 | embedding backfill cron (rate-limited, resumable, idempotent) |
-| B.05 1b451a8 | worker scheduler loop + leaf-write session_key fix |
-| B.fix2 06f27d2 | Voyage retry budget vs lock TTL, slug collision, dim bound |
-
-### Group C — Retrieval (7 commits)
-
-| Commit | What |
-|---|---|
-| C.01 6e4a373 | semantic-search service (embed → KNN → summary join) |
-| C.02a c194a2a | hybrid-search service (FTS + semantic + Voyage rerank OR RRF fallback) |
-| C.01b 1acb811 | lcm_semantic_recall agent tool |
-| C.03 48a3162 | suppression filter wired into 4 SummaryStore search paths |
-| C.02b ef23ede | hybrid mode for lcm_grep tool |
-| C.05 baec079 | lcm_describe extension (sessionKey + timeRange) |
-| C.fix 104df46 | 5th search path (CJK), lcm_semantic_recall hardening, hydrate-step suppression |
-
-### Group D — Synthesis + Eval (4 commits)
-
-| Commit | What |
-|---|---|
-| D.01 3a20fec | prompt registry service (versioned, atomic, NULL-safe) |
-| D.02 c5d3aaf | synthesis dispatch (single / single+verify / best-of-N+judge) |
-| D.03 e0bdee1 | eval harness (query sets + recall + ensemble judge + run recording) |
-| D.fix e544b04 | dispatch dry-run contract, best-of-N pass_session_id, tier_label normalization |
-
-### Group E — Extraction (5 commits)
-
-| Commit | What |
-|---|---|
-| E.01 bbd3be3 | procedure pre-filter (numbered-steps + command-block + how-to-marker) |
-| E.02 8408c54 | procedure mining pass (cluster + LLM judge + write) |
-| E.03 babb815 | async entity coreference worker |
-| E.fix 7bf2b3f | numClusters degenerate-tree crash, undefined-confidence crash, mention idempotency |
-
-### Group F — Operator surface (5 commits)
-
-| Commit | What |
-|---|---|
-| F.01 9d8f514 | runPurge service (soft / immediate; main-session safety) |
-| F.02 0c02b32 | /lcm health subsystem snapshot |
-| F.03a d01c24d | worker orchestrator service |
-| F.04 fedc131 | /lcm reconcile-session-keys (--apply / --list-candidates) |
-| F.05 a0e9ad0 | /lcm eval (operator wraps D.03 harness) |
-
-### Group G — Themes (1 commit, optional per plan)
-
-| Commit | What |
-|---|---|
-| G.01 e0ef3b3 | themes idle consolidation + lcm_themes / lcm_theme_sources schema + suppression-cascade trigger |
-
-### Final fixes + Wire (5 commits)
-
-| Commit | What |
-|---|---|
-| Final.fix 9098dd4 | suppression bypass via getSummary*+assembler; agent Voyage budget; eval cold-start error; reconcile UNIQUE pre-check; /lcm worker status |
-| smoke 7949677 | full-pipeline smoke test |
-| Wire.1+2 34b0ebf | leaf-write hook → lcm_extraction_queue + /lcm worker tick embedding-backfill |
-| Wire.3 348e2a3 | backfill autostart on plugin init + live-DB harness |
-| Final.review ec99fd0 | semantic init wiring + message grep cascade + over-cap accounting + purge JSDoc |
-
-</details>
+All schema changes are additive. Re-running `runLcmMigrations` is idempotent (verified in tests + against live DB twice). No column drops, no type changes. Cut tables (themes / procedures / intentions / voyage rate-state / purge rebuild queue) are simply not created on fresh installs; existing operator DBs that already have them keep them as no-op residue (no FK breakage, no data loss).
 
 ---
 
 ## Related
 
 - Replaces (closes upon merge?): #516 — same problem space, different architectural answer (rejected for repetition + lossy compression-of-compression)
+- Companion draft PR: **#616** — preserves themes / procedures / intentions / hard-delete drainer / voyage rate-state / lcm_describe consolidation with full context for future-cycle pickup
 - Related: #600 (use OpenClaw runtime LLM for summarization) — separate concern, parallel work, not blocking

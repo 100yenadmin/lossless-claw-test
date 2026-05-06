@@ -105,15 +105,18 @@ async function main() {
   log(`Migration completed in ${Date.now() - migT0}ms`);
 
   // ── Schema sanity ─────────────────────────────────────────────────
+  // Note: 6 tables removed in first-principles pass (2026-05-06):
+  //   lcm_purge_rebuild_queue, lcm_voyage_rate_state, lcm_procedures,
+  //   lcm_intentions, lcm_themes, lcm_theme_sources
+  // All preserved in deferred-features draft PR #616.
   const v41Tables = [
-    "lcm_worker_lock", "lcm_extraction_queue", "lcm_purge_rebuild_queue",
-    "lcm_voyage_rate_state", "lcm_session_key_audit", "lcm_prompt_registry",
+    "lcm_worker_lock", "lcm_extraction_queue",
+    "lcm_session_key_audit", "lcm_prompt_registry",
     "lcm_synthesis_cache", "lcm_synthesis_audit",
     "lcm_eval_query_set", "lcm_eval_query", "lcm_eval_run", "lcm_eval_drift",
     "lcm_entities", "lcm_entity_mentions", "lcm_entity_type_registry",
-    "lcm_procedures", "lcm_intentions",
     "lcm_embedding_profile", "lcm_embedding_meta",
-    "lcm_themes", "lcm_theme_sources", "lcm_feature_flags",
+    "lcm_feature_flags",
   ];
   for (const t of v41Tables) {
     const row = db

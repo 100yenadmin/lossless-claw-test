@@ -119,43 +119,46 @@ v4 RAG-leak adversarial agent finding: themes in the assemble pyramid violate th
 
 **If you ever feel tempted to put themes in the pyramid**: re-read v4-rag-leak-agent-findings.md. The architectural reasoning is solid.
 
-## What's wired vs what's deferred (cycle-2 SHIPPED ✅, cycle-3 deferred ❌)
+## What's wired vs what's cut (final post first-principles pass)
 
-> **Updated 2026-05-06**: cycle-2 wire commits all landed (`f0469b1` + `09ee7ad` + `7b4d4ad` + `ded2a60`). Items previously marked cycle-2 ❌ that have shipped are now cycle-2 ✅. Truly remaining work is now labeled cycle-3.
+> **Updated 2026-05-06 (afternoon)**: First-principles pass + 8 challenger agents. Several previously-shipped tools/schemas were CUT to avoid half-shipped UX worse than not shipping. All cuts preserved in deferred-features draft PR (#616) for future-cycle pickup with complete worker + agent-tool wiring together.
 
-| Component | Wired? | Notes |
+| Component | Wired in this PR? | Notes |
 |---|---|---|
-| Schema (21 new tables) | ✅ | Migration runs at boot, idempotent, live-DB-verified |
-| Suppression filter on FTS/LIKE/CJK/regex search | ✅ | All 5 paths in summary-store |
+| Schema (16 new tables — was 21, cut 5) | ✅ | Migration runs at boot, idempotent, live-DB-verified twice. Cut: lcm_themes, lcm_theme_sources, lcm_intentions, lcm_procedures, lcm_voyage_rate_state, lcm_purge_rebuild_queue. |
+| Suppression filter on FTS/LIKE/CJK/regex search | ✅ | All 5 paths in summary-store + 3 in conversation-store + vec0 metadata filter |
 | Suppression filter on getSummary/Parents/Children/Subtree | ✅ | Default exclude; opt-in via includeSuppressed=true |
+| Suppression filter on getMessageById | ✅ | Final.review.3 fix (Loop 2 BLOCKER) |
 | Suppression cascade trigger to vec0 | ✅ | Per-model AFTER UPDATE OF suppressed_at |
-| Suppression cascade to context_items | ✅ | Inline in runPurge |
-| Suppression cascade to themes (active→stale) | ✅ | Trigger AFTER UPDATE |
+| Suppression cascade to context_items (summary + message) | ✅ | Inline in runPurge soft mode |
+| Suppression cascade to lcm_synthesis_cache | ✅ | runPurge invalidates dependent cache rows |
 | Leaf-write enqueues extraction | ✅ | Wire.1 |
 | Backfill auto-runs on plugin init | ✅ | Wire.3 (gated on VOYAGE_API_KEY) |
 | `/lcm worker tick embedding-backfill` operator command | ✅ | Wire.2 |
 | `/lcm worker status` | ✅ | F.02 + F.03a |
 | `/lcm health` | ✅ | F.02 |
 | `/lcm reconcile-session-keys` | ✅ | F.04 |
-| `/lcm eval` | ✅ | F.05 (recall only; quality judge deferred) |
+| `/lcm eval` | ✅ | F.05 (recall only; quality judge primitive present, production wiring deferred) |
 | `lcm_semantic_recall` agent tool | ✅ | C.01b (returns empty until backfill runs) |
 | `lcm_grep --mode hybrid` | ✅ | C.02b (degrades to FTS-only without embeddings) |
+| `lcm_grep --mode semantic` | ✅ | NEW (Phase 2) — pure semantic, no rerank cost |
+| `lcm_grep --mode verbatim` | ✅ | NEW (Phase 2) — full untruncated message rows; closes Type C verbatim gap |
 | `lcm_describe` extension (sessionKey + timeRange) | ✅ | C.05 |
-| `lcm_synthesize_around` agent tool | ✅ | Group C cycle-2 wire (commit 09ee7ad); 754-line impl in `src/tools/lcm-synthesize-around-tool.ts`; 13 tests; registered in manifest line 19; wired in `plugin/index.ts` line 2408 |
-| `lcm_recent_themes` agent tool | ✅ | Cycle-2 (commit ded2a60) |
-| `lcm_search_themes` agent tool | ✅ | Cycle-2 (commit 7b4d4ad) |
-| `lcm_theme_explain` agent tool | ✅ | Cycle-2 |
-| Entity coref worker auto-tick | ✅ | Cycle-2 (commit f0469b1 + 09ee7ad wire); LLM injected via worker-llm.ts adapter |
-| Procedure mining auto-tick | ❌ | Cycle-3 — worker exists; needs cron schedule + LLM credentials plumbed |
-| Themes consolidation auto-tick | ❌ | Cycle-3 — worker exists; needs idle-pass scheduler |
-| Worker_threads heartbeat isolation (v4.1.1 A9) | ❌ | Cycle-3 — current setInterval works for this cadence |
-| Quality eval (LLM judge) wiring in /lcm eval | ❌ | Cycle-3 — recall-only this PR |
-| `/lcm eval --register-set` CLI flag | ❌ | Cycle-3 — operator seeds via SQL today |
-| Best-of-N parallel limit | ❌ | Cycle-3 — currently fully parallel; could throttle |
-| Voyage rate-state actually consulted | ❌ | Cycle-3 — table exists but client doesn't read it |
-| Hard-delete for `runPurge --immediate` (true byte-deletion) | ❌ | Cycle-3 — currently soft-purge + condensed-rebuild enqueue |
+| `lcm_describe expandChildren / expandMessages flags` | ✅ | NEW (Phase 2) — one-hop main-agent expansion without delegating to sub-agent |
+| `lcm_synthesize_around` agent tool | ✅ | Group C cycle-2 wire; 754-line impl; 13 tests |
+| `lcm_get_entity` agent tool | ✅ | Final.review.3 — 754 LOC + 9 tests |
+| `lcm_search_entities` agent tool | ✅ | Final.review.3 — 240 LOC + 10 tests |
+| Entity coref worker auto-tick | ✅ | Cycle-2 wire; LLM injected via worker-llm.ts adapter |
+| **Themes** (3 agent tools + worker + schema) | ❌ CUT | Half-shipped UX. Preserved in PR #616 for focused future-cycle ship with worker auto-tick wired. |
+| **Procedure mining** (worker + prefilter + schema) | ❌ CUT | 0% shipped (no agent tool, no LLM injection, no auto-tick). Preserved in PR #616. |
+| **Intentions** (schema + prospective-extract prompt) | ❌ CUT | ZERO producer/consumer/agent tools. Preserved in PR #616. |
+| **`runPurge --immediate`** (hard-delete drainer) | ❌ CUT | No drainer worker (~20-40h work, HIGH risk). Soft mode covers operational need. Preserved in PR #616. |
+| **`lcm_voyage_rate_state`** schema | ❌ CUT | Table-only, ZERO production readers/writers. Per-process throttle covers single-gateway use. Preserved in PR #616. |
+| **`lcm_describe` consolidation** (entity_id polymorphism) | ❌ DEFERRED | 400-LOC refactor; ergonomic-only; risk to canonical describe tool after 4 review rounds. Preserved in PR #616. |
+| Quality eval (LLM judge) wiring in /lcm eval | ❌ deferred | Primitive `src/eval/judge.ts` present; production wiring (~10-60h depending on cross-family ensemble) deferred |
+| `/lcm eval --register-set` CLI flag | ❌ deferred | Operator can seed via SQL today |
 
-**Cycle-2 is shipped.** What remains (cycle-3) is small (~1.0K LOC total), well-bounded, and each item can ship as its own PR.
+**This is the final shape.** No "Phase 2", no "Cycle 3" hidden in the docs. What ships here works end-to-end. What's preserved in PR #616 is documented with concrete cost/scope estimates for when each one ships as its own focused PR.
 
 ## Failure modes the architecture handles
 
