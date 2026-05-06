@@ -475,11 +475,25 @@ async function postWithRetry(
         retryAfterMs,
         bodyText,
       );
-      if (attempt < maxRetries) {
+      // Wave-2 Auditor #2 fix F1: previously we silently clamped Retry-After
+      // against BACKOFF_CAP_MS (25s), so a server-supplied 60s wait became a
+      // 25s wait — still rate-limited on next attempt. Now we honor the
+      // server's value verbatim BUT throw immediately if it would push us
+      // past the worker-lock TTL budget. Caller (backfill) releases lock
+      // cleanly and the autostart's next interval picks up where we left
+      // off — much better than burning a lock + retry slot on a stale wait.
+      const LOCK_BUDGET_AWARE_RETRY_MS = 60_000; // ~2/3 of WORKER_LOCK_TTL_MS=90s
+      if (
+        attempt < maxRetries &&
+        (retryAfterMs ?? 0) <= LOCK_BUDGET_AWARE_RETRY_MS
+      ) {
         // Honor server hint if present; else exponential backoff.
         await sleep(retryAfterMs ?? backoffMs(attempt));
         continue;
       }
+      // Either: (a) we exhausted retries, OR (b) server told us to wait
+      // longer than our lock-aware budget. Throw so caller can release
+      // lock and the next tick will retry fresh.
       throw lastErr;
     }
     if (status >= 500 && status < 600) {
@@ -530,17 +544,32 @@ function summarizeBody(body: string): string {
   return body.slice(0, 200);
 }
 
+/**
+ * Wave-2 Auditor #2 finding F1: previously clamped server-supplied
+ * Retry-After against BACKOFF_CAP_MS. If Voyage returns `Retry-After: 60`,
+ * we'd silently retry at 25s — still rate-limited, wasting a retry slot.
+ * Server contract requires honoring its retry-after value. Return the
+ * server's value verbatim; caller decides whether to honor or abandon.
+ *
+ * Retry-after returned in milliseconds. `undefined` means no header.
+ * A retry-after-from-server of >2 minutes signals server is heavily
+ * loaded — caller (backfill, semantic-search) must ABORT the in-flight
+ * call rather than wait, since waiting >90s would exceed lock TTL.
+ *
+ * Soft cap at 5 minutes (no realistic Voyage Retry-After exceeds this).
+ */
+const RETRY_AFTER_HARD_CAP_MS = 5 * 60 * 1000;
 function parseRetryAfterMs(header: string | null): number | undefined {
   if (!header) return undefined;
   // Voyage may send seconds (numeric) or HTTP-date.
   const asNum = Number.parseFloat(header);
   if (Number.isFinite(asNum) && asNum >= 0) {
-    return Math.min(asNum * 1000, BACKOFF_CAP_MS);
+    return Math.min(asNum * 1000, RETRY_AFTER_HARD_CAP_MS);
   }
   const asDate = Date.parse(header);
   if (Number.isFinite(asDate)) {
     const ms = asDate - Date.now();
-    return ms > 0 ? Math.min(ms, BACKOFF_CAP_MS) : undefined;
+    return ms > 0 ? Math.min(ms, RETRY_AFTER_HARD_CAP_MS) : undefined;
   }
   return undefined;
 }

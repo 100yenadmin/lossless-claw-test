@@ -107,6 +107,8 @@ For Type E with main-agent access (no sub-agent delegation needed), use `lcm_des
 
 22/25 test cases have PRIMARY tool coverage. The 3 D-pattern theme/procedure sub-cases (D1, D3, D5) have adequate-fallback coverage. Themes consolidation worker + procedure mining worker are preserved in draft PR #616 for a focused future-cycle PR.
 
+**Live-harness verification (2026-05-06)**: 5 parallel Sonnet subagents ran the 25 cases against Eva's snapshot DB. Pre-fix result: 14/25 high confidence + 8/25 degraded UX + 3/25 broken. Post-Wave-1 + Wave-2 fixes: 30/30 cases pass on the QA runner (`scripts/v41-qa-runner.mjs --suite full`), at ~$0.11 cost per run. The QA runner's 30-case suite is a superset (the 25 from this doc + 5 new-feature regression checks for P1–P7 fixes). See `docs/v4.1/HARNESS_REPORT_2026-05-06.md` for the bug-by-bug audit trail.
+
 ---
 
 ## What this is NOT

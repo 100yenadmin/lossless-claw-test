@@ -172,9 +172,19 @@ function selectTimeWindowLeaves(
   // form. Plain string comparison would treat '2026-05-01 09:00:00' as
   // smaller than '2026-05-01T09:00:00.000Z' (space < T), which silently
   // drops valid rows. SQLite normalizes both via datetime().
+  // Wave-2 Auditor #7 fix A1: time filter now uses
+  // `julianday(COALESCE(latest_at, created_at))` for parity with the
+  // summary FTS path (summary-store.ts) and the semantic-search path
+  // (post Wave-1). Without this, `since`/`before` on a condensed
+  // summary covering content from time T but written to the row at
+  // time T' would land in different "windows" depending on which tool
+  // an agent used. Leaves typically have latest_at = created_at, so
+  // for the leaf-only filter below this is functionally equivalent —
+  // but using the same SQL across tools eliminates a class of subtle
+  // cross-tool inconsistency bugs.
   const filters: string[] = [
-    "datetime(created_at) >= datetime(?)",
-    "datetime(created_at) < datetime(?)",
+    "julianday(COALESCE(latest_at, created_at)) >= julianday(?)",
+    "julianday(COALESCE(latest_at, created_at)) < julianday(?)",
     "suppressed_at IS NULL",
     "kind = 'leaf'",
   ];
@@ -591,19 +601,25 @@ export function createLcmSynthesizeAroundTool(input: {
       // the UNIQUE lookup index (session_key, range_start, range_end,
       // leaf_fingerprint, COALESCE(grep_filter,'')).
       //
-      // Pre-write janitor: reap zombie 'building' rows older than 10 min
-      // (process killed mid-dispatch can leave them blocking the latch).
-      // Mark them 'failed' so the new caller's INSERT OR IGNORE will be
-      // outshadowed by the cache lookup below — wait, actually, the row
-      // still occupies the UNIQUE slot. We DELETE zombie rows so the
-      // latch frees up. Audit row may have already been written by the
-      // dispatcher; FK ON DELETE CASCADE on lcm_synthesis_audit handles
-      // it (per migration.ts:1556).
+      // Pre-write janitor:
+      //   1. Reap zombie 'building' rows older than 10 min (process killed
+      //      mid-dispatch can leave them blocking the latch).
+      //   2. Wave-2 Auditor #1 fix #2: ALSO reap 'failed' rows older than
+      //      10 min so a transient dispatch failure doesn't poison the
+      //      tuple permanently. Without this, a single LLM 5xx would
+      //      block all future synthesis of the same window forever
+      //      (caller hits the row, sees status='failed', loops on
+      //      "building_elsewhere" hint or our retry path — neither is
+      //      correct semantics).
+      //
+      // Audit row may have already been written by the dispatcher; FK
+      // ON DELETE CASCADE on lcm_synthesis_audit handles it (per
+      // migration.ts:1574).
       const ZOMBIE_TTL_MIN = 10;
       try {
         db.prepare(
           `DELETE FROM lcm_synthesis_cache
-             WHERE status = 'building'
+             WHERE status IN ('building', 'failed')
                AND building_started_at IS NOT NULL
                AND datetime(building_started_at) < datetime('now', ?)`,
         ).run(`-${ZOMBIE_TTL_MIN} minutes`);
@@ -677,9 +693,15 @@ export function createLcmSynthesizeAroundTool(input: {
       // row and either return the cached result (status='ready') or
       // surface a "building elsewhere" hint without re-LLM-ing.
       if (!weHoldTheCacheLatch) {
+        // Wave-2 Auditor #1 fix #1 (HIGH CRASH BUG): the cache table column
+        // is `content` (per migration.ts:1506), NOT `output`. Previous code
+        // SELECTed `output, output_token_count` — every concurrent
+        // ready-cache hit threw `no such column: output` instead of
+        // returning the cached synthesis. Single-flight winner-already-ready
+        // fast-path was completely broken. This fix uses the real columns.
         const winner = db
           .prepare(
-            `SELECT cache_id, status, output, output_token_count, building_started_at
+            `SELECT cache_id, status, content, output_token_count, building_started_at
                FROM lcm_synthesis_cache
                WHERE session_key = ? AND range_start = ? AND range_end = ?
                  AND leaf_fingerprint = ? AND COALESCE(grep_filter, '') = ''
@@ -694,19 +716,32 @@ export function createLcmSynthesizeAroundTool(input: {
           | {
               cache_id: string;
               status: string;
-              output: string | null;
+              content: string | null;
               output_token_count: number | null;
               building_started_at: string | null;
             }
           | undefined;
-        if (winner?.status === "ready" && winner.output != null) {
+        if (winner?.status === "ready" && winner.content != null) {
           // Cache hit — return the existing synthesis without re-LLM.
           return jsonResult({
             cache_id: winner.cache_id,
             status: "cached",
-            text: winner.output,
+            text: winner.content,
             output_token_count: winner.output_token_count ?? 0,
             single_flight_outcome: "winner_already_ready",
+          });
+        }
+        // Note: 'failed' rows older than 10 min were just reaped by the
+        // janitor above. If we still see 'failed' here it's recent — surface
+        // the failure so caller doesn't loop forever.
+        if (winner?.status === "failed") {
+          return jsonResult({
+            status: "recent_failure",
+            cache_id: winner.cache_id,
+            building_started_at: winner.building_started_at,
+            hint:
+              "A recent attempt at this same window failed. The janitor will reap it after 10 minutes; retry then or pass slightly different criteria to bypass the failed cache row.",
+            single_flight_outcome: "lost_latch",
           });
         }
         return jsonResult({
@@ -829,6 +864,14 @@ export function createLcmSynthesizeAroundTool(input: {
           model_used: summarizerBuilt.model,
           embedding_model: semanticMeta?.modelName ?? null,
           voyage_tokens_consumed: semanticMeta?.voyageTokensConsumed ?? 0,
+          // Wave-2 Auditor #7 fix A2: cross-tool naming parity. The
+          // synthesize-around output shape uses snake_case throughout
+          // (cache_id, range_start, output_token_count etc.) so we keep
+          // voyage_tokens_consumed for internal consistency, AND mirror
+          // it as voyageTokensConsumed so cross-tool agents that key on
+          // the standard camelCase name find it. Both fields read the
+          // same value.
+          voyageTokensConsumed: semanticMeta?.voyageTokensConsumed ?? 0,
           synthesis: {
             primary_prompt_id: dispatchResult.primaryPromptId,
             audit_ids: dispatchResult.auditIds,

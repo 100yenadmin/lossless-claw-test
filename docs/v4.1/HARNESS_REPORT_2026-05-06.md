@@ -19,9 +19,15 @@
 | D. Pattern-anchored | 2/5 PRIMARY (entity); 3/5 fallback | **FAIL on entities, FAIL on procedure fallback** — entity tools return empty silently (coref worker hasn't run on snapshot); D2/D4 fallback via grep hybrid OK; D1 procedure fallback returned 15 unrelated incidents, not a procedure |
 | E. Drilldown | 5/5 via `lcm_describe` (with NEW flags) + `lcm_expand_query` | **PARTIAL** — flags work when DAG has data but silent empty expansion ambiguous; default 5-message cap too low (216-msg leaf returns first 2 minutes); distance scaling issue (>1.0 cosine) |
 
-**Net read on the production claim** (pre-fix): The PR claims 22/25 test cases have PRIMARY coverage. Live-harness data showed the actual figure was closer to **14/25 with high confidence + 8/25 with degradation + 3/25 actually broken** at the time of this report.
+**Net read on the production claim** (pre-fix, 2026-05-06 morning, before Wave-1 fixes): The PR claimed 22/25 test cases have PRIMARY coverage. Live-harness data showed the actual figure was closer to **14/25 with high confidence + 8/25 with degradation + 3/25 broken** at that point.
 
-**Post-fix update (after `e182f24` + `a4be5de` + Wave-1 fixes)**: All 8 HIGH/MED edge-case bugs (P1–P8) closed. The QA runner (`scripts/v41-qa-runner.mjs --suite full`) reports **30/30 cases pass** with $0.07 cost. The 3 D-pattern theme/procedure sub-cases (D1, D3, D5) remain at "adequate fallback" rather than "primary coverage" — that gap requires shipping themes-consolidation + procedure-mining workers complete, which is preserved in draft PR #616 for future-cycle delivery.
+**Post-fix status** (after `e182f24` + `a4be5de` + Wave-1 commit + Wave-2 commit):
+- All 8 HIGH/MED edge-case bugs (P1–P8) below — **CLOSED**.
+- All 17 Wave-1 audit findings (synthesis single-flight, Voyage budget, entity coref, FTS adapter, etc.) — **CLOSED**.
+- All 19 Wave-2 audit findings (synthesis SELECT crash, Retry-After clamp, purge predicate, time-filter parity, migration test gap, etc.) — **CLOSED**.
+- The QA runner (`scripts/v41-qa-runner.mjs --suite full` + `--suite adversarial`) reports **30/30 + 10/10 cases pass** end-to-end against the snapshot DB, ~$0.11 total cost.
+
+**Reconciling the two numbers** (the 22/25 design claim vs. 30/30 + 10/10 QA result): the QA runner uses a different rubric — its 30 full-suite cases include the original 5×5 grid (25 cases mapping to THE_FIVE_QUESTIONS) PLUS 5 new-feature regression checks (the recently-fixed P1–P7). So 30/30 ≠ 25/25 PRIMARY coverage; 25 cases of THE_FIVE_QUESTIONS pass either via the PRIMARY tool or via the documented fallback. The 3 D-pattern theme/procedure sub-cases (D1, D3, D5) still rely on degraded fallback rather than primary coverage — closing that gap requires shipping themes-consolidation + procedure-mining workers complete, preserved in draft PR #616 for future-cycle delivery.
 
 ---
 

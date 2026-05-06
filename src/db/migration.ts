@@ -1474,13 +1474,20 @@ export function runLcmMigrations(
       // BEFORE the DROP so we never leave orphans pointing to recreated
       // cache_ids that might be re-used. Audit rows are themselves
       // rebuildable (re-run the synthesis pass and the new audits land).
+      // Wave-2 Auditor #8 fix F2: narrow the catch to expected error
+      // ("no such table"). Previously the bare catch swallowed any error
+      // (corrupted DB, schema mismatch, etc.) — too broad.
       try {
         db.exec(
           `DELETE FROM lcm_synthesis_audit WHERE target_cache_id IS NOT NULL`,
         );
-      } catch {
-        // best-effort — if the audit table doesn't exist yet (first migration),
-        // nothing to clean.
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (!/no such table.*lcm_synthesis_audit/i.test(msg)) {
+          throw e;
+        }
+        // Audit table doesn't exist yet (first migration of an old DB);
+        // nothing to clean. Continue.
       }
       db.exec(`DROP TABLE IF EXISTS lcm_synthesis_cache`);
       log?.info?.(

@@ -802,11 +802,11 @@ async function runVerbatimLcmGrep(input: HybridGrepInput) {
   }
 
   if (since) {
-    filters.push("datetime(m.created_at) >= datetime(?)");
+    filters.push("julianday(m.created_at) >= julianday(?)");
     binds.push(since.toISOString());
   }
   if (before) {
-    filters.push("datetime(m.created_at) < datetime(?)");
+    filters.push("julianday(m.created_at) < julianday(?)");
     binds.push(before.toISOString());
   }
 

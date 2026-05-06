@@ -27,8 +27,16 @@ After merge: the agent can answer "what did we work on three weeks ago?" or "wha
 - Backfill autostart (gated on `VOYAGE_API_KEY`)
 - Entity coreference autostart (default-on; opt-out via `LCM_EXTRACTION_LLM_ENABLED=false`)
 
-**5 operator commands**:
-- `/lcm health`, `/lcm worker [status|tick embedding-backfill]`, `/lcm reconcile-session-keys`, `/lcm eval` (recall-only), `runPurge` (soft mode)
+**9 operator commands** (all reachable via `/lcm <subcommand>`):
+- `/lcm status` — plugin / DB / current-conversation status
+- `/lcm health` — v4.1 subsystem health (embeddings / workers / synthesis / eval / suppression)
+- `/lcm worker [status|tick embedding-backfill]` — worker management
+- `/lcm reconcile-session-keys [--list-candidates|--apply ...]` — merge legacy session keys
+- `/lcm eval [--baseline|--mode hybrid|...]` — recall + drift report
+- `/lcm purge [--reason ... --apply]` — soft-purge (immediate cut from PR; preserved in #616). Defaults to dry-run preview.
+- `/lcm backup` — timestamped DB backup
+- `/lcm rotate` — compact session transcript while preserving LCM identity
+- `/lcm doctor [clean [apply ...]|apply]` — broken-summary scanning / repair
 
 **Schema (16 new tables)** — all migrations idempotent, live-DB verified twice on Eva's actual ~/.openclaw/lcm.db.
 

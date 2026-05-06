@@ -47,6 +47,7 @@ import {
 } from "../operator/eval-runner.js";
 import {
   PurgeError,
+  previewPurgeAffected,
   runPurge,
   type PurgeOptions,
 } from "../operator/purge.js";
@@ -2175,37 +2176,45 @@ async function buildPurgeText(params: {
   };
 
   // Dry-run preview: count what WOULD be affected without actually
-  // suppressing. We re-implement the resolveTargetLeafIds logic here
-  // since purge.ts doesn't export it; this is a deliberately
-  // best-effort preview, not a transactional snapshot.
+  // suppressing. Wave-2 Auditor #6 fix BUG-2 + BUG-3: uses
+  // previewPurgeAffected (a thin wrapper over the same resolveTargetLeafIds
+  // that runPurge calls) so the dry-run count is GUARANTEED to match
+  // apply count. Fixes:
+  //   - BUG-2: dry-run had its own predicate using `datetime(created_at)
+  //     >= datetime(?)` while runPurge used raw `created_at >= ?`. Edge
+  //     cases (timezone offsets, microseconds) gave divergent counts.
+  //   - BUG-3: --summary-ids dry-run returned `opts.summaryIds.length`
+  //     blindly, even when half the IDs didn't exist or were already
+  //     suppressed. Now COUNTs only the IDs runPurge would actually touch.
+  //   - BUG-4: --allow-main-session safety not surfaced in preview;
+  //     now annotated below.
+  //   - BUG-5: empty-criteria dry-run scared operators with whole-DB
+  //     count; now surface no_criteria error explicitly before counting.
   if (!params.apply) {
+    // Mirror runPurge's validation so we don't return a misleading whole-DB
+    // count for an empty-criteria preview.
+    const hasCriteria =
+      (opts.summaryIds && opts.summaryIds.length > 0) ||
+      Boolean(opts.sessionKey) ||
+      Boolean(opts.since) ||
+      Boolean(opts.before) ||
+      Boolean(opts.minTokenCount);
+    if (!hasCriteria) {
+      lines.push(
+        buildSection("🛠️ Preview", [
+          buildStatLine("status", "rejected"),
+          buildStatLine("kind", "no_criteria"),
+          buildStatLine(
+            "fix",
+            "Pass at least one of: --session-key, --summary-ids, --since, --before, --min-token-count",
+          ),
+        ]),
+      );
+      return lines.join("\n");
+    }
     let previewCount = 0;
     try {
-      if (opts.summaryIds && opts.summaryIds.length > 0) {
-        previewCount = opts.summaryIds.length;
-      } else {
-        const where: string[] = ["kind = 'leaf'", "suppressed_at IS NULL"];
-        const binds: unknown[] = [];
-        if (opts.sessionKey) {
-          where.push("session_key = ?");
-          binds.push(opts.sessionKey);
-        }
-        if (opts.since) {
-          where.push("datetime(created_at) >= datetime(?)");
-          binds.push(opts.since.toISOString());
-        }
-        if (opts.before) {
-          where.push("datetime(created_at) < datetime(?)");
-          binds.push(opts.before.toISOString());
-        }
-        if (typeof opts.minTokenCount === "number") {
-          where.push("token_count >= ?");
-          binds.push(opts.minTokenCount);
-        }
-        const sql = `SELECT COUNT(*) AS n FROM summaries WHERE ${where.join(" AND ")}`;
-        const row = params.db.prepare(sql).all(...binds) as Array<{ n: number }>;
-        previewCount = row[0]?.n ?? 0;
-      }
+      previewCount = previewPurgeAffected(params.db, opts);
     } catch (e) {
       lines.push(
         buildSection("🛠️ Outcome", [
@@ -2215,15 +2224,30 @@ async function buildPurgeText(params: {
       );
       return lines.join("\n");
     }
-    lines.push(
-      buildSection("🛠️ Preview", [
-        buildStatLine("would-affect-leaves", formatNumber(previewCount)),
-        buildStatLine(
-          "to apply",
-          `Re-run with the same flags plus \`--apply\` to actually suppress.`,
-        ),
-      ]),
-    );
+    const previewWarnings: string[] = [];
+    if (
+      params.sessionKey === "agent:main:main" &&
+      !params.allowMainSession
+    ) {
+      previewWarnings.push(
+        "WARNING: --session-key=agent:main:main without --allow-main-session — apply WILL be blocked. Pass --allow-main-session to unblock.",
+      );
+    }
+    const previewSection = [
+      buildStatLine("would-affect-leaves", formatNumber(previewCount)),
+      buildStatLine(
+        "to apply",
+        "Re-run with the same flags plus `--apply` to actually suppress.",
+      ),
+      buildStatLine(
+        "race window",
+        "Preview is best-effort; --apply re-resolves under transaction. Counts may differ if leaves are written or suppressed in the meantime.",
+      ),
+    ];
+    if (previewWarnings.length > 0) {
+      for (const w of previewWarnings) previewSection.push(buildStatLine("warning", w));
+    }
+    lines.push(buildSection("🛠️ Preview", previewSection));
     return lines.join("\n");
   }
 

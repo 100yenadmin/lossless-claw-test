@@ -637,15 +637,32 @@ SUITES.full = [
       // Determinism (Auditor #9 finding #3): instead of ORDER BY RANDOM(),
       // pick a different leaf per case index using OFFSET, sorted stably.
       // Same DB + same case = same leaf, every run.
-      const row = db
+      // Wave-2 Auditor #9 fix HIGH-2: if OFFSET exceeds row count, fall
+      // back to OFFSET 0 (the first leaf) instead of getting `undefined`
+      // and silently passing because the predicate accepts any error.
+      const offset = i * 7;
+      let row = db
         .prepare(
           `SELECT summary_id FROM summaries
            WHERE kind='leaf' AND suppressed_at IS NULL
            ORDER BY summary_id ASC LIMIT 1 OFFSET ?`,
         )
-        .get(i * 7); // step by a prime so consecutive cases get different rows
+        .get(offset);
+      if (!row?.summary_id) {
+        row = db
+          .prepare(
+            `SELECT summary_id FROM summaries
+             WHERE kind='leaf' AND suppressed_at IS NULL
+             ORDER BY summary_id ASC LIMIT 1`,
+          )
+          .get();
+      }
+      if (!row?.summary_id) {
+        // Empty corpus — return a sentinel that the predicate can detect.
+        return { target: "__NO_LEAVES_IN_CORPUS__", window_kind: "time", windowHours: 24, windowK: 10, allConversations: true };
+      }
       return {
-        target: row?.summary_id,
+        target: row.summary_id,
         window_kind: i % 2 === 0 ? "time" : "semantic",
         windowHours: 24,
         windowK: 10,
@@ -682,8 +699,13 @@ SUITES.full = [
     expect: (r) => {
       // Some of these are stumpers (e.g. "worker_threads heartbeat" has 0 hits in
       // Eva's corpus — that's a true negative, NOT a tool bug). So we don't
-      // require hits — we just require the tool didn't error.
+      // require hits — we just require the tool didn't error AND that it
+      // returned a structured response with hits as an array.
+      // Wave-2 Auditor #9 fix HIGH-3: tightened to assert response shape.
       if (r.error) return `errored: ${r.error}`;
+      if (!Array.isArray(r.details?.hits)) {
+        return `details.hits is not an array — broken response shape (got ${typeof r.details?.hits})`;
+      }
       return null;
     },
     severity: "important",
@@ -701,7 +723,18 @@ SUITES.full = [
       allConversations: true,
     },
     expect: (r) => {
+      // Wave-2 Auditor #9 fix HIGH-3: also assert response shape, not
+      // just that there was no error.
       if (r.error) return `errored: ${r.error}`;
+      if (!Array.isArray(r.details?.hits)) {
+        return `details.hits is not an array — broken response shape (got ${typeof r.details?.hits})`;
+      }
+      // Verbatim hits should ALL have content + role + createdAt fields.
+      // If any hit is missing these, response shape regression.
+      for (const h of r.details.hits) {
+        if (typeof h.content !== "string") return "verbatim hit missing content";
+        if (typeof h.role !== "string") return "verbatim hit missing role";
+      }
       return null;
     },
     severity: "important",

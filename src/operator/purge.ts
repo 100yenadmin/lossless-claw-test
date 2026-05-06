@@ -141,6 +141,24 @@ export function runPurge(db: DatabaseSync, opts: PurgeOptions): PurgeResult {
 
 // ---------- internals ----------
 
+/**
+ * Wave-2 Auditor #6 fix BUG-2 + BUG-3: dry-run preview helper that uses
+ * the EXACT same predicate as resolveTargetLeafIds so the dry-run count
+ * matches the apply count. Previously the operator tool implemented its
+ * own `WHERE` clauses — they used `datetime(created_at) >= datetime(?)`
+ * while runPurge uses raw `created_at >= ?`. Edge cases (timezone
+ * offsets, microseconds) gave divergent counts.
+ *
+ * Returns the count of leaves that runPurge() would actually affect.
+ * For --summary-ids: counts only IDs that EXIST AND are kind='leaf' AND
+ * are not yet suppressed (matches the implicit filter in runPurge).
+ *
+ * Does NOT modify the DB.
+ */
+export function previewPurgeAffected(db: DatabaseSync, opts: PurgeCriteria): number {
+  return resolveTargetLeafIds(db, opts).length;
+}
+
 function resolveTargetLeafIds(db: DatabaseSync, opts: PurgeCriteria): string[] {
   if (opts.summaryIds && opts.summaryIds.length > 0) {
     // Validate each ID exists + is a leaf — operator mistakes shouldn't

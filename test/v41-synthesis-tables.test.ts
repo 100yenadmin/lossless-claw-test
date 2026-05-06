@@ -334,3 +334,107 @@ describe("lcm_synthesis_audit (v4.1.1 B1)", () => {
     db.close();
   });
 });
+
+// Wave-2 Auditor #8 fix F1: regression test for the migration's
+// DELETE-before-DROP cleanup of orphan audit rows. The Wave-1 commit
+// added the cleanup; this test pins the behavior so a future refactor
+// doesn't silently regress it.
+//
+// Strategy: run runLcmMigrations once (gets fully-migrated schema with
+// new wide CHECK), seed audit rows referencing real cache_ids, then
+// directly invoke the same DELETE that the migration runs and verify
+// it cleans the right rows. This is a unit test of the cleanup SQL,
+// not a full migration upgrade simulation (the upgrade path is
+// covered by v41-pre-existing-schema-migration.test.ts).
+describe("v4.1.3 widenLcmSynthesisCacheTierCheck — orphan-cleanup SQL", () => {
+  it("DELETE FROM lcm_synthesis_audit WHERE target_cache_id IS NOT NULL prunes only orphan-pointing rows", () => {
+    const db = setupDbWithRequiredFixtures();
+    // Pre-condition: count audit rows with target_cache_id set vs NULL
+    // (the fixture seeds none; we'll seed both kinds).
+
+    // Need a real cache_id to FK against
+    db.prepare(
+      `INSERT INTO lcm_synthesis_cache
+         (cache_id, session_key, range_start, range_end, leaf_fingerprint,
+          content, model_used, prompt_id, tier_label, source_leaf_ids,
+          source_token_count, output_token_count, actual_range_covered,
+          leaf_count_synthesized)
+       VALUES ('cache_for_orphan_test', 'agent:main:main', '2026-01-01', '2026-01-31',
+         'fp1', null, 'm1', 'prompt_v1', 'year', '["sum_a"]', 100, 50, '...', 1)`,
+    ).run();
+
+    // Seed: 2 audit rows pointing at the cache (will be the "orphans"
+    // after the eventual DROP), 1 row pointing at a summary instead
+    // (must be PRESERVED).
+    db.prepare(
+      `INSERT INTO lcm_synthesis_audit
+         (audit_id, pass_session_id, target_cache_id, prompt_id, pass_kind,
+          pass_input_truncated, status, model_used)
+       VALUES ('audit_cache_1', 'pass_1', 'cache_for_orphan_test', 'prompt_v1',
+         'single', '...', 'completed', 'm1')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO lcm_synthesis_audit
+         (audit_id, pass_session_id, target_cache_id, prompt_id, pass_kind,
+          pass_input_truncated, status, model_used)
+       VALUES ('audit_cache_2', 'pass_2', 'cache_for_orphan_test', 'prompt_v1',
+         'single', '...', 'completed', 'm1')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO lcm_synthesis_audit
+         (audit_id, pass_session_id, target_summary_id, prompt_id, pass_kind,
+          pass_input_truncated, status, model_used)
+       VALUES ('audit_summary', 'pass_3', 'sum_a', 'prompt_v1',
+         'single', '...', 'completed', 'm1')`,
+    ).run();
+
+    const beforeCacheTargeted = db
+      .prepare(`SELECT COUNT(*) AS n FROM lcm_synthesis_audit WHERE target_cache_id IS NOT NULL`)
+      .get() as { n: number };
+    const beforeSummaryTargeted = db
+      .prepare(`SELECT COUNT(*) AS n FROM lcm_synthesis_audit WHERE target_summary_id IS NOT NULL`)
+      .get() as { n: number };
+    expect(beforeCacheTargeted.n).toBe(2);
+    expect(beforeSummaryTargeted.n).toBeGreaterThanOrEqual(1);
+
+    // Apply the same DELETE the migration runs.
+    db.exec(`DELETE FROM lcm_synthesis_audit WHERE target_cache_id IS NOT NULL`);
+
+    const afterCacheTargeted = db
+      .prepare(`SELECT COUNT(*) AS n FROM lcm_synthesis_audit WHERE target_cache_id IS NOT NULL`)
+      .get() as { n: number };
+    const afterSummaryTargeted = db
+      .prepare(`SELECT COUNT(*) AS n FROM lcm_synthesis_audit WHERE target_summary_id IS NOT NULL`)
+      .get() as { n: number };
+    expect(afterCacheTargeted.n).toBe(0);
+    expect(afterSummaryTargeted.n).toBe(beforeSummaryTargeted.n);
+
+    db.close();
+  });
+
+  it("re-running runLcmMigrations on already-widened DB is a no-op (idempotent)", () => {
+    const db = new DatabaseSync(":memory:");
+    runLcmMigrations(db, { fts5Available: false, seedDefaultPrompts: false });
+    const before = db
+      .prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='lcm_synthesis_cache'`)
+      .get() as { sql: string };
+    runLcmMigrations(db, { fts5Available: false, seedDefaultPrompts: false });
+    const after = db
+      .prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='lcm_synthesis_cache'`)
+      .get() as { sql: string };
+    expect(after.sql).toBe(before.sql);
+    db.close();
+  });
+
+  it("schema includes the wide CHECK including 'monthly' on first migration", () => {
+    const db = new DatabaseSync(":memory:");
+    runLcmMigrations(db, { fts5Available: false, seedDefaultPrompts: false });
+    const sql = db
+      .prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='lcm_synthesis_cache'`)
+      .get() as { sql: string };
+    expect(sql.sql).toMatch(/'monthly'|"monthly"/);
+    expect(sql.sql).toMatch(/'weekly'|"weekly"/);
+    expect(sql.sql).toMatch(/'daily'|"daily"/);
+    db.close();
+  });
+});
