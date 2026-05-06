@@ -316,7 +316,10 @@ export async function runSemanticSearch(
   // Build dynamic WHERE clauses + bind params
   const placeholders = summaryIds.map(() => "?").join(",");
   const filters: string[] = [];
-  const binds: unknown[] = [...summaryIds];
+  // Wave-9 TS-tightening: typed for DatabaseSync.all(...args) which
+  // requires SQLInputValue. summaryIds are strings; appended values
+  // are ISO timestamps (since/before) and summaryKinds (strings).
+  const binds: (string | number)[] = [...summaryIds];
 
   if (opts.excludeSuppressed !== false) {
     filters.push("s.suppressed_at IS NULL");

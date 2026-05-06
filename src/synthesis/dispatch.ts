@@ -494,7 +494,11 @@ function updateAuditRow(
   },
 ): void {
   const sets: string[] = [];
-  const args: unknown[] = [];
+  // Wave-9 TS-tightening: typed array satisfies node:sqlite's
+  // DatabaseSync.run(...args) signature (SQLInputValue = null
+  // | number | bigint | string | ArrayBufferView). All pushed
+  // values below are strings or finite numbers.
+  const args: (string | number)[] = [];
   if (updates.status !== undefined) {
     sets.push("status = ?");
     args.push(updates.status);
@@ -582,7 +586,16 @@ async function runBestOfNYearly(
   const candidateFailures: string[] = [];
   for (const s of settled) {
     if (s.status === "fulfilled") {
-      candidateResults.push(s.value);
+      // Wave-9 TS-tightening: PassResult.costCents is optional (`?:`)
+      // so we normalize to `number | undefined` here to satisfy the
+      // narrower destination type (which keeps the field present
+      // even when no usage data was returned).
+      candidateResults.push({
+        output: s.value.output,
+        latencyMs: s.value.latencyMs,
+        costCents: s.value.costCents,
+        auditId: s.value.auditId,
+      });
     } else {
       candidateFailures.push(s.reason instanceof Error ? s.reason.message : String(s.reason));
     }

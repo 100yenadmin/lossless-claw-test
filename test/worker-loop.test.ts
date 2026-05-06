@@ -220,7 +220,11 @@ describe("worker-loop — runOnce", () => {
     // Give the promise time to register in-flight
     await sleep(5);
     await expect(loop.runOnce("embedding-backfill")).rejects.toThrow(/already in flight/);
-    resolveBlock?.(); // let the original finish
+    // Wave-9 TS-tightening: resolveBlock is assigned inside an inner
+    // closure, so control-flow analysis treats it as still `null`.
+    // Cast through the union — by here the runOnce above has already
+    // entered the run() function and assigned resolve.
+    (resolveBlock as (() => void) | null)?.(); // let the original finish
     await inflight;
   });
 });

@@ -90,7 +90,8 @@ export function getActivePrompt(
   const normalizedTier =
     args.tierLabel === null || args.tierLabel === "" ? null : args.tierLabel;
   const tierClause = normalizedTier === null ? "tier_label IS NULL" : "tier_label = ?";
-  const params: unknown[] =
+  // Wave-9 TS-tightening: typed for DatabaseSync.get(...args).
+  const params: string[] =
     normalizedTier === null
       ? [args.memoryType, args.passKind]
       : [args.memoryType, normalizedTier, args.passKind];
@@ -174,7 +175,8 @@ export function registerPrompt(
   try {
     // 1. Find current max version for this triple (across active + archived)
     const tierClauseSel = tierLabel === null ? "tier_label IS NULL" : "tier_label = ?";
-    const selParams: unknown[] =
+    // Wave-9 TS-tightening: typed for DatabaseSync.get(...args).
+    const selParams: string[] =
       tierLabel === null
         ? [opts.memoryType, opts.passKind]
         : [opts.memoryType, tierLabel, opts.passKind];
@@ -187,7 +189,8 @@ export function registerPrompt(
     const newVersion = maxRow.max_v + 1;
 
     // 2. Deactivate previous active row (if any)
-    const updParams: unknown[] =
+    // Wave-9 TS-tightening: typed for DatabaseSync.run(...args).
+    const updParams: string[] =
       tierLabel === null
         ? [opts.memoryType, opts.passKind]
         : [opts.memoryType, tierLabel, opts.passKind];

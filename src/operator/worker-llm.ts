@@ -106,11 +106,18 @@ export function createWorkerLlmCall(config: WorkerLlmConfig): LlmCall {
     }
 
     const latencyMs = Date.now() - startedAt;
+    // Wave-9 TS-tightening: route through `unknown` because
+    // CompletionResult's runtime shape may include a `model` field
+    // (some pi-ai providers populate it; the typed surface doesn't
+    // expose it). Cast through unknown to satisfy strict overlap, then
+    // narrow with typeof.
+    const responseModel = (response as unknown as { model?: unknown }).model;
+    const actualModelName = typeof responseModel === "string" ? responseModel : model;
     return {
       output: text,
       latencyMs,
       // costCents intentionally undefined — no token-cost calculator wired
-      actualModel: response.model ?? model,
+      actualModel: actualModelName,
     };
   };
 }

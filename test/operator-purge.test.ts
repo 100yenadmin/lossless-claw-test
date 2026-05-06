@@ -276,9 +276,11 @@ describe("operator-purge — previewPurgeAffected parity (Wave-2 BUG-2/BUG-3 reg
   it("preview returns 0 when no leaves match (clean negative)", () => {
     const db = setupDb();
     insertLeaf(db, "leaf_a", 1);
+    // Wave-9 TS-tightening: previewPurgeAffected takes PurgeCriteria
+    // (no `reason` field). The previous test passed a stray `reason`
+    // that was silently ignored at runtime but flagged by strict TS.
     const preview = previewPurgeAffected(db, {
       sessionKey: "non-existent-session",
-      reason: "test",
     });
     expect(preview).toBe(0);
     db.close();

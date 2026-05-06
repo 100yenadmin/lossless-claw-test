@@ -1247,7 +1247,10 @@ export function createLcmExpandQueryTool(input: {
             // Wave-8 P0 fix: thread `lcm` so citation validation can
             // call `lcm.getDb()`. Without this, the W4+W6 anti-
             // fabrication validation silently no-ops.
-            lcm: input.lcm,
+            // Wave-9 TS-tightening: use the resolved `lcm` local
+            // (line 1064) so the engine is non-nullable at the
+            // boundary — the ! guard already early-returned above.
+            lcm,
             callerSessionKey,
             requesterAgentId,
             bucket,
@@ -1295,7 +1298,8 @@ export function createLcmExpandQueryTool(input: {
           try {
             const delegatedReply = await runDelegatedExpandQuery({
               deps: input.deps,
-              lcm: input.lcm,
+              // Wave-9 TS-tightening: use resolved `lcm` local (1064).
+              lcm,
               callerSessionKey,
               requesterAgentId,
               bucket,

@@ -358,7 +358,9 @@ export function createLcmGrepTool(input: {
       }
 
       return {
-        content: [{ type: "text", text: lines.join("\n") }],
+        // Wave-9 TS-tightening: `as const` preserves the literal "text"
+        // type so this branch matches the AgentToolResult contract.
+        content: [{ type: "text" as const, text: lines.join("\n") }],
         details: {
           messageCount: result.messages.length,
           summaryCount: result.summaries.length,
@@ -625,7 +627,8 @@ async function runHybridLcmGrep(input: HybridGrepInput) {
   }
 
   return {
-    content: [{ type: "text", text: lines.join("\n") }],
+    // Wave-9 TS-tightening: `as const` preserves the literal "text" type.
+    content: [{ type: "text" as const, text: lines.join("\n") }],
     details: {
       mode: "hybrid",
       messageCount: 0,

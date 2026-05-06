@@ -204,7 +204,10 @@ export function createLcmGetEntityTool(input: {
              ORDER BY m.mentioned_at DESC
              LIMIT ?`,
         )
-        .all(entity.entity_id, mentionLimit) as MentionRow[];
+        // Wave-9 TS-tightening: Record<string, SQLOutputValue>[] doesn't
+        // overlap MentionRow strictly enough for direct cast; route
+        // through unknown.
+        .all(entity.entity_id, mentionLimit) as unknown as MentionRow[];
 
       const altSurfaces = safeJsonParse<string[]>(entity.alternate_surfaces) ?? [];
       const metadata = safeJsonParse<Record<string, unknown>>(entity.metadata) ?? {};

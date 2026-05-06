@@ -216,7 +216,10 @@ function resolveTargetLeafIds(db: DatabaseSync, opts: PurgeCriteria): string[] {
   }
   // Range purge
   const conds: string[] = ["kind = 'leaf'", "suppressed_at IS NULL"];
-  const args: unknown[] = [];
+  // Wave-9 TS-tightening: typed for DatabaseSync.all(...args) which
+  // requires SQLInputValue. All pushed values below are strings
+  // (sessionKey, ISO timestamps) or numbers (token count).
+  const args: (string | number)[] = [];
   if (opts.sessionKey) {
     conds.push("session_key = ?");
     args.push(opts.sessionKey);

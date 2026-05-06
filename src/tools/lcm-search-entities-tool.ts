@@ -196,7 +196,9 @@ export function createLcmSearchEntitiesTool(input: {
              ORDER BY occurrence_count DESC, last_seen_at DESC
              LIMIT ?`,
         )
-        .all(...binds, limit) as EntityRow[];
+        // Wave-9 TS-tightening: route through unknown (Record<string,
+        // SQLOutputValue>[] doesn't overlap EntityRow strictly).
+        .all(...binds, limit) as unknown as EntityRow[];
 
       // P8 fix (2026-05-06 harness): distinguish "0 results for query" from
       // "0 entities indexed yet" — the latter is a coverage gap, not a

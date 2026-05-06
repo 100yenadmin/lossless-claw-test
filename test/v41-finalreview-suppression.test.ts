@@ -174,10 +174,13 @@ describe("Final review #1 — runPurge cleans up context_items", () => {
        VALUES (1, 1, 'summary', ?, datetime('now'))`,
     ).run("leaf_a");
 
+    // Wave-9 TS-tightening: mode='immediate' was REMOVED during
+    // first-principles cuts (2026-05-06) — runPurge always operates
+    // in soft-suppression mode now. context_items still get cleaned
+    // because the soft-purge path runs the cascade DELETE regardless.
     runPurge(db, {
       summaryIds: ["leaf_a"],
       reason: "test",
-      mode: "immediate",
     });
 
     expect(

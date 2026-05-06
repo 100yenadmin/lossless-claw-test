@@ -361,6 +361,9 @@ describe("createLcmSynthesizeAroundTool — time window happy path", () => {
     expect(details.cache_id).toMatch(/^cache_around_/);
 
     // Cache row exists and is ready
+    // Wave-9 TS-tightening: assert cache_id is set (verified by earlier
+    // expect.toMatch above), then .get() takes a definite SQLInputValue.
+    if (!details.cache_id) throw new Error("cache_id missing");
     const cache = db
       .prepare(`SELECT cache_id, status, content, source_leaf_ids, tier_label FROM lcm_synthesis_cache WHERE cache_id = ?`)
       .get(details.cache_id) as {
