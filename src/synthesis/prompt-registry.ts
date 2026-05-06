@@ -33,7 +33,6 @@ export type MemoryType =
   | "episodic-condensed"
   | "episodic-yearly"
   | "procedural-extract"
-  | "prospective-extract"
   | "entity-extract"
   | "theme-consolidation";
 

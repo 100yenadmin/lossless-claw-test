@@ -223,22 +223,9 @@ describe("operator-health — suppression section", () => {
     db.close();
   });
 
-  it("counts pending purge rebuilds (picked_at IS NULL only)", () => {
-    const db = setupDb();
-    insertLeaf(db, "leaf_target_1");
-    insertLeaf(db, "leaf_target_2");
-    db.prepare(
-      `INSERT INTO lcm_purge_rebuild_queue (queue_id, target_summary_id, purge_session_id, reason)
-       VALUES ('q1', 'leaf_target_1', 'ps_test', 'test'),
-              ('q2', 'leaf_target_2', 'ps_test', 'test')`,
-    ).run();
-    db.prepare(
-      `UPDATE lcm_purge_rebuild_queue SET picked_at = datetime('now') WHERE queue_id = 'q1'`,
-    ).run();
-    const snapshot = getV41HealthSnapshot(db);
-    expect(snapshot.suppression.pendingPurgeRebuilds).toBe(1);
-    db.close();
-  });
+  // pendingPurgeRebuilds test REMOVED in first-principles pass (2026-05-06).
+  // lcm_purge_rebuild_queue + drainer worker preserved in deferred-features
+  // draft PR (#616).
 });
 
 describe("operator-health — overall snapshot shape", () => {

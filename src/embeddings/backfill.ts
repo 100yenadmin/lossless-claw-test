@@ -21,12 +21,12 @@
  *      embedding-backfill at a time; otherwise we'd burn quota and
  *      potentially write duplicate vec0 rows.
  *
- *   3. Rate limit lives in `lcm_voyage_rate_state`. Today it's a
- *      simple per-call sleep (1/maxRequestsPerSecond). v4.1.1 B3
- *      foresees more sophisticated cross-process token-budget
- *      enforcement; for now we keep coordination minimal — the
- *      worker_lock already guarantees single-flight, so RPM/TPM
- *      throttling is a single-process concern in this commit.
+ *   3. Rate limit is per-process: simple per-call sleep
+ *      (1/maxRequestsPerSecond). The worker_lock already guarantees
+ *      single-flight, so RPM/TPM throttling is a single-process concern.
+ *      Cross-process Voyage budget coordination via lcm_voyage_rate_state
+ *      table was preserved in deferred-features draft PR (#616) for when
+ *      multi-gateway scenario emerges.
  *
  *   4. Resumable. Each batch's writes commit independently, so a
  *      mid-tick crash loses at most one in-flight batch worth of

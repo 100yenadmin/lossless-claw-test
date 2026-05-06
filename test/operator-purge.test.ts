@@ -92,7 +92,6 @@ describe("operator-purge — soft mode (default)", () => {
     });
     expect(r.mode).toBe("soft");
     expect(r.affectedLeafIds.sort()).toEqual(["leaf_a", "leaf_b"]);
-    expect(r.rebuildQueueIds).toEqual([]); // soft mode doesn't enqueue
 
     const after = db
       .prepare(`SELECT summary_id, suppressed_at, suppress_reason FROM summaries WHERE summary_id IN ('leaf_a','leaf_b','leaf_other_session') ORDER BY summary_id`)
@@ -126,56 +125,9 @@ describe("operator-purge — soft mode (default)", () => {
   });
 });
 
-describe("operator-purge — immediate mode", () => {
-  it("marks suppressed AND enqueues affected condensed for rebuild", () => {
-    const db = setupDb();
-    insertLeaf(db, "leaf_a");
-    insertLeaf(db, "leaf_b");
-    insertCondensed(db, "cond_x", 1, ["leaf_a", "leaf_b"]);
-
-    const r = runPurge(db, {
-      summaryIds: ["leaf_a", "leaf_b"],
-      reason: "operator hard-forget",
-      mode: "immediate",
-    });
-    expect(r.mode).toBe("immediate");
-    expect(r.affectedLeafIds.sort()).toEqual(["leaf_a", "leaf_b"]);
-    expect(r.rebuildQueueIds).toHaveLength(1); // one affected condensed
-
-    const queue = db
-      .prepare(`SELECT target_summary_id, reason FROM lcm_purge_rebuild_queue`)
-      .all() as Array<{ target_summary_id: string; reason: string }>;
-    expect(queue).toEqual([{ target_summary_id: "cond_x", reason: "operator hard-forget" }]);
-
-    // Leaves are SUPPRESSED, not deleted (RESTRICT FK on parent_summary_id
-    // prevents direct delete; rebuild worker will delete after rebuild)
-    const stillExist = db
-      .prepare(`SELECT COUNT(*) AS n FROM summaries WHERE summary_id IN ('leaf_a','leaf_b')`)
-      .get() as { n: number };
-    expect(stillExist.n).toBe(2);
-
-    // But suppressed_at is set
-    const after = db
-      .prepare(`SELECT suppressed_at FROM summaries WHERE summary_id = 'leaf_a'`)
-      .get() as { suppressed_at: string | null };
-    expect(after.suppressed_at).not.toBeNull();
-    db.close();
-  });
-
-  it("immediate without affected condensed: just marks suppressed, empty rebuild queue", () => {
-    const db = setupDb();
-    insertLeaf(db, "leaf_lonely");
-
-    const r = runPurge(db, {
-      summaryIds: ["leaf_lonely"],
-      reason: "test",
-      mode: "immediate",
-    });
-    expect(r.affectedLeafIds).toEqual(["leaf_lonely"]);
-    expect(r.rebuildQueueIds).toEqual([]);
-    db.close();
-  });
-});
+// "immediate mode" tests REMOVED in first-principles pass (2026-05-06).
+// Hard-delete drainer + queue schema preserved in deferred-features
+// draft PR (#616). runPurge always runs in soft mode now.
 
 describe("operator-purge — criteria flexibility", () => {
   it("range purge by sessionKey + token cutoff", () => {
@@ -233,7 +185,6 @@ describe("operator-purge — empty match", () => {
       reason: "nothing to purge",
     });
     expect(r.affectedLeafIds).toEqual([]);
-    expect(r.rebuildQueueIds).toEqual([]);
     db.close();
   });
 });

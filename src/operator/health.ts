@@ -108,8 +108,6 @@ export interface EvalHealth {
 export interface SuppressionHealth {
   /** Count of leaves with suppressed_at IS NOT NULL. */
   suppressedLeaves: number;
-  /** Pending entries in lcm_purge_rebuild_queue (picked_at IS NULL). */
-  pendingPurgeRebuilds: number;
 }
 
 export interface V41HealthSnapshot {
@@ -369,18 +367,9 @@ function getSuppressionHealth(db: DatabaseSync): SuppressionHealth {
     suppressedLeaves = 0;
   }
 
-  let pendingPurgeRebuilds = 0;
-  try {
-    const row = db
-      .prepare(
-        `SELECT COUNT(*) AS n FROM lcm_purge_rebuild_queue
-           WHERE picked_at IS NULL`,
-      )
-      .get() as { n?: number } | undefined;
-    pendingPurgeRebuilds = row?.n ?? 0;
-  } catch {
-    pendingPurgeRebuilds = 0;
-  }
+  // lcm_purge_rebuild_queue REMOVED in first-principles pass (2026-05-06).
+  // Hard-delete drainer + queue schema preserved in deferred-features draft
+  // PR (#616). When queue ships, restore the pendingPurgeRebuilds count here.
 
-  return { suppressedLeaves, pendingPurgeRebuilds };
+  return { suppressedLeaves };
 }

@@ -162,7 +162,8 @@ function ensureSummaryV41Columns(db: DatabaseSync): void {
 
 /**
  * v3.1 A3 (extended in v4.1.1 A3): suppression cascade reaches raw messages
- * via `messages.suppressed_at`. lcm_quote / lcm_factcheck filter on this.
+ * via `messages.suppressed_at`. All message-search read paths
+ * (conversation-store FTS / LIKE / regex + grep mode='verbatim') filter on this.
  */
 function ensureMessageSuppressedAtColumn(db: DatabaseSync): void {
   const cols = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
@@ -1334,59 +1335,19 @@ export function runLcmMigrations(
       `);
     });
 
-    // v4.1.1 B2 — lcm_purge_rebuild_queue: persistent rebuild queue for
-    // operator-on-demand hard-purge (lcm_purge --immediate). T1 fires
-    // suppression cascade + enqueues rebuild targets; worker drains the
-    // queue using A4 forwarder pattern (INSERT new condensed row, UPDATE
-    // OLD.superseded_by, never mutate summary_parents).
-    runMigrationStep("ensureLcmPurgeRebuildQueueTable", log, () => {
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS lcm_purge_rebuild_queue (
-          queue_id TEXT NOT NULL PRIMARY KEY,
-          target_summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
-          purge_session_id TEXT NOT NULL,
-          reason TEXT NOT NULL,
-          queued_at TEXT NOT NULL DEFAULT (datetime('now')),
-          picked_at TEXT,
-          worker_id TEXT,
-          attempts INTEGER NOT NULL DEFAULT 0,
-          last_error TEXT
-        )
-      `);
-      db.exec(`
-        CREATE INDEX IF NOT EXISTS lcm_purge_rebuild_queue_pending_idx
-          ON lcm_purge_rebuild_queue (queued_at)
-          WHERE picked_at IS NULL
-      `);
-      db.exec(`
-        CREATE INDEX IF NOT EXISTS lcm_purge_rebuild_queue_session_idx
-          ON lcm_purge_rebuild_queue (purge_session_id)
-      `);
-    });
+    // v4.1.1 B2 — lcm_purge_rebuild_queue REMOVED in first-principles pass
+    // (2026-05-06). The hard-delete drainer worker (`runPurge --immediate`)
+    // was never built (~20-40h work, HIGH risk to assemble-pyramid
+    // invariants). Schema + producer code preserved in deferred-features
+    // draft PR (#616). Without the queue table, runPurge always operates
+    // in soft mode (which is what it actually does today anyway).
 
-    // v4.1.1 B3 — lcm_voyage_rate_state: cross-process rate-limit budget
-    // for Voyage embeddings + reranker. SQLite serializes BEGIN IMMEDIATE
-    // naturally so gateway query embeds, worker leaf-time embeds, worker
-    // entity-coref embeds, and worker backfill all coordinate via this
-    // shared row. Caller pattern (per v4.1.1 B3): brief BEGIN IMMEDIATE
-    // updates the counters and COMMITs BEFORE the HTTP call (HTTP must
-    // NOT be wrapped in the transaction — that would serialize all calls).
-    runMigrationStep("ensureLcmVoyageRateStateTable", log, () => {
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS lcm_voyage_rate_state (
-          bucket TEXT NOT NULL PRIMARY KEY CHECK (bucket IN ('embed', 'rerank')),
-          tokens_consumed_window INTEGER NOT NULL DEFAULT 0,
-          requests_consumed_window INTEGER NOT NULL DEFAULT 0,
-          window_started_at TEXT NOT NULL DEFAULT (datetime('now')),
-          last_429_at TEXT,
-          consecutive_429_count INTEGER NOT NULL DEFAULT 0
-        )
-      `);
-      // Seed both buckets so callers can UPDATE without first INSERTing.
-      db.exec(`
-        INSERT OR IGNORE INTO lcm_voyage_rate_state (bucket) VALUES ('embed'), ('rerank')
-      `);
-    });
+    // v4.1.1 B3 — lcm_voyage_rate_state REMOVED in first-principles pass
+    // (2026-05-06). Table-only feature, ZERO production readers/writers.
+    // Per-process throttle in voyage/client.ts covers single-gateway use.
+    // Schema + tests preserved in deferred-features draft PR (#616). When
+    // multi-gateway scenario emerges, re-add with the cross-process
+    // coordination pattern documented at the original site.
 
     // v4.1.1 §C item — lcm_session_key_audit: reversibility log for the
     // §2.1 step 1 re-key of 5 legacy convs to agent:main:main. Eva can
@@ -1428,7 +1389,6 @@ export function runLcmMigrations(
             'episodic-condensed',
             'episodic-yearly',
             'procedural-extract',
-            'prospective-extract',
             'entity-extract',
             'theme-consolidation'
           )),
@@ -1782,67 +1742,18 @@ export function runLcmMigrations(
       `);
     });
 
-    // v4.1 §7.1 + v4.1.1 B7/B8 — procedures with empirically-tuned
-    // promotion threshold (4 occurrences per B8, was 8 in v4.1) and
-    // status lifecycle. extraction_source distinguishes auto-extracted
-    // procedures from manually-flagged ones (lcm_remember_procedure).
-    runMigrationStep("ensureLcmProceduresTable", log, () => {
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS lcm_procedures (
-          procedure_id TEXT NOT NULL PRIMARY KEY,
-          session_key TEXT NOT NULL,
-          name TEXT NOT NULL,
-          steps TEXT NOT NULL,
-          last_seen_at TEXT NOT NULL,
-          source_leaf_ids TEXT NOT NULL,
-          extracted_at TEXT NOT NULL DEFAULT (datetime('now')),
-          status TEXT NOT NULL DEFAULT 'draft'
-            CHECK (status IN ('draft', 'active', 'stale', 'archived', 'deprecated')),
-          occurrence_count INTEGER NOT NULL DEFAULT 1,
-          confidence REAL,
-          extracted_by_pass_id TEXT,
-          extraction_source TEXT NOT NULL DEFAULT 'auto'
-            CHECK (extraction_source IN ('auto', 'manual'))
-        )
-      `);
-      db.exec(`
-        CREATE INDEX IF NOT EXISTS lcm_procedures_lookup_idx
-          ON lcm_procedures (session_key, name, status)
-      `);
-    });
+    // v4.1 §7.1 — procedures feature was REMOVED in first-principles pass
+    // (2026-05-06). Schema (lcm_procedures) + worker (mineProceduresPass) +
+    // prefilter all preserved in deferred-features draft PR (#616). Cut
+    // reason: 0% shipped (no agent tool, no LLM injection, no auto-tick)
+    // per challenger agent C5. Will ship as focused PR with worker +
+    // lcm_get_procedure / lcm_search_procedures agent tools together.
 
-    // v3 + v4.1 §7.3 + v4.1.1 B11 — intentions; resolution_text added in
-    // v4.1.1 B11 so lcm_resolve_intention can capture WHY an intention
-    // was fulfilled/cancelled. NOTE: source_leaf_id was NOT NULL in v4.1
-    // spec — relaxed here to NULL-allowed since suppression sets
-    // suppressed_at on the leaf (NOT delete) AND ON DELETE SET NULL only
-    // makes sense if the column allows NULL. v4.1.1 §C item.
-    runMigrationStep("ensureLcmIntentionsTable", log, () => {
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS lcm_intentions (
-          intention_id TEXT NOT NULL PRIMARY KEY,
-          session_key TEXT NOT NULL,
-          text TEXT NOT NULL,
-          target_date TEXT,
-          source_leaf_id TEXT REFERENCES summaries(summary_id) ON DELETE SET NULL,
-          status TEXT NOT NULL DEFAULT 'pending'
-            CHECK (status IN ('pending', 'fulfilled', 'cancelled')),
-          resolution_text TEXT,
-          resolved_at TEXT,
-          extracted_at TEXT NOT NULL DEFAULT (datetime('now')),
-          surfaced_at TEXT
-        )
-      `);
-      db.exec(`
-        CREATE INDEX IF NOT EXISTS lcm_intentions_due_idx
-          ON lcm_intentions (session_key, target_date)
-          WHERE status = 'pending'
-      `);
-      db.exec(`
-        CREATE INDEX IF NOT EXISTS lcm_intentions_session_status_idx
-          ON lcm_intentions (session_key, status)
-      `);
-    });
+    // v3 + v4.1 §7.3 — intentions feature was REMOVED in first-principles
+    // pass (2026-05-06). Schema (lcm_intentions) + prospective-extract
+    // prompt template all preserved in deferred-features draft PR (#616).
+    // Cut reason: ZERO producer, ZERO consumer, ZERO agent tools, served
+    // ZERO of the 25 test cases. Per challenger agent C3 at 99% confidence.
 
     // ── v4.1 embedding registry tables (A.07) ───────────────────────────────
     // Per v4.1 §1 + v4.1.1 A5/A7 — these are the MANAGED tables (regular
@@ -1922,67 +1833,13 @@ export function runLcmMigrations(
       `);
     });
 
-    // v4.1 §6.3 / Group G — themes (idle consolidation; agent-explicit
-    // only, NEVER in assemble() pyramid per RAG-leak agent finding).
-    runMigrationStep("ensureLcmThemesTable", log, () => {
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS lcm_themes (
-          theme_id TEXT NOT NULL PRIMARY KEY,
-          session_key TEXT NOT NULL,
-          name TEXT NOT NULL,
-          description TEXT NOT NULL,
-          source_leaf_count INTEGER NOT NULL,
-          consolidated_at TEXT NOT NULL DEFAULT (datetime('now')),
-          status TEXT NOT NULL DEFAULT 'active'
-            CHECK (status IN ('active', 'stale', 'archived')),
-          consolidation_model TEXT,
-          consolidation_pass_id TEXT
-        )
-      `);
-      db.exec(`
-        CREATE INDEX IF NOT EXISTS lcm_themes_lookup_idx
-          ON lcm_themes (session_key, status, consolidated_at DESC)
-      `);
-    });
-
-    // lcm_theme_sources: normalized many-to-many between themes and the
-    // leaves they were consolidated from. CASCADE both directions:
-    //   - DELETE theme → drop all source rows
-    //   - DELETE summary (purge) → drop the rows pointing to that summary
-    //     (theme stays; source_leaf_count stale until next consolidation)
-    runMigrationStep("ensureLcmThemeSourcesTable", log, () => {
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS lcm_theme_sources (
-          theme_id TEXT NOT NULL REFERENCES lcm_themes(theme_id) ON DELETE CASCADE,
-          summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
-          PRIMARY KEY (theme_id, summary_id)
-        )
-      `);
-      db.exec(`
-        CREATE INDEX IF NOT EXISTS lcm_theme_sources_by_summary_idx
-          ON lcm_theme_sources (summary_id)
-      `);
-    });
-
-    // Theme cleanup trigger: when a leaf is suppressed (NOT deleted),
-    // mark all themes that referenced it as 'stale' so the next
-    // consolidation pass re-builds them. The CASCADE on DELETE handles
-    // the hard-purge path; this trigger handles the soft-suppress path.
-    runMigrationStep("ensureLcmThemesStaleTrigger", log, () => {
-      db.exec(`
-        CREATE TRIGGER IF NOT EXISTS lcm_themes_stale_on_suppress
-          AFTER UPDATE OF suppressed_at ON summaries
-          WHEN (NEW.suppressed_at IS NULL) != (OLD.suppressed_at IS NULL)
-            AND NEW.suppressed_at IS NOT NULL
-          BEGIN
-            UPDATE lcm_themes SET status = 'stale'
-              WHERE status = 'active' AND theme_id IN (
-                SELECT DISTINCT theme_id FROM lcm_theme_sources
-                  WHERE summary_id = NEW.summary_id
-              );
-          END
-      `);
-    });
+    // v4.1 §6.3 / Group G — themes feature was REMOVED in first-principles
+    // pass (2026-05-06). Schema (lcm_themes, lcm_theme_sources) + worker
+    // (consolidateThemesPass) + 3 agent tools all preserved in draft PR
+    // feat/lcm-v4.1-deferred-features (PR #616). They'll come back as a
+    // focused PR with worker auto-tick + LLM injection wired together.
+    // Cut reason: half-shipped UX (tools shipped but worker had no auto-tick;
+    // operators couldn't manually trigger via /lcm worker tick) per C3+C5.
 
     // ── v4.1 indexes on summaries (A.08) ────────────────────────────────────
     // These are CONDITIONAL on the v4.1 columns existing (added by A.02
@@ -2096,7 +1953,7 @@ export function runLcmMigrations(
           ON summaries (contains_suppressed_leaves)
           WHERE contains_suppressed_leaves = 1 AND superseded_by IS NULL
       `);
-      // messages.suppressed_at filter (for lcm_quote / lcm_factcheck)
+      // messages.suppressed_at filter (for lcm_grep mode='verbatim' + conversation-store search paths)
       db.exec(`
         CREATE INDEX IF NOT EXISTS messages_suppressed_idx
           ON messages (suppressed_at)

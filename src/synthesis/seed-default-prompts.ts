@@ -320,35 +320,9 @@ OUTPUT (JSON):
   },
 
   // ── Prospective-extract ──────────────────────────────────────────────
-  {
-    memoryType: "prospective-extract",
-    tierLabel: null,
-    passKind: "single",
-    template: `You are scanning a leaf summary for FUTURE-TENSE intentions — things the user said they plan to do, want to remember, or commit to doing.
-
-Look for:
-- "remind me to ..."
-- "I want to ... later"
-- "I'll do ... after ..."
-- "next time we ..."
-- Explicit deadlines or target dates
-
-Skip:
-- Past actions (already done)
-- Hypotheticals ("maybe we should ...")
-- Other people's intentions (only the user's)
-
-LEAF:
-{{source_text}}
-
-OUTPUT (JSON array):
-[{
-  "text": <verbatim quote of the intention>,
-  "target_date": <ISO date if mentioned, else null>,
-  "confidence": <0-1>
-}, ...]`,
-    notes: "v4.1 §12 default — prospective intention extraction. Output strict JSON array.",
-  },
+  // REMOVED in first-principles pass (2026-05-06). Intentions feature was
+  // cut entirely (zero producer/consumer/agent tools). Prompt + schema
+  // preserved in deferred-features draft PR (#616).
 
   // ── Entity-extract ───────────────────────────────────────────────────
   {

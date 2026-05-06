@@ -76,93 +76,9 @@ describe("lcm_extraction_queue (v4.1.1 A3)", () => {
   });
 });
 
-describe("lcm_purge_rebuild_queue (v4.1.1 B2)", () => {
-  it("creates the table with expected schema + indexes", () => {
-    const db = new DatabaseSync(":memory:");
-    runLcmMigrations(db, { fts5Available: false });
-
-    const cols = db
-      .prepare("PRAGMA table_info(lcm_purge_rebuild_queue)")
-      .all() as ColumnInfo[];
-    const byName = new Map(cols.map((c) => [c.name, c]));
-    expect(byName.get("queue_id")?.pk).toBe(1);
-    expect(byName.get("target_summary_id")?.notnull).toBe(1);
-    expect(byName.get("purge_session_id")?.notnull).toBe(1);
-    expect(byName.get("reason")?.notnull).toBe(1);
-
-    const fks = db
-      .prepare("PRAGMA foreign_key_list(lcm_purge_rebuild_queue)")
-      .all() as Array<{ from: string; table: string; on_delete: string }>;
-    expect(fks.find((fk) => fk.from === "target_summary_id")?.on_delete).toBe("CASCADE");
-
-    const indexes = db
-      .prepare(
-        `SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='lcm_purge_rebuild_queue'`,
-      )
-      .all() as IndexInfo[];
-    expect(indexes.map((i) => i.name)).toContain("lcm_purge_rebuild_queue_pending_idx");
-    expect(indexes.map((i) => i.name)).toContain("lcm_purge_rebuild_queue_session_idx");
-    db.close();
-  });
-});
-
-describe("lcm_voyage_rate_state (v4.1.1 B3)", () => {
-  it("creates the table with seeded 'embed' and 'rerank' rows", () => {
-    const db = new DatabaseSync(":memory:");
-    runLcmMigrations(db, { fts5Available: false });
-
-    const buckets = db
-      .prepare(`SELECT bucket FROM lcm_voyage_rate_state ORDER BY bucket`)
-      .all() as Array<{ bucket: string }>;
-    expect(buckets.map((b) => b.bucket)).toEqual(["embed", "rerank"]);
-  });
-
-  it("rejects unknown buckets via CHECK constraint", () => {
-    const db = new DatabaseSync(":memory:");
-    runLcmMigrations(db, { fts5Available: false });
-    expect(() =>
-      db
-        .prepare(`INSERT INTO lcm_voyage_rate_state (bucket) VALUES (?)`)
-        .run("totally-bogus-bucket"),
-    ).toThrow();
-    db.close();
-  });
-
-  it("supports the brief-tx update pattern (UPDATE counters then COMMIT before HTTP call)", () => {
-    const db = new DatabaseSync(":memory:");
-    runLcmMigrations(db, { fts5Available: false });
-
-    // Pattern from v4.1.1 B3: BEGIN IMMEDIATE → SELECT → UPDATE → COMMIT → make HTTP call
-    db.exec("BEGIN IMMEDIATE");
-    const before = db
-      .prepare("SELECT tokens_consumed_window FROM lcm_voyage_rate_state WHERE bucket = ?")
-      .get("embed") as { tokens_consumed_window: number };
-    expect(before.tokens_consumed_window).toBe(0);
-    db.prepare(
-      `UPDATE lcm_voyage_rate_state SET tokens_consumed_window = tokens_consumed_window + ?, requests_consumed_window = requests_consumed_window + 1 WHERE bucket = ?`,
-    ).run(50_000, "embed");
-    db.exec("COMMIT");
-
-    const after = db
-      .prepare("SELECT * FROM lcm_voyage_rate_state WHERE bucket = ?")
-      .get("embed") as { tokens_consumed_window: number; requests_consumed_window: number };
-    expect(after.tokens_consumed_window).toBe(50_000);
-    expect(after.requests_consumed_window).toBe(1);
-
-    db.close();
-  });
-
-  it("idempotent seed (running migration twice does not duplicate rows)", () => {
-    const db = new DatabaseSync(":memory:");
-    runLcmMigrations(db, { fts5Available: false });
-    runLcmMigrations(db, { fts5Available: false });
-    const count = db
-      .prepare(`SELECT COUNT(*) AS n FROM lcm_voyage_rate_state`)
-      .get() as { n: number };
-    expect(count.n).toBe(2); // still just 'embed' + 'rerank'
-    db.close();
-  });
-});
+// lcm_purge_rebuild_queue + lcm_voyage_rate_state tests REMOVED in
+// first-principles pass (2026-05-06). Schema + tests preserved in
+// deferred-features draft PR (#616).
 
 describe("lcm_session_key_audit (v4.1.1 §C reversibility log)", () => {
   it("creates the audit table with FK + index", () => {

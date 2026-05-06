@@ -503,9 +503,7 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
             kind: "help",
             error:
               `\`${VISIBLE_COMMAND} worker tick\` requires a job kind. ` +
-              `Supported: \`embedding-backfill\`. ` +
-              `Other kinds (extraction, procedure-mining, themes-consolidation) ` +
-              `need LLM-call injection wiring — deferred to a cycle-2 commit.`,
+              `Supported: \`embedding-backfill\`.`,
           };
         }
         if (kind !== "embedding-backfill") {
@@ -513,8 +511,8 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
             kind: "help",
             error:
               `\`${VISIBLE_COMMAND} worker tick ${kind}\` not supported. ` +
-              `Only \`embedding-backfill\` is wired today (no LLM call needed; uses Voyage HTTP directly). ` +
-              `Extraction / procedure-mining / themes-consolidation need LLM-injection wiring (cycle-2).`,
+              `Only \`embedding-backfill\` is wired (no LLM call needed; uses Voyage HTTP directly). ` +
+              `Entity coreference auto-ticks in the background; themes/procedures workers are deferred (see PR #616).`,
           };
         }
         return { kind: "worker_tick_backfill" };
@@ -1551,10 +1549,6 @@ function formatHealthSnapshot(snapshot: V41HealthSnapshot): string[] {
   lines.push(
     buildSection("Suppression", [
       buildStatLine("suppressed leaves", formatNumber(snapshot.suppression.suppressedLeaves)),
-      buildStatLine(
-        "pending purge rebuilds",
-        formatNumber(snapshot.suppression.pendingPurgeRebuilds),
-      ),
     ]),
   );
 
@@ -1605,12 +1599,11 @@ function buildWorkerStatusText(params: { db: DatabaseSync }): string {
   lines.push("### Note");
   lines.push("");
   lines.push(
-    "Manual `/lcm worker tick embedding-backfill` IS wired in this PR (Wire.2). " +
-      "Other tick kinds (extraction / procedure-mining / themes-consolidation) " +
-      "are exported from `src/operator/worker-orchestrator.ts` but not yet " +
-      "exposed via the `/lcm worker tick` parser — they're cycle-3. Backfill " +
-      "is the only one that doesn't need LLM-call injection (uses Voyage HTTP " +
-      "directly), which is why it's first to ship.",
+    "Manual `/lcm worker tick embedding-backfill` is wired. Entity coreference " +
+      "auto-ticks in the background (default-on; opt-out via " +
+      "`LCM_EXTRACTION_LLM_ENABLED=false`). Themes consolidation and procedure " +
+      "mining workers were preserved in deferred-features draft PR (#616) and " +
+      "will ship as focused PRs with auto-tick + agent tools together.",
   );
   return lines.join("\n");
 }

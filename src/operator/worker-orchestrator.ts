@@ -50,13 +50,10 @@ import {
   type ExtractEntities,
   countPendingExtractions,
 } from "../extraction/entity-coreference.js";
-import {
-  mineProceduresPass,
-  type CandidateLeaf,
-  type JudgeProcedureCluster,
-  type MineProceduresOptions,
-  type MineProceduresReport,
-} from "../extraction/procedure-mining.js";
+// Procedure mining was REMOVED in first-principles pass (2026-05-06).
+// Module + types preserved in deferred-features draft PR (#616). When that
+// ships, re-import: mineProceduresPass, CandidateLeaf, JudgeProcedureCluster,
+// MineProceduresOptions, MineProceduresReport from "../extraction/procedure-mining.js".
 
 export interface WorkerStatusSnapshot {
   /** Current lock state for each worker kind (null = no one holds). */
@@ -160,45 +157,8 @@ export async function tickExtraction(
   }
 }
 
-export interface RunProcedureMiningArgs extends Omit<MineProceduresOptions, "passId"> {
-  passId?: string;
-  candidates: CandidateLeaf[];
-  judge: JudgeProcedureCluster;
-}
-
-/**
- * Manual procedure-mining tick. Wraps with worker-lock acquire/release
- * (mineProceduresPass doesn't acquire its own).
- */
-export async function tickProcedureMining(
-  db: DatabaseSync,
-  args: RunProcedureMiningArgs,
-): Promise<MineProceduresReport & { lockAcquired: boolean }> {
-  const workerId = generateWorkerId("orchestrator-procedures");
-  const got = acquireLock(db, "extraction", { workerId, jobMetadata: "tickProcedureMining" });
-  if (!got) {
-    return {
-      sessionKey: args.sessionKey,
-      candidateCount: 0,
-      clusterCount: 0,
-      largeClusterCount: 0,
-      activeProceduresWritten: 0,
-      draftProceduresWritten: 0,
-      judgeRejected: 0,
-      clusters: [],
-      lockAcquired: false,
-    };
-  }
-  try {
-    const result = await mineProceduresPass(db, args.candidates, args.judge, {
-      ...args,
-      passId: args.passId ?? `mine-${Date.now()}`,
-    });
-    return { ...result, lockAcquired: true };
-  } finally {
-    releaseLock(db, "extraction", workerId);
-  }
-}
+// tickProcedureMining was REMOVED in first-principles pass (2026-05-06).
+// Implementation + types preserved in deferred-features draft PR (#616).
 
 /**
  * Force-release a stuck lock. Operator escape hatch when a worker

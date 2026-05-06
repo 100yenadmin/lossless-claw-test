@@ -48,7 +48,6 @@ describe("v4.1 Final.review.2 — seedDefaultPrompts (BLOCKER fix)", () => {
       { memoryType: "episodic-condensed", tierLabel: "custom", passKind: "single" },
       { memoryType: "episodic-condensed", tierLabel: "filtered", passKind: "single" },
       { memoryType: "procedural-extract", tierLabel: null, passKind: "single" },
-      { memoryType: "prospective-extract", tierLabel: null, passKind: "single" },
       { memoryType: "entity-extract", tierLabel: null, passKind: "single" },
     ];
 

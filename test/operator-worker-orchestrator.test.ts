@@ -12,7 +12,6 @@ import {
   getWorkerStatusSnapshot,
   heartbeatAllHeldLocks,
   tickExtraction,
-  tickProcedureMining,
 } from "../src/operator/worker-orchestrator.js";
 
 const VEC0_PATH =
@@ -132,20 +131,8 @@ describe("worker-orchestrator — tickExtraction (lock-protected)", () => {
   });
 });
 
-describe("worker-orchestrator — tickProcedureMining (lock-protected)", () => {
-  it("returns lockAcquired=false when extraction lock is held", async () => {
-    const db = setupDb();
-    acquireLock(db, "extraction", { workerId: "occupies-extraction-lock" });
-
-    const r = await tickProcedureMining(db, {
-      sessionKey: "sk1",
-      candidates: [],
-      judge: async () => ({ confirmed: true, confidence: 1 }),
-    });
-    expect(r.lockAcquired).toBe(false);
-    db.close();
-  });
-});
+// tickProcedureMining was REMOVED in first-principles pass (2026-05-06).
+// Test preserved in deferred-features draft PR (#616).
 
 describe("worker-orchestrator — forceReleaseLock", () => {
   it("returns true when lock existed; subsequent call returns false", () => {

@@ -21,8 +21,6 @@ import { runLcmMigrations } from "../src/db/migration.js";
 const EXPECTED_V41_TABLES = [
   "lcm_worker_lock",
   "lcm_extraction_queue",
-  "lcm_purge_rebuild_queue",
-  "lcm_voyage_rate_state",
   "lcm_session_key_audit",
   "lcm_prompt_registry",
   "lcm_synthesis_cache",
@@ -35,8 +33,6 @@ const EXPECTED_V41_TABLES = [
   "lcm_entity_type_registry",
   "lcm_entities",
   "lcm_entity_mentions",
-  "lcm_procedures",
-  "lcm_intentions",
   "lcm_embedding_profile",
   "lcm_embedding_meta",
   "lcm_feature_flags",

@@ -16,11 +16,12 @@
  *
  *   2. Rate-limit budget visible to caller. The 429 response carries
  *      `Retry-After` (sometimes seconds, sometimes HTTP-date). The
- *      response body has more detail. Caller (backfill cron) coordinates
- *      across processes via `lcm_voyage_rate_state` table — this client
- *      JUST surfaces the retry hint and lets the caller decide the
- *      backoff strategy. (The client's own retry is for transient
- *      5xx / network blips, not sustained 429s.)
+ *      response body has more detail. Caller (backfill cron) handles
+ *      backoff at per-process level — this client JUST surfaces the
+ *      retry hint and lets the caller decide the backoff strategy.
+ *      (The client's own retry is for transient 5xx / network blips,
+ *      not sustained 429s. Cross-process coordination via
+ *      lcm_voyage_rate_state preserved in deferred-features draft PR.)
  *
  *   3. Truncation policy explicit. We pass `truncation: false` so Voyage
  *      will reject (HTTP 400) any input over its per-document cap, rather
