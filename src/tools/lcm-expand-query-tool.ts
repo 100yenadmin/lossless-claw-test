@@ -894,14 +894,20 @@ async function runDelegatedExpandQuery(
       let citedIdsValidated: string[] = parsed.value.citedIds;
       let citedIdsRejectedAsFabricated = 0;
       if (parsed.value.citedIds.length > 0) {
+        // Wave-5 P2 fix: cap IN-list size before query so an LLM that
+        // emitted thousands of fabricated IDs doesn't blow SQLite's
+        // SQLITE_MAX_VARIABLE_NUMBER (default 32766). 1000 is well above
+        // any realistic citation count and well under the SQLite cap.
+        const CITATION_VALIDATION_CAP = 1000;
+        const idsToCheck = parsed.value.citedIds.slice(0, CITATION_VALIDATION_CAP);
         try {
           const dbForValidation = params.lcm.getDb();
-          const placeholders = parsed.value.citedIds.map(() => "?").join(",");
+          const placeholders = idsToCheck.map(() => "?").join(",");
           const rows = dbForValidation
             .prepare(
               `SELECT summary_id FROM summaries WHERE summary_id IN (${placeholders})`,
             )
-            .all(...parsed.value.citedIds) as Array<{ summary_id: string }>;
+            .all(...idsToCheck) as Array<{ summary_id: string }>;
           const real = new Set(rows.map((r) => r.summary_id));
           const filtered = parsed.value.citedIds.filter((id) => real.has(id));
           citedIdsRejectedAsFabricated = parsed.value.citedIds.length - filtered.length;

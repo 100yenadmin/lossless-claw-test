@@ -173,11 +173,17 @@ export async function runRecallEval(
     }
   }
 
-  // Wave-4 Auditor #15 P1 fix: per-query timeout. Default 30s.
-  // Only TIMEOUT errors are swallowed (recorded as zero recall);
-  // adapter-throws still propagate so the caller can debug a broken
-  // adapter rather than getting a silent zero-recall result.
-  const perQueryTimeoutMs = opts?.perQueryTimeoutMs ?? 30_000;
+  // Wave-4 Auditor #15 P1 fix + Wave-5 P2 clamp: per-query timeout.
+  // Default 30s. Clamp ≤0 / NaN to 30s — perQueryTimeoutMs=0 would
+  // resolve immediately and zero out every query's recall, with no
+  // error signal. Cap at 5min to prevent operator misuse.
+  const requestedTimeoutMs = opts?.perQueryTimeoutMs;
+  const perQueryTimeoutMs =
+    typeof requestedTimeoutMs === "number" &&
+    Number.isFinite(requestedTimeoutMs) &&
+    requestedTimeoutMs >= 100
+      ? Math.min(requestedTimeoutMs, 5 * 60 * 1000)
+      : 30_000;
   const TIMEOUT_SENTINEL = Symbol("recall-eval-timeout");
   const perQuery: RecallResult[] = [];
   for (const q of queries) {

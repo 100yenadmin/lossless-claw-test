@@ -166,6 +166,13 @@ export interface SynthesizeResult {
     selectedIndex: number;
     /** All candidate outputs, in order. */
     candidates: string[];
+    /**
+     * Wave-5 P2 fix: when caller-requested bestOfN exceeds the hard cap
+     * (5), the value used is clamped. Surface BOTH the requested + used
+     * values so callers can see the clamp + audit cost decisions.
+     */
+    requested?: number;
+    capped?: boolean;
   };
 }
 
@@ -235,19 +242,24 @@ export async function dispatchSynthesis(
 
   // 3. Branch on tier
   if (tier === "yearly") {
-    // Wave-4 Auditor #5 P1 fix: hard-cap bestOfN to prevent unbounded
-    // cost. Yearly fires N parallel Opus-thinking candidates + 1 judge.
-    // Without a cap, a caller passing bestOfN=100 would spend ~$100+ per
-    // call on a clean DB. Realistic best-of-N is 3-5; cap at 5.
+    // Wave-4 Auditor #5 P1 fix + Wave-5 P2: hard-cap bestOfN at 5 to
+    // prevent unbounded cost (caller passing bestOfN=100 would spend
+    // ~$100+ per yearly synthesis call). Surface clamp via `requested`
+    // + `capped` fields in the result so callers can see + audit it.
     const HARD_CAP_BEST_OF_N = 5;
     const requestedBestOfN = req.bestOfN ?? 3;
     const cappedBestOfN = Math.max(1, Math.min(HARD_CAP_BEST_OF_N, requestedBestOfN));
-    return await runBestOfNYearly(db, llmCall, req, primaryPrompt, model, {
+    const result = await runBestOfNYearly(db, llmCall, req, primaryPrompt, model, {
       bestOfN: cappedBestOfN,
       auditIds,
       addLatency: (ms) => (totalLatencyMs += ms),
       addCost: (c) => (totalCostCents += c ?? 0),
     });
+    if (result.bestOfN) {
+      result.bestOfN.requested = requestedBestOfN;
+      result.bestOfN.capped = requestedBestOfN > HARD_CAP_BEST_OF_N;
+    }
+    return result;
   }
 
   // 4. Standard single-pass (daily/weekly/custom/filtered): one LLM call

@@ -64,19 +64,41 @@ type DoctorTargetRow = {
 
 /**
  * Detect broken summary markers that doctor should flag or repair.
- * Wave-4 Auditor #18 P0 fix: also detects v4.1 fallback markers
- * (prefix-form, both truncated + full variants).
+ *
+ * Marker classification:
+ * - `"old"` — startsWith the legacy FALLBACK_SUMMARY_MARKER. Practically
+ *   unreachable: pre-Wave-4 summarize.ts emitted the legacy marker as a
+ *   trailing SUFFIX on truncated content, never as a prefix. Kept for
+ *   defense-in-depth in case any future code path emits the legacy
+ *   marker as a prefix; legacy data is detected via the trailing-suffix
+ *   `fallbackIndex` branch below and classified `"fallback"`.
+ * - `"fallback"` — legacy SUFFIX marker on truncated content (pre-Wave-4
+ *   data) OR new v4.1 PREFIX markers (both truncated + full variants
+ *   from Wave-4). Both classifications collapse to "fallback" because
+ *   the repair semantics are identical (re-summarize the source).
+ * - `"new"` — TRUNCATED_SUMMARY_PREFIX trailing-suffix marker (different
+ *   condition: "summary was emitted but content was truncated for size",
+ *   distinct from "summarizer fell back").
+ *
+ * Wave-5 P3 clarification: the comment-vs-code intent gap noted by the
+ * Wave-5 audit; the "old" branch was historically dead code for legitimate
+ * data, but the v4.1 prefix markers MAY trigger it (start-of-string check
+ * is correct for them — but they take the v4.1 branch first since it
+ * checks for the LONGER prefix).
  */
 export function detectDoctorMarker(content: string): DoctorMarkerKind | null {
-  if (content.startsWith(FALLBACK_SUMMARY_MARKER)) {
-    return "old";
-  }
-  // v4.1 fallback markers: always at start (prefix form)
+  // v4.1 fallback markers: always at start (prefix form). Check FIRST
+  // because the v4.1 truncated marker prefix is longer than the legacy
+  // marker — though the strings differ at "; truncated" vs " — model"
+  // so there's no actual collision; this ordering is just for clarity.
   if (
     content.startsWith(FALLBACK_SUMMARY_MARKER_V41_TRUNC) ||
     content.startsWith(FALLBACK_SUMMARY_MARKER_V41_FULL)
   ) {
     return "fallback";
+  }
+  if (content.startsWith(FALLBACK_SUMMARY_MARKER)) {
+    return "old";
   }
 
   const truncatedIndex = content.indexOf(TRUNCATED_SUMMARY_PREFIX);

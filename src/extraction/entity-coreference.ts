@@ -206,10 +206,16 @@ export async function runCoreferenceTick(
       itemDetail.error = errMsg;
       result.extractorFailures++;
       result.perItem.push(itemDetail);
-      // Wave-4 Auditor #12 P1-1 fix: bump attempts + record last_error so
-      // the dead-letter gate (attempts < MAX_ATTEMPTS) actually fires
-      // after enough retries. Without this, the queue row attempts column
-      // stayed at 0 forever and the same poison row burned tick budgets.
+      // Wave-4 Auditor #12 P1-1 fix + Wave-5 P1 fix: bump attempts +
+      // record last_error so the dead-letter gate (attempts < MAX_ATTEMPTS)
+      // actually fires after enough retries. Without this, the queue row
+      // attempts column stayed at 0 forever and the same poison row burned
+      // tick budgets.
+      //
+      // Wave-5 fix: if THIS UPDATE itself fails (DB locked, schema race),
+      // log the secondary failure and surface in itemDetail so callers
+      // can see the dead-letter mechanism is broken — was previously
+      // silent + would loop forever.
       try {
         db.prepare(
           `UPDATE lcm_extraction_queue
@@ -217,8 +223,12 @@ export async function runCoreferenceTick(
                  last_error = ?
              WHERE queue_id = ?`,
         ).run(errMsg.slice(0, 500), item.queue_id);
-      } catch {
-        // best-effort; don't let this masking the original error
+      } catch (updateErr) {
+        const updateErrMsg = updateErr instanceof Error ? updateErr.message : String(updateErr);
+        itemDetail.error = `${errMsg} | dead-letter-update-failed: ${updateErrMsg}`;
+        // Don't break the loop — other items may still be processable.
+        // But the operator will see the merged error in the per-item
+        // diagnostics.
       }
       continue; // don't mark queue row processed — next tick will retry (until attempts >= MAX_ATTEMPTS)
     }

@@ -304,12 +304,17 @@ export class RetrievalEngine {
       truncated: false,
     };
 
-    // Wave-4 Auditor #7 P1 fix: cycle-guard. The DAG is acyclic by
-    // invariant, but if a doctor bug or migration produces a cycle, the
-    // recursion would loop forever (default tokenCap is Infinity in some
-    // call paths). Track visited summaryIds and short-circuit re-entry.
-    const visited = new Set<string>();
-    await this.expandRecursive(input.summaryId, depth, includeMessages, tokenCap, result, visited);
+    // Wave-4 Auditor #7 P1 fix + Wave-5 P1 fix: cycle-guard. The DAG is
+    // acyclic by invariant, but if a doctor bug or migration produces a
+    // cycle, the recursion would loop forever (default tokenCap is
+    // Infinity in some call paths). Track ACTIVE call-stack ancestors
+    // (in-flight DFS path) — NOT all-time visits. This prevents cycles
+    // without breaking legitimate cross-path re-entry: if A→B and C→B
+    // (B reachable from two distinct ancestors), B's subtree is
+    // explored under each ancestor as before. We `add` on entry, `delete`
+    // on return, so the set always reflects the current call stack only.
+    const stackAncestors = new Set<string>();
+    await this.expandRecursive(input.summaryId, depth, includeMessages, tokenCap, result, stackAncestors);
 
     return result;
   }
@@ -320,7 +325,7 @@ export class RetrievalEngine {
     includeMessages: boolean,
     tokenCap: number,
     result: ExpandResult,
-    visited: Set<string>,
+    stackAncestors: Set<string>,
   ): Promise<void> {
     if (depth <= 0) {
       return;
@@ -328,12 +333,27 @@ export class RetrievalEngine {
     if (result.truncated) {
       return;
     }
-    // Cycle guard
-    if (visited.has(summaryId)) {
+    // Cycle guard: if this id is an ancestor on the current call stack,
+    // we've hit a cycle — return without exploring (would loop forever).
+    if (stackAncestors.has(summaryId)) {
       return;
     }
-    visited.add(summaryId);
+    stackAncestors.add(summaryId);
+    try {
+      await this.expandRecursiveInner(summaryId, depth, includeMessages, tokenCap, result, stackAncestors);
+    } finally {
+      stackAncestors.delete(summaryId);
+    }
+  }
 
+  private async expandRecursiveInner(
+    summaryId: string,
+    depth: number,
+    includeMessages: boolean,
+    tokenCap: number,
+    result: ExpandResult,
+    stackAncestors: Set<string>,
+  ): Promise<void> {
     const summary = await this.summaryStore.getSummary(summaryId);
     if (!summary) {
       return;
@@ -367,7 +387,7 @@ export class RetrievalEngine {
 
         // Recurse into children if depth allows
         if (depth > 1) {
-          await this.expandRecursive(child.summaryId, depth - 1, includeMessages, tokenCap, result, visited);
+          await this.expandRecursive(child.summaryId, depth - 1, includeMessages, tokenCap, result, stackAncestors);
         }
       }
     } else if (summary.kind === "leaf" && includeMessages) {

@@ -408,7 +408,16 @@ export function recordEmbedding(
   // wrapped with the meta INSERT in a SAVEPOINT so the pair is atomic
   // (compounds with Wave-1's writeBatch SAVEPOINT-per-row in
   // backfill.ts — that protects bulk paths; this protects all callers).
-  const sp = `re_${Math.floor(Math.random() * 0xffffff).toString(16)}`;
+  //
+  // Wave-5 P1 fix: SAVEPOINT name uses crypto.randomUUID-derived hex
+  // (was Math.random 24-bit, ~1/4096 collision risk under concurrent
+  // outer-tx callers). 12 hex chars = 48 bits, collision-free for any
+  // realistic concurrency.
+  const cryptoSuffix =
+    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID().replace(/-/g, "").slice(0, 12)
+      : `${Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, "0")}${Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, "0")}`;
+  const sp = `re_${cryptoSuffix}`;
   db.exec(`SAVEPOINT ${sp}`);
   try {
     db.prepare(

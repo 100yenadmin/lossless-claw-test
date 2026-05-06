@@ -281,32 +281,62 @@ function getSynthesisHealth(db: DatabaseSync): SynthesisHealth {
   const distinctMemoryTypes = new Set<string>();
   for (const p of activePrompts) distinctMemoryTypes.add(p.memoryType);
 
+  // Wave-5 P2 fix: split into 4 separate queries so each hits a partial
+  // index (lcm_synthesis_audit_started_gc_idx for stale-started,
+  // lcm_synthesis_audit_completed_gc_idx for stale-done; the 7-day +
+  // total queries scan via primary key but are O(n) bounded). Previously
+  // a single SELECT with multiple SUM(CASE...) couldn't use any partial
+  // index → O(n) full table scan → /lcm health latency degraded
+  // precisely under the "millions of stale rows" condition this is
+  // meant to surface.
   let recentRuns = 0;
   let totalAuditRows = 0;
   let startedRowsOlderThan1h = 0;
   let completedOrFailedOlderThan30d = 0;
   try {
-    const row = db
-      .prepare(
-        `SELECT
-           COUNT(*) AS total,
-           SUM(CASE WHEN ran_at >= datetime('now', '-7 days') THEN 1 ELSE 0 END) AS recent,
-           SUM(CASE WHEN status = 'started' AND ran_at < datetime('now', '-1 hour') THEN 1 ELSE 0 END) AS stale_started,
-           SUM(CASE WHEN status IN ('completed', 'failed') AND ran_at < datetime('now', '-30 days') THEN 1 ELSE 0 END) AS stale_done
-         FROM lcm_synthesis_audit`,
-      )
-      .get() as {
-      total?: number;
-      recent?: number;
-      stale_started?: number;
-      stale_done?: number;
-    } | undefined;
-    totalAuditRows = row?.total ?? 0;
-    recentRuns = row?.recent ?? 0;
-    startedRowsOlderThan1h = row?.stale_started ?? 0;
-    completedOrFailedOlderThan30d = row?.stale_done ?? 0;
+    const totalRow = db
+      .prepare(`SELECT COUNT(*) AS n FROM lcm_synthesis_audit`)
+      .get() as { n?: number } | undefined;
+    totalAuditRows = totalRow?.n ?? 0;
   } catch {
-    // Table may not exist yet (fresh DB before any synthesis); leave at 0
+    // Table may not exist yet
+  }
+  try {
+    const recentRow = db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM lcm_synthesis_audit
+           WHERE ran_at >= datetime('now', '-7 days')`,
+      )
+      .get() as { n?: number } | undefined;
+    recentRuns = recentRow?.n ?? 0;
+  } catch {
+    // Table may not exist yet
+  }
+  try {
+    // Hits lcm_synthesis_audit_started_gc_idx
+    const staleStartedRow = db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM lcm_synthesis_audit
+           WHERE status = 'started'
+             AND ran_at < datetime('now', '-1 hour')`,
+      )
+      .get() as { n?: number } | undefined;
+    startedRowsOlderThan1h = staleStartedRow?.n ?? 0;
+  } catch {
+    // ignore
+  }
+  try {
+    // Hits lcm_synthesis_audit_completed_gc_idx
+    const staleDoneRow = db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM lcm_synthesis_audit
+           WHERE status IN ('completed', 'failed')
+             AND ran_at < datetime('now', '-30 days')`,
+      )
+      .get() as { n?: number } | undefined;
+    completedOrFailedOlderThan30d = staleDoneRow?.n ?? 0;
+  } catch {
+    // ignore
   }
   return {
     activePromptCount: activePrompts.length,
