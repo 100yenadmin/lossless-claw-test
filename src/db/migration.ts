@@ -1613,6 +1613,16 @@ export function runLcmMigrations(
           ON lcm_synthesis_audit (ran_at)
           WHERE status = 'started'
       `);
+      // Wave-3 Auditor #1 fix M1: add a parallel index for the 30-day GC
+      // sweep on `completed`/`failed` rows. Without this, the GC runs a
+      // full table scan on every `lcm_synthesize_around` call (the GC is
+      // inline per-call by design). With this partial index, the sweep
+      // is O(log n) on a hot DB.
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_synthesis_audit_completed_gc_idx
+          ON lcm_synthesis_audit (ran_at)
+          WHERE status IN ('completed', 'failed')
+      `);
     });
 
     // ── v4.1 eval harness tables (A.05) ─────────────────────────────────────

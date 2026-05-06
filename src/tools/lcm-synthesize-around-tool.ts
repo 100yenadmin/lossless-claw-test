@@ -597,49 +597,105 @@ export function createLcmSynthesizeAroundTool(input: {
       }
       const initialPromptId = promptCheckRow.prompt_id;
 
-      // Wave-1 Auditor #3 fix #1+#5: single-flight via INSERT OR IGNORE on
-      // the UNIQUE lookup index (session_key, range_start, range_end,
+      // Wave-1 Auditor #3 fix #1+#5 + Wave-2 Auditor #1 fix #2 + Wave-3
+      // Auditor #1 fixes (H2 + M1 + M2): single-flight via INSERT OR IGNORE
+      // on the UNIQUE lookup index (session_key, range_start, range_end,
       // leaf_fingerprint, COALESCE(grep_filter,'')).
       //
       // Pre-write janitor:
       //   1. Reap zombie 'building' rows older than 10 min (process killed
       //      mid-dispatch can leave them blocking the latch).
-      //   2. Wave-2 Auditor #1 fix #2: ALSO reap 'failed' rows older than
-      //      10 min so a transient dispatch failure doesn't poison the
-      //      tuple permanently. Without this, a single LLM 5xx would
-      //      block all future synthesis of the same window forever
-      //      (caller hits the row, sees status='failed', loops on
-      //      "building_elsewhere" hint or our retry path — neither is
-      //      correct semantics).
+      //   2. Reap 'failed' rows older than the FAILURE_BACKOFF_MIN (start
+      //      at 10 min; doubles per repeated failure, capped at 6h). This
+      //      avoids hammering the LLM during long outages: instead of
+      //      retrying every 10 min, we back off exponentially.
+      //   3. Both DELETE + INSERT OR IGNORE wrapped in BEGIN IMMEDIATE so
+      //      cross-process callers can't sneak in between.
       //
       // Audit row may have already been written by the dispatcher; FK
       // ON DELETE CASCADE on lcm_synthesis_audit handles it (per
       // migration.ts:1574).
       const ZOMBIE_TTL_MIN = 10;
+      const FAILED_BACKOFF_HARD_CAP_MIN = 6 * 60; // 6h ceiling
+
+      // Wave-3 fix M2: wrap janitor + INSERT in a single transaction so
+      // a concurrent caller can't steal the tuple between our DELETE and
+      // INSERT-OR-IGNORE. SQLite's BEGIN IMMEDIATE acquires the write
+      // lock at transaction start, serializing all writers.
+      let txStarted = false;
       try {
+        db.exec("BEGIN IMMEDIATE");
+        txStarted = true;
+      } catch {
+        // Another writer holds the lock — proceed without our own tx
+        // and let the INSERT OR IGNORE do its work. Worst case we get a
+        // benign latch loss.
+      }
+      try {
+        // Building zombies: simple 10-min TTL.
         db.prepare(
           `DELETE FROM lcm_synthesis_cache
-             WHERE status IN ('building', 'failed')
+             WHERE status = 'building'
                AND building_started_at IS NOT NULL
-               AND datetime(building_started_at) < datetime('now', ?)`,
+               AND julianday(building_started_at) < julianday('now', ?)`,
         ).run(`-${ZOMBIE_TTL_MIN} minutes`);
-      } catch {
-        // best-effort; if it fails the INSERT below will still proceed
-        // and the operator can manually clean.
-      }
 
-      // Audit GC (Auditor #3 #2): reap orphaned 'started' audit rows
-      // (>1 hour) and aged 'completed'/'failed' rows (>30 days). Both are
-      // documented retention policies in the schema. Cheap to do here
-      // since we're already in a write path.
-      try {
+        // Failed rows: count attempts via lcm_synthesis_audit (rows with
+        // status='failed' targeting the same cache_id) and apply
+        // exponential backoff: TTL_MIN * 2^attempts, capped 6h.
+        // For SQLite's strftime arithmetic we compute the threshold as
+        // a julianday delta. We do the count + delete in two steps for
+        // clarity (small audit table; no perf concern).
+        const failedRows = db
+          .prepare(
+            `SELECT cache_id, building_started_at FROM lcm_synthesis_cache
+               WHERE status = 'failed'
+                 AND building_started_at IS NOT NULL`,
+          )
+          .all() as Array<{ cache_id: string; building_started_at: string }>;
+        for (const fr of failedRows) {
+          // Count prior failure-audits for this cache to compute backoff.
+          const auditCountRow = db
+            .prepare(
+              `SELECT COUNT(*) AS n FROM lcm_synthesis_audit
+                 WHERE target_cache_id = ? AND status = 'failed'`,
+            )
+            .get(fr.cache_id) as { n: number };
+          const attempts = Math.max(1, auditCountRow?.n ?? 1);
+          const backoffMin = Math.min(
+            ZOMBIE_TTL_MIN * 2 ** Math.max(0, attempts - 1),
+            FAILED_BACKOFF_HARD_CAP_MIN,
+          );
+          // Reap iff started > backoffMin minutes ago.
+          db.prepare(
+            `DELETE FROM lcm_synthesis_cache
+               WHERE cache_id = ?
+                 AND status = 'failed'
+                 AND building_started_at IS NOT NULL
+                 AND julianday(building_started_at) < julianday('now', ?)`,
+          ).run(fr.cache_id, `-${backoffMin} minutes`);
+        }
+
+        // Audit GC (Wave-1 Auditor #3 #2 + Wave-3 Auditor #1 M1): reap
+        // orphaned 'started' rows >1 hour and aged 'completed'/'failed'
+        // rows >30 days. Wave-3 noted the 30-day branch was unindexed —
+        // we added an index in this commit (see migration.ts) and now
+        // both branches scan via index.
         db.prepare(
           `DELETE FROM lcm_synthesis_audit
-             WHERE (status = 'started' AND datetime(ran_at) < datetime('now', '-1 hour'))
-                OR (status IN ('completed','failed') AND datetime(ran_at) < datetime('now', '-30 days'))`,
+             WHERE (status = 'started' AND julianday(ran_at) < julianday('now', '-1 hour'))
+                OR (status IN ('completed','failed') AND julianday(ran_at) < julianday('now', '-30 days'))`,
         ).run();
       } catch {
-        // best-effort
+        // best-effort; the INSERT below will still proceed.
+      } finally {
+        if (txStarted) {
+          try {
+            db.exec("COMMIT");
+          } catch {
+            try { db.exec("ROLLBACK"); } catch {}
+          }
+        }
       }
 
       // INSERT OR IGNORE — UNIQUE collision means another caller already
@@ -699,9 +755,14 @@ export function createLcmSynthesizeAroundTool(input: {
         // ready-cache hit threw `no such column: output` instead of
         // returning the cached synthesis. Single-flight winner-already-ready
         // fast-path was completely broken. This fix uses the real columns.
+        //
+        // Wave-3 Auditor #1 fix H1: also SELECT `failure_reason` so the
+        // recent_failure response surfaces the actual cause to the caller
+        // (was hidden one column away).
         const winner = db
           .prepare(
-            `SELECT cache_id, status, content, output_token_count, building_started_at
+            `SELECT cache_id, status, content, output_token_count,
+                    building_started_at, failure_reason
                FROM lcm_synthesis_cache
                WHERE session_key = ? AND range_start = ? AND range_end = ?
                  AND leaf_fingerprint = ? AND COALESCE(grep_filter, '') = ''
@@ -719,6 +780,7 @@ export function createLcmSynthesizeAroundTool(input: {
               content: string | null;
               output_token_count: number | null;
               building_started_at: string | null;
+              failure_reason: string | null;
             }
           | undefined;
         if (winner?.status === "ready" && winner.content != null) {
@@ -731,24 +793,48 @@ export function createLcmSynthesizeAroundTool(input: {
             single_flight_outcome: "winner_already_ready",
           });
         }
-        // Note: 'failed' rows older than 10 min were just reaped by the
-        // janitor above. If we still see 'failed' here it's recent — surface
-        // the failure so caller doesn't loop forever.
         if (winner?.status === "failed") {
+          // Wave-3 Auditor #1 H1: include failure_reason so caller knows
+          // WHY (was just "A recent attempt failed; retry"). Compute
+          // retry_after_ms based on building_started_at + 10 min so caller
+          // can sleep precisely instead of polling.
+          const startedAtMs = winner.building_started_at
+            ? new Date(winner.building_started_at).getTime()
+            : null;
+          const retryAfterMs =
+            startedAtMs != null
+              ? Math.max(0, startedAtMs + 10 * 60 * 1000 - Date.now())
+              : null;
           return jsonResult({
             status: "recent_failure",
             cache_id: winner.cache_id,
             building_started_at: winner.building_started_at,
-            hint:
-              "A recent attempt at this same window failed. The janitor will reap it after 10 minutes; retry then or pass slightly different criteria to bypass the failed cache row.",
+            failure_reason: winner.failure_reason,
+            retry_after_ms: retryAfterMs,
+            hint: winner.failure_reason
+              ? `Last attempt failed: ${String(winner.failure_reason).slice(0, 200)}. Retries are exponentially backed off (10 min × 2^attempt, capped 6h). Wait retry_after_ms then re-call, or pass slightly different criteria.`
+              : "A recent attempt failed. Retries are exponentially backed off; wait retry_after_ms or pass slightly different criteria.",
             single_flight_outcome: "lost_latch",
           });
         }
+        // Wave-3 Auditor #1 H3: building_elsewhere now includes
+        // retry_after_ms so the caller can sleep precisely once instead
+        // of polling. Computed from building_started_at + zombie TTL
+        // (10 min) so we converge on the same exhaustion that the
+        // janitor uses.
+        const startedAtMs = winner?.building_started_at
+          ? new Date(winner.building_started_at).getTime()
+          : null;
+        const retryAfterMs =
+          startedAtMs != null
+            ? Math.max(0, startedAtMs + 10 * 60 * 1000 - Date.now())
+            : null;
         return jsonResult({
           status: "building_elsewhere",
           cache_id: winner?.cache_id ?? "(unknown)",
           building_started_at: winner?.building_started_at ?? null,
-          hint: "Another caller is synthesizing the same window. Retry in a few seconds.",
+          retry_after_ms: retryAfterMs,
+          hint: "Another caller is synthesizing the same window. Wait retry_after_ms (or a few seconds) before retrying — the janitor will reap stalled work after 10 minutes max.",
           single_flight_outcome: "lost_latch",
         });
       }

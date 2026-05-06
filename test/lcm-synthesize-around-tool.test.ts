@@ -583,3 +583,49 @@ describe.skipIf(!VEC0_AVAILABLE)("createLcmSynthesizeAroundTool — semantic hap
     db.close();
   });
 });
+
+// Wave-3 Auditor #7 fix: regression test for the Wave-2 Auditor #1 #1
+// crash bug. Loser-path SELECT used to query column `output` but the
+// schema has `content`. Every concurrent ready-cache hit threw
+// `no such column: output`. We unit-test the SQL directly here.
+describe("lcm_synthesis_cache schema column names (Wave-2 crash regression)", () => {
+  it("schema has `content` column (not `output`) — loser-path SELECT must use this name", () => {
+    const db = setupDb();
+    const cols = db
+      .prepare(`PRAGMA table_info(lcm_synthesis_cache)`)
+      .all() as Array<{ name: string }>;
+    const colNames = cols.map((c) => c.name);
+    expect(colNames).toContain("content");
+    expect(colNames).not.toContain("output");
+    // The SELECT in lcm-synthesize-around-tool.ts loser-path uses these
+    // exact column names — verify they all exist.
+    for (const required of [
+      "cache_id",
+      "status",
+      "content",
+      "output_token_count",
+      "building_started_at",
+      "failure_reason", // Wave-3 H1 fix
+    ]) {
+      expect(colNames).toContain(required);
+    }
+    db.close();
+  });
+
+  it("the literal SELECT used by the loser-path executes without error", () => {
+    const db = setupDb();
+    // Direct SQL test — same query the tool runs at the loser-path:
+    const stmt = db.prepare(
+      `SELECT cache_id, status, content, output_token_count,
+              building_started_at, failure_reason
+         FROM lcm_synthesis_cache
+         WHERE session_key = ? AND range_start = ? AND range_end = ?
+           AND leaf_fingerprint = ? AND COALESCE(grep_filter, '') = ''
+         ORDER BY building_started_at DESC LIMIT 1`,
+    );
+    // Should not throw — empty result is fine.
+    const row = stmt.get("nonexistent", "2026-01-01", "2026-01-31", "fp");
+    expect(row).toBeUndefined();
+    db.close();
+  });
+});

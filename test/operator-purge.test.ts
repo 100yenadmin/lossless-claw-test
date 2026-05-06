@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { runLcmMigrations } from "../src/db/migration.js";
-import { PurgeError, runPurge } from "../src/operator/purge.js";
+import { PurgeError, previewPurgeAffected, runPurge } from "../src/operator/purge.js";
 
 function setupDb(): DatabaseSync {
   const db = new DatabaseSync(":memory:");
@@ -207,6 +207,80 @@ describe("operator-purge — atomic transaction", () => {
       .get() as { contains_suppressed_leaves: number };
     expect(leaf.suppressed_at).not.toBeNull();
     expect(cond.contains_suppressed_leaves).toBe(1);
+    db.close();
+  });
+});
+
+// Wave-3 Auditor #7 fix: previewPurgeAffected was added in Wave-2 but
+// had ZERO tests pinning it. The whole purpose is preview/apply parity
+// — the dry-run count MUST equal the actual affected count.
+describe("operator-purge — previewPurgeAffected parity (Wave-2 BUG-2/BUG-3 regression)", () => {
+  it("preview count matches affectedLeafIds.length when applied (range purge)", () => {
+    const db = setupDb();
+    insertLeaf(db, "leaf_a", 1, "a");
+    insertLeaf(db, "leaf_b", 1, "b");
+    insertLeaf(db, "leaf_c", 1, "c");
+    // One already-suppressed leaf — should NOT be counted
+    insertLeaf(db, "leaf_already", 1, "already");
+    db.prepare(`UPDATE summaries SET suppressed_at = datetime('now') WHERE summary_id = 'leaf_already'`).run();
+
+    const opts = { sessionKey: "sk1", reason: "regression-test" };
+    const preview = previewPurgeAffected(db, opts);
+    const result = runPurge(db, opts);
+    expect(preview).toBe(result.affectedLeafIds.length);
+    expect(preview).toBe(3); // 3 unsuppressed leaves
+    db.close();
+  });
+
+  it("preview count for --summary-ids filters out non-leaf and already-suppressed", () => {
+    const db = setupDb();
+    insertLeaf(db, "leaf_real", 1, "x");
+    insertCondensed(db, "cond_x", 1, ["leaf_real"]);
+    db.prepare(
+      `INSERT INTO summaries (summary_id, conversation_id, kind, content, token_count, session_key, suppressed_at)
+       VALUES ('leaf_supp', 1, 'leaf', 'x', 1, 'sk1', datetime('now'))`,
+    ).run();
+
+    // User passes 4 ids: 1 valid leaf, 1 condensed (filtered out), 1
+    // already-suppressed (filtered out), 1 nonexistent (filtered out).
+    const opts = {
+      summaryIds: ["leaf_real", "cond_x", "leaf_supp", "ghost_id"],
+      reason: "regression",
+    };
+    const preview = previewPurgeAffected(db, opts);
+    const result = runPurge(db, opts);
+    expect(preview).toBe(1);
+    expect(result.affectedLeafIds).toEqual(["leaf_real"]);
+    db.close();
+  });
+
+  it("preview reflects since/before time-filter exactly like runPurge", () => {
+    const db = setupDb();
+    insertLeaf(db, "leaf_old", 1);
+    insertLeaf(db, "leaf_new", 1);
+    db.prepare(`UPDATE summaries SET created_at = '2026-01-01 00:00:00' WHERE summary_id = 'leaf_old'`).run();
+    db.prepare(`UPDATE summaries SET created_at = '2026-05-01 00:00:00' WHERE summary_id = 'leaf_new'`).run();
+
+    const opts = {
+      sessionKey: "sk1",
+      since: new Date("2026-04-01T00:00:00Z"),
+      reason: "regression",
+    };
+    const preview = previewPurgeAffected(db, opts);
+    const result = runPurge(db, opts);
+    expect(preview).toBe(result.affectedLeafIds.length);
+    expect(result.affectedLeafIds).toEqual(["leaf_new"]);
+    db.close();
+  });
+
+  it("preview returns 0 when no leaves match (clean negative)", () => {
+    const db = setupDb();
+    insertLeaf(db, "leaf_a", 1);
+    const preview = previewPurgeAffected(db, {
+      sessionKey: "non-existent-session",
+      reason: "test",
+    });
+    expect(preview).toBe(0);
     db.close();
   });
 });

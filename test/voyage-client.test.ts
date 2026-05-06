@@ -244,6 +244,67 @@ describe("voyage client — embedTexts error handling", () => {
     expect(caught?.retryAfterMs).toBe(2000);
   });
 
+  // Wave-3 Auditor #2 fix F1: Voyage Retry-After lock-budget regression
+  it("Retry-After > 60s threshold throws immediately (does NOT sleep) — Wave-2 LOCK_BUDGET fix", async () => {
+    let calls = 0;
+    const fetch = mockFetch(async () => {
+      calls++;
+      return mockResponse({ error: "slow down" }, {
+        status: 429,
+        headers: { "Retry-After": "120" }, // 2 min > 60s threshold
+      });
+    });
+    let caught: VoyageError | null = null;
+    const startedAt = Date.now();
+    try {
+      await embedTexts({
+        model: "voyage-4-large",
+        texts: ["x"],
+        inputType: "document",
+        apiKey: "k",
+        fetch,
+        // Allow 2 retries — but 120s > 60s threshold should still throw
+        // immediately without sleeping or retrying.
+        maxRetries: 2,
+      });
+    } catch (e) {
+      caught = e as VoyageError;
+    }
+    const elapsed = Date.now() - startedAt;
+    expect(calls).toBe(1); // ONE call, no retries
+    expect(caught?.kind).toBe("rate_limit");
+    expect(caught?.retryAfterMs).toBe(120_000); // server value preserved
+    expect(elapsed).toBeLessThan(2000); // did NOT sleep — proved by elapsed time
+  });
+
+  // Wave-3 Auditor #2 fix F1: short Retry-After honored verbatim
+  it("Retry-After ≤ 60s sleeps server-supplied value then retries", async () => {
+    let calls = 0;
+    const fetch = mockFetch(async () => {
+      calls++;
+      if (calls === 1) {
+        return mockResponse({ error: "slow down" }, {
+          status: 429,
+          headers: { "Retry-After": "0.05" }, // 50ms; well under 60s threshold
+        });
+      }
+      return mockResponse({
+        data: [{ embedding: [0.1, 0.2, 0.3], index: 0 }],
+        usage: { total_tokens: 5 },
+      });
+    });
+    const result = await embedTexts({
+      model: "voyage-4-large",
+      texts: ["x"],
+      inputType: "document",
+      apiKey: "k",
+      fetch,
+      maxRetries: 1,
+    });
+    expect(calls).toBe(2); // First 429, second success
+    expect(result.totalTokens).toBe(5);
+  });
+
   it("retries on 5xx then succeeds — caller never sees the transient failure", async () => {
     let calls = 0;
     const fetch = mockFetch(async () => {

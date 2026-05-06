@@ -711,17 +711,43 @@ async function runSemanticLcmGrep(input: HybridGrepInput) {
   lines.push(`**Model:** ${semResult.modelName ?? "unknown"}`);
   lines.push("");
 
+  // Wave-3 Auditor #4 fix #5: parity with lcm_semantic_recall — emit
+  // confidenceBand based on top-hit cosineSimilarity. Same calibration
+  // (≥0.65 high / ≥0.5 medium / ≥0.35 low / <0.35 noise / no-match).
+  const topCos = semResult.hits[0]?.cosineSimilarity ?? -1;
+  const confidenceBand =
+    semResult.hits.length === 0
+      ? "no-match"
+      : topCos >= 0.65
+        ? "high"
+        : topCos >= 0.5
+          ? "medium"
+          : topCos >= 0.35
+            ? "low"
+            : "noise";
+  if (semResult.hits.length > 0) {
+    lines.push(`**Confidence (top hit):** ${confidenceBand} (cosine=${topCos.toFixed(3)})`);
+  }
+  lines.push("");
+
   if (semResult.hits.length === 0) {
     lines.push(
       "_No semantic matches. Try mode='hybrid' for rerank-boosted recall, or mode='regex'/'full_text' for keyword-only._",
     );
   } else {
+    if (confidenceBand === "low" || confidenceBand === "noise") {
+      lines.push(
+        `*Note: top-hit cosine ${topCos.toFixed(3)} is below the medium-confidence threshold (0.5). Treat results as candidates, not answers.*`,
+      );
+      lines.push("");
+    }
     lines.push("### Hits (ranked by semantic distance — lower = more similar)");
     lines.push("");
     let currentChars = lines.join("\n").length;
     for (const hit of semResult.hits) {
       const snippet = truncateSnippet(hit.content);
-      const line = `- [${hit.summaryId}] (${hit.kind}, dist=${hit.distance.toFixed(3)}, ${formatDisplayTime(hit.createdAt, timezone)}): ${snippet}`;
+      const cosStr = hit.cosineSimilarity.toFixed(3);
+      const line = `- [${hit.summaryId}] (${hit.kind}, cosine=${cosStr}, ${formatDisplayTime(hit.createdAt, timezone)}): ${snippet}`;
       if (currentChars + line.length > MAX_RESULT_CHARS) {
         lines.push("*(truncated — more results available)*");
         break;
@@ -739,11 +765,19 @@ async function runSemanticLcmGrep(input: HybridGrepInput) {
       totalMatches: semResult.hits.length,
       voyageTokensConsumed: semResult.voyageTokensConsumed,
       modelName: semResult.modelName,
+      // Wave-3 Auditor #4 fix #5: confidenceBand mirrors lcm_semantic_recall
+      confidenceBand,
+      // Wave-3 Auditor #4 fix #3: include conversationId + tokenCount
+      // (was missing — broke parity with hybrid mode + semantic-recall).
+      // cosineSimilarity is the standard cross-tool field.
       hits: semResult.hits.map((h) => ({
         summaryId: h.summaryId,
+        conversationId: h.conversationId,
         sessionKey: h.sessionKey,
         kind: h.kind,
         distance: h.distance,
+        cosineSimilarity: h.cosineSimilarity,
+        tokenCount: h.tokenCount,
         createdAt: h.createdAt,
       })),
     },
