@@ -59,6 +59,7 @@ import { countPendingDocs as countBackfillPending } from "../embeddings/backfill
 import { getActiveEmbeddingModel } from "../embeddings/semantic-search.js";
 import { runHybridSearch } from "../embeddings/hybrid-search.js";
 import { vec0Version } from "../embeddings/store.js";
+import { MAX_TOKENS_PER_EMBED_DOC } from "../voyage/client.js";
 import { SummaryStore } from "../store/summary-store.js";
 import { getLcmDbFeatures } from "../db/features.js";
 
@@ -1849,16 +1850,67 @@ async function buildWorkerTickBackfillText(params: { db: DatabaseSync }): Promis
   }
 
   const pendingAfter = countBackfillPending(params.db, { modelName: active.modelName });
+  // Wave-10 reviewer P2 fix: countBackfillPending excludes leaves with
+  // token_count > MAX_TOKENS_PER_EMBED_DOC, so an "over-cap" leaf is
+  // neither pending nor backfilled — invisible to the in-range count.
+  // Previously the "Backfill complete" message printed even when over-cap
+  // leaves remained unembedded, lying about coverage. Count them
+  // separately and include in the completion message.
+  const overCapPending = countOverCapPendingForBackfill(
+    params.db,
+    active.modelName,
+  );
   lines.push("");
-  lines.push(`**Pending docs after tick**: ${pendingAfter}`);
+  lines.push(`**Pending docs after tick** (in-range): ${pendingAfter}`);
+  if (overCapPending > 0) {
+    lines.push(
+      `**Over-cap leaves** (>${MAX_TOKENS_PER_EMBED_DOC.toLocaleString()} tokens, NOT embeddable): ${overCapPending} — re-summarize at a smaller cap to bring them into range.`,
+    );
+  }
   if (pendingAfter > 0) {
     lines.push("");
     lines.push(`Re-run \`${VISIBLE_COMMAND} worker tick embedding-backfill\` to continue.`);
+  } else if (overCapPending > 0) {
+    lines.push("");
+    lines.push(
+      `⚠️  In-range backfill complete, but ${overCapPending} over-cap leaves remain unembedded. Semantic recall coverage is partial — over-cap leaves will not surface via \`lcm_semantic_recall\` or \`lcm_grep --mode hybrid\`.`,
+    );
   } else {
     lines.push("");
     lines.push("✅ Backfill complete. `lcm_semantic_recall` and `lcm_grep --mode hybrid` should now return real results.");
   }
   return lines.join("\n");
+}
+
+/**
+ * Wave-10 reviewer P2 fix: count over-cap leaves not yet embedded for
+ * the active profile. Mirrors the SQL in src/operator/health.ts but
+ * scoped here so the worker-tick output is honest.
+ */
+function countOverCapPendingForBackfill(
+  db: DatabaseSync,
+  modelName: string,
+): number {
+  try {
+    const row = db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM summaries s
+           WHERE s.kind = 'leaf'
+             AND s.suppressed_at IS NULL
+             AND s.token_count > ?
+             AND NOT EXISTS (
+               SELECT 1 FROM lcm_embedding_meta m
+                 WHERE m.embedded_id = s.summary_id
+                   AND m.embedded_kind = 'summary'
+                   AND m.embedding_model = ?
+                   AND m.archived = 0
+             )`,
+      )
+      .get(MAX_TOKENS_PER_EMBED_DOC, modelName) as { n?: number } | undefined;
+    return row?.n ?? 0;
+  } catch {
+    return 0;
+  }
 }
 
 function buildReconcileListText(params: { db: DatabaseSync }): string {
@@ -2667,7 +2719,30 @@ export function createLcmCommand(params: {
             }),
           };
         }
-        case "eval":
+        case "eval": {
+          // Wave-10 reviewer P1 fix: /lcm eval mutates lcm_eval_run +
+          // lcm_eval_query_result tables AND can cost Voyage tokens
+          // (hybrid mode embeds the query). Wave-9 Agent #10 had
+          // classified eval as READ_ONLY but the reviewer challenged
+          // that, correctly. Gate on senderIsOwner like purge / reconcile
+          // / worker-tick.
+          if (!ctx.senderIsOwner) {
+            return {
+              text: [
+                ...buildHeaderLines(),
+                "",
+                "📊 Eval — operator-only",
+                "",
+                buildSection("🚫 Rejected", [
+                  buildStatLine("status", "operator-only"),
+                  buildStatLine(
+                    "reason",
+                    "/lcm eval requires owner privileges (ctx.senderIsOwner=true). Eval writes lcm_eval_run + lcm_eval_query_result rows and may cost Voyage tokens in hybrid mode — non-owner callers cannot invoke it.",
+                  ),
+                ]),
+              ].join("\n"),
+            };
+          }
           return {
             text: await buildEvalText({
               db: await getDb(),
@@ -2676,6 +2751,7 @@ export function createLcmCommand(params: {
               querySetVersion: parsed.querySetVersion,
             }),
           };
+        }
         case "purge": {
           // Wave-7 Auditor #14 P0-1 fix: operator-session gate.
           //

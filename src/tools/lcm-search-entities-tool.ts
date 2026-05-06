@@ -163,37 +163,52 @@ export function createLcmSearchEntitiesTool(input: {
 
       const db = lcm.getDb();
 
-      // Build WHERE / pattern based on mode
-      const filters: string[] = ["session_key = ?"];
+      // Build WHERE / pattern based on mode.
+      // Wave-10 reviewer P2 fix: previously the docstring acknowledged
+      // "Entities with all-suppressed mentions can still appear here
+      // (the entity row itself isn't suppressed)" — but that violated
+      // the suppression contract for agent-facing read paths. Add an
+      // EXISTS guard requiring at least one unsuppressed mention so
+      // suppressed entities don't leak via search either.
+      const filters: string[] = [
+        "e.session_key = ?",
+        // EXISTS guard: at least one mention whose summary is not suppressed.
+        `EXISTS (
+           SELECT 1 FROM lcm_entity_mentions m
+             JOIN summaries s ON s.summary_id = m.summary_id
+             WHERE m.entity_id = e.entity_id
+               AND s.suppressed_at IS NULL
+         )`,
+      ];
       const binds: (string | number)[] = [effectiveSessionKey];
 
       const escaped = escapeLike(query);
       let pattern: string;
       if (mode === "prefix") {
         pattern = `${escaped}%`;
-        filters.push("canonical_text LIKE ? ESCAPE '\\' COLLATE NOCASE");
+        filters.push("e.canonical_text LIKE ? ESCAPE '\\' COLLATE NOCASE");
         binds.push(pattern);
       } else if (mode === "exact") {
-        filters.push("canonical_text = ? COLLATE NOCASE");
+        filters.push("e.canonical_text = ? COLLATE NOCASE");
         binds.push(query);
       } else {
         pattern = `%${escaped}%`;
-        filters.push("canonical_text LIKE ? ESCAPE '\\' COLLATE NOCASE");
+        filters.push("e.canonical_text LIKE ? ESCAPE '\\' COLLATE NOCASE");
         binds.push(pattern);
       }
       if (entityTypeFilter) {
-        filters.push("entity_type = ?");
+        filters.push("e.entity_type = ?");
         binds.push(entityTypeFilter);
       }
 
       // Rank: most-occurrences first, then most-recent. Cap at `limit`.
       const rows = db
         .prepare(
-          `SELECT entity_id, canonical_text, entity_type,
-                  first_seen_at, last_seen_at, occurrence_count, alternate_surfaces
-             FROM lcm_entities
+          `SELECT e.entity_id, e.canonical_text, e.entity_type,
+                  e.first_seen_at, e.last_seen_at, e.occurrence_count, e.alternate_surfaces
+             FROM lcm_entities e
              WHERE ${filters.join(" AND ")}
-             ORDER BY occurrence_count DESC, last_seen_at DESC
+             ORDER BY e.occurrence_count DESC, e.last_seen_at DESC
              LIMIT ?`,
         )
         // Wave-9 TS-tightening: route through unknown (Record<string,

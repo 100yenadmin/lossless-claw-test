@@ -583,6 +583,15 @@ export function createLcmDescribeTool(input: {
         // without auth manager seeing it. Now we sum the token costs of
         // any expanded payload and consume them from the grant.
         if (delegatedGrantId !== "") {
+          // Wave-10 reviewer P1 fix (incomplete-Wave-9 follow-up): the base
+          // summary's full content is emitted via lines.push(s.content) on
+          // line 290, but Wave-9 only counted expandedChildren/Messages.
+          // A sub-agent calling lcm_describe on a 30K-token condensed
+          // summary with NO expansion flags drains 30K tokens of context-
+          // window-worthy content for free against the grant — exactly
+          // the bypass the fix was trying to close. Charge the base
+          // s.tokenCount too.
+          const baseTokens = s.tokenCount ?? 0;
           const expandedChildrenTokens = expandedChildren.reduce(
             (total, c) => total + (c.tokenCount ?? 0),
             0,
@@ -591,7 +600,8 @@ export function createLcmDescribeTool(input: {
             (total, m) => total + (m.tokenCount ?? 0),
             0,
           );
-          const consumedTokens = expandedChildrenTokens + expandedMessagesTokens;
+          const consumedTokens =
+            baseTokens + expandedChildrenTokens + expandedMessagesTokens;
           if (consumedTokens > 0) {
             getRuntimeExpansionAuthManager().consumeTokenBudget(
               delegatedGrantId,

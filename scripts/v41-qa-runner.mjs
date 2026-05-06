@@ -696,19 +696,25 @@ const SUITES = {
       questionType: "A",
       description: "lcm_synthesize_around period='yesterday' (lcm_recent replacement)",
       tool: "lcm_synthesize_around",
+      // Wave-10 reviewer P2 fix: previously omitted `window_kind: "period"`
+      // which the tool requires — without it, the tool returned
+      // `"window_kind must be 'time', 'semantic', or 'period'"` and the
+      // predicate's regex match on `period` made it trivially pass without
+      // ever exercising the period-dispatch code path.
       args: {
+        window_kind: "period",
         period: "yesterday",
-        windowK: 5,
         allConversations: true,
       },
       expect: (r) => {
         // Same graceful-error shape as full-A1..A5: LLM unavailable OK,
         // crash / unexpected error not OK. Also accept "no leaves in
         // window" since a fresh corpus may legitimately have nothing
-        // for "yesterday".
+        // for "yesterday". (Removed bare 'period' from the regex so the
+        // schema-validation early-return no longer trivially matches.)
         if (
           r.error &&
-          !/summary model|provider|LLM|complete is unavailable|VOYAGE_API|no synthesis|not configured|no leaves|period|empty/i.test(
+          !/summary model|provider|LLM|complete is unavailable|VOYAGE_API|no synthesis|not configured|no leaves|empty/i.test(
             String(r.error),
           )
         ) {
@@ -723,15 +729,16 @@ const SUITES = {
       questionType: "A",
       description: "lcm_synthesize_around period='last-7d' (hyphenated short form)",
       tool: "lcm_synthesize_around",
+      // Wave-10 reviewer P2 fix: same window_kind requirement.
       args: {
+        window_kind: "period",
         period: "last-7d",
-        windowK: 5,
         allConversations: true,
       },
       expect: (r) => {
         if (
           r.error &&
-          !/summary model|provider|LLM|complete is unavailable|VOYAGE_API|no synthesis|not configured|no leaves|period|empty/i.test(
+          !/summary model|provider|LLM|complete is unavailable|VOYAGE_API|no synthesis|not configured|no leaves|empty/i.test(
             String(r.error),
           )
         ) {
@@ -1109,6 +1116,15 @@ if (mdOut) {
 db.close();
 
 // Exit code
+// Wave-10 reviewer P2 fix: failedImportant previously had no exit branch,
+// so an "important" failure printed in the report but the process still
+// exited 0 — turning the runner into an advisory tool instead of a release
+// gate. Exit codes:
+//   3 = tool errors (uncaught exceptions; runner itself is broken)
+//   2 = critical failure (must-pass scenario regressed)
+//   1 = important failure (should-pass scenario regressed; release gate)
+//   0 = all important+critical pass (warnings allowed)
 if (toolErrors > 0) process.exit(3);
 if (failedCritical > 0) process.exit(2);
+if (failedImportant > 0) process.exit(1);
 process.exit(0);

@@ -18,8 +18,16 @@ import { formatTimestamp } from "../compaction.js";
 /**
  * `lcm_synthesize_around` — agent tool (LCM v4.1 §13).
  *
- * Builds a freshly-synthesized summary of leaves "around" a target. Two
- * window modes:
+ * Builds a freshly-synthesized summary of leaves over a window. THREE
+ * window modes (replaces old lcm_recent surface):
+ *   - `period`   — direct date-range or human-readable shortcut. Target
+ *                  is OPTIONAL (acts as a label only). The operator-facing
+ *                  surface for "what did we work on yesterday / last week /
+ *                  this month?" — period boundaries are computed in the
+ *                  operator's local timezone (lcm.timezone config), not
+ *                  UTC. Accepts: today / yesterday / this-week / last-week /
+ *                  this-month / last-month / last-Nh / last-Nd OR explicit
+ *                  since/before bounds.
  *   - `time`     — leaves with `created_at` within ±N hours of the target's
  *                  timestamp. Target must be a `summary_id` (we anchor on
  *                  the target summary's `created_at`).
@@ -31,7 +39,8 @@ import { formatTimestamp } from "../compaction.js";
  * `dispatchSynthesis` (D.02) using tier='custom' or 'filtered'. The result
  * is persisted to `lcm_synthesis_cache` so subsequent identical calls can
  * hit the cache rather than re-LLM (single-flight via INSERT OR IGNORE on
- * the UNIQUE lookup index).
+ * the UNIQUE lookup index — keyed on session_key, range, leaf set, tier,
+ * AND prompt_id so cache stays fresh when the active prompt changes).
  *
  * Why a separate tool from `lcm_semantic_recall`: recall returns ranked
  * snippets (the agent picks). `synthesize_around` returns a single
@@ -138,56 +147,188 @@ interface SummariesScopeFilter {
 }
 
 /**
+ * Wave-10 reviewer P1 fix: compute the UTC instant corresponding to the
+ * START of the local day containing `at` in the given IANA timezone.
+ *
+ * Why: previously `parsePeriodShortcut` anchored "today"/"yesterday"/etc.
+ * at UTC midnight, so a Bangkok operator (UTC+7) at 02:00 local time
+ * asking for "yesterday" got UTC-yesterday (which is ~17 hours different
+ * from local-yesterday). Operator scenarios like "what did we work on
+ * yesterday?" must mean LOCAL yesterday.
+ *
+ * Implementation: use Intl.DateTimeFormat to render the date in the
+ * target timezone, parse the y/m/d back, and compute the UTC instant
+ * for that local-midnight by sampling the timezone's UTC offset at noon
+ * of that local day (avoids DST-fold ambiguity at midnight on spring-
+ * forward / fall-back boundaries).
+ */
+function getLocalDayStartUtc(at: Date, timezone: string): Date {
+  let parts: Record<string, string> = {};
+  try {
+    const fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    });
+    for (const p of fmt.formatToParts(at)) {
+      if (p.type !== "literal") parts[p.type] = p.value;
+    }
+  } catch {
+    // Invalid timezone — fall back to UTC.
+    parts = {
+      year: String(at.getUTCFullYear()),
+      month: String(at.getUTCMonth() + 1).padStart(2, "0"),
+      day: String(at.getUTCDate()).padStart(2, "0"),
+    };
+  }
+  const y = parseInt(parts.year ?? "1970", 10);
+  const m = parseInt(parts.month ?? "01", 10);
+  const d = parseInt(parts.day ?? "01", 10);
+  // Sample the timezone offset at local noon (12:00) of the resolved
+  // local date. We compute by rendering the offset name and using the
+  // hourCycle h23 representation. Simpler approach: construct a UTC
+  // Date for "Y-M-D 12:00:00 UTC", measure its rendered hour in the
+  // target tz; offset = renderedHour - 12. Then localMidnight UTC =
+  // UTC noon - 12h - offset hours.
+  const probeUtc = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+  let renderedHour = 12;
+  try {
+    const fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      hour: "2-digit",
+      hourCycle: "h23",
+    });
+    const hourStr = fmt
+      .formatToParts(probeUtc)
+      .find((p) => p.type === "hour")?.value;
+    if (hourStr) renderedHour = parseInt(hourStr, 10);
+  } catch {
+    // already fell back above
+  }
+  const tzOffsetHours = renderedHour - 12; // e.g. Bangkok = +7, LA = -7/-8
+  const localMidnightMs = probeUtc.getTime() - 12 * 3600_000 - tzOffsetHours * 3600_000;
+  return new Date(localMidnightMs);
+}
+
+/**
  * Reviewer P1 fix: parse a "period" shortcut into a (since, before) range.
- * Anchored at "now" UTC. All ranges are half-open [since, before).
+ * Half-open [since, before).
+ *
+ * Wave-10 reviewer fix: timezone-aware. The day boundaries (today,
+ * yesterday, this-week, last-week, this-month, last-month) are computed
+ * in the operator's local timezone (`lcm.timezone`), not UTC. The
+ * relative-window forms (`last-Nh`, `last-Nd`) remain UTC-anchored
+ * since they're "now minus N hours/days," which doesn't depend on
+ * day boundaries.
  *
  * Returns null + error string if the period is unrecognized.
  */
-function parsePeriodShortcut(
+// Exported for tests — see test/v41-period-timezone.test.ts
+export function parsePeriodShortcut(
   raw: string,
-  nowMs: number = Date.now(),
+  options: { nowMs?: number; timezone?: string } = {},
 ): { since: Date; before: Date; label: string } | { error: string } {
   const period = raw.trim().toLowerCase();
+  const nowMs = options.nowMs ?? Date.now();
+  const timezone = options.timezone ?? "UTC";
   const now = new Date(nowMs);
-  // Anchor at UTC midnight of "today"
-  const utcMidnight = new Date(
-    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
-  );
+  // Local-day midnight in the operator's timezone.
+  const localMidnight = getLocalDayStartUtc(now, timezone);
   const dayMs = 24 * 60 * 60 * 1000;
 
   if (period === "today") {
-    return { since: utcMidnight, before: new Date(utcMidnight.getTime() + dayMs), label: "today" };
+    return {
+      since: localMidnight,
+      before: new Date(localMidnight.getTime() + dayMs),
+      label: "today",
+    };
   }
   if (period === "yesterday") {
     return {
-      since: new Date(utcMidnight.getTime() - dayMs),
-      before: utcMidnight,
+      since: new Date(localMidnight.getTime() - dayMs),
+      before: localMidnight,
       label: "yesterday",
     };
   }
   if (period === "this-week") {
-    // ISO week: Monday = day 1
-    const dow = utcMidnight.getUTCDay() || 7; // Sun=0 -> 7
-    const monday = new Date(utcMidnight.getTime() - (dow - 1) * dayMs);
+    // ISO week: Monday = day 1. Compute day-of-week in the target tz by
+    // checking which weekday `localMidnight` (which IS local-today's
+    // midnight) corresponds to.
+    const weekdayFmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      weekday: "short",
+    });
+    const weekdayName = weekdayFmt.format(localMidnight);
+    const dowMap: Record<string, number> = {
+      Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7,
+    };
+    const dow = dowMap[weekdayName] ?? 1;
+    const monday = new Date(localMidnight.getTime() - (dow - 1) * dayMs);
     return { since: monday, before: new Date(monday.getTime() + 7 * dayMs), label: "this-week" };
   }
   if (period === "last-week") {
-    const dow = utcMidnight.getUTCDay() || 7;
-    const thisMonday = new Date(utcMidnight.getTime() - (dow - 1) * dayMs);
+    const weekdayFmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      weekday: "short",
+    });
+    const weekdayName = weekdayFmt.format(localMidnight);
+    const dowMap: Record<string, number> = {
+      Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7,
+    };
+    const dow = dowMap[weekdayName] ?? 1;
+    const thisMonday = new Date(localMidnight.getTime() - (dow - 1) * dayMs);
     const lastMonday = new Date(thisMonday.getTime() - 7 * dayMs);
     return { since: lastMonday, before: thisMonday, label: "last-week" };
   }
   if (period === "this-month") {
-    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
-    const nextMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+    // Get y/m of local "today" via formatToParts in tz.
+    const fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+    });
+    const parts: Record<string, string> = {};
+    for (const p of fmt.formatToParts(now)) {
+      if (p.type !== "literal") parts[p.type] = p.value;
+    }
+    const y = parseInt(parts.year ?? "1970", 10);
+    const m = parseInt(parts.month ?? "01", 10);
+    // Local first-of-month at midnight, in UTC instants:
+    const monthStart = getLocalDayStartUtc(new Date(Date.UTC(y, m - 1, 1, 12)), timezone);
+    const nextMonthStart = getLocalDayStartUtc(
+      new Date(Date.UTC(m === 12 ? y + 1 : y, m === 12 ? 0 : m, 1, 12)),
+      timezone,
+    );
     return { since: monthStart, before: nextMonthStart, label: "this-month" };
   }
   if (period === "last-month") {
-    const lastMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
-    const thisMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+    const fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+    });
+    const parts: Record<string, string> = {};
+    for (const p of fmt.formatToParts(now)) {
+      if (p.type !== "literal") parts[p.type] = p.value;
+    }
+    const y = parseInt(parts.year ?? "1970", 10);
+    const m = parseInt(parts.month ?? "01", 10);
+    const lastY = m === 1 ? y - 1 : y;
+    const lastM = m === 1 ? 12 : m - 1;
+    const lastMonthStart = getLocalDayStartUtc(
+      new Date(Date.UTC(lastY, lastM - 1, 1, 12)),
+      timezone,
+    );
+    const thisMonthStart = getLocalDayStartUtc(
+      new Date(Date.UTC(y, m - 1, 1, 12)),
+      timezone,
+    );
     return { since: lastMonthStart, before: thisMonthStart, label: "last-month" };
   }
-  // last-Nh / last-Nd patterns
+  // last-Nh / last-Nd patterns — these are "now minus N hours/days," not
+  // calendar-day-anchored, so they stay UTC-anchored and are timezone-
+  // independent.
   const hMatch = period.match(/^last-(\d+)h$/);
   if (hMatch) {
     const hours = Math.min(24 * 90, Math.max(1, parseInt(hMatch[1]!, 10)));
@@ -328,7 +469,7 @@ function fingerprintLeaves(ids: string[]): string {
   const hash = createHash("sha256");
   for (const id of ids) {
     hash.update(id);
-    hash.update(" ");
+    hash.update("\0");
   }
   return hash.digest("hex").slice(0, 24);
 }
@@ -395,13 +536,18 @@ export function createLcmSynthesizeAroundTool(input: {
     name: "lcm_synthesize_around",
     label: "LCM Synthesize Around",
     description:
-      "Synthesize a fresh summary of leaves AROUND a target (a summary_id or a " +
-      "semantic query). Two modes: 'time' (leaves within ±windowHours of target's " +
-      "timestamp) or 'semantic' (top windowK most-similar leaves to target content). " +
-      "Returns a markdown summary built via the synthesis dispatch (D.02), backed by " +
-      "lcm_synthesis_cache so subsequent identical calls hit the cache. Use this for " +
-      "'what was happening around X?' style memory passes — distinct from " +
-      "lcm_semantic_recall (which returns ranked snippets, not a synthesized rollup).",
+      "Synthesize a fresh summary of leaves over a window (replaces old lcm_recent). " +
+      "Three modes: 'period' (date range or shortcut like 'yesterday' / 'last-7-days' / " +
+      "'this-month' — target OPTIONAL; this is the direct \"what did we work on yesterday\" " +
+      "surface), 'time' (leaves within ±windowHours of a target summary's timestamp — " +
+      "target REQUIRED), or 'semantic' (top windowK most-similar leaves to target " +
+      "content/query — target REQUIRED). Period boundaries are computed in the operator's " +
+      "local timezone (configured on the LCM engine). Returns a markdown summary built via " +
+      "the synthesis dispatch (D.02), backed by lcm_synthesis_cache so subsequent identical " +
+      "calls hit the cache. Use 'period' for time-anchored questions (what did we do " +
+      "yesterday?), 'time' for narrow ±N-hour windows around a known leaf, or 'semantic' " +
+      "for memory passes around a topic — distinct from lcm_semantic_recall (which returns " +
+      "ranked snippets, not a synthesized rollup).",
     parameters: LcmSynthesizeAroundSchema,
     async execute(_toolCallId, params) {
       const lcm = input.lcm ?? (await input.getLcm?.());
@@ -562,7 +708,11 @@ export function createLcmSynthesizeAroundTool(input: {
         let periodBefore: Date | undefined;
         let periodLabel = "custom-range";
         if (periodRaw.length > 0) {
-          const parsed = parsePeriodShortcut(periodRaw);
+          // Wave-10 reviewer P1 fix: pass timezone so day-boundary
+          // periods (today/yesterday/this-week/last-week/this-month/
+          // last-month) are computed in the operator's local timezone
+          // instead of UTC.
+          const parsed = parsePeriodShortcut(periodRaw, { timezone });
           if ("error" in parsed) {
             return jsonResult({ error: parsed.error });
           }
@@ -973,6 +1123,14 @@ export function createLcmSynthesizeAroundTool(input: {
         // Wave-3 Auditor #1 fix H1: also SELECT `failure_reason` so the
         // recent_failure response surfaces the actual cause to the caller
         // (was hidden one column away).
+        // Wave-10 reviewer P1 fix: include `tier_label` and `prompt_id`
+        // in the cache lookup so distinct (tier, prompt) combinations
+        // get distinct cache rows — matches the new UNIQUE index.
+        // Previously the lookup ignored both, so:
+        //   - tier='custom' then tier='filtered' for same range/leaves
+        //     silently returned the wrong-tier cached text
+        //   - active prompt change via registerPrompt continued to serve
+        //     stale text from the old prompt
         const winner = db
           .prepare(
             `SELECT cache_id, status, content, output_token_count,
@@ -980,6 +1138,7 @@ export function createLcmSynthesizeAroundTool(input: {
                FROM lcm_synthesis_cache
                WHERE session_key = ? AND range_start = ? AND range_end = ?
                  AND leaf_fingerprint = ? AND COALESCE(grep_filter, '') = ''
+                 AND tier_label = ? AND prompt_id = ?
                ORDER BY building_started_at DESC LIMIT 1`,
           )
           .get(
@@ -987,6 +1146,8 @@ export function createLcmSynthesizeAroundTool(input: {
             rangeStartIso,
             rangeEndIso,
             leafFingerprint,
+            cacheTierLabel,
+            initialPromptId,
           ) as
           | {
               cache_id: string;

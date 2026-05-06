@@ -210,6 +210,11 @@ describe("THE_FIVE_QUESTIONS — Type B: Topic-anchored", () => {
     });
     const details = r.details as { totalMatches: number; summaryCount: number };
     expect(details.totalMatches).toBeGreaterThan(0);
+    // Wave-10 sub-agent #3 strengthening (additive): assert the canonical
+    // worker_threads leaf is in the result text. Catches a regression
+    // where the FTS join returns *some* match but not the right one.
+    const text = r.content[0]!.type === "text" ? r.content[0]!.text : "";
+    expect(text).toMatch(/sum_b1_001/);
   });
 
   it("B2: 'What work has been done on hybrid search rerank?'", async () => {
@@ -225,6 +230,10 @@ describe("THE_FIVE_QUESTIONS — Type B: Topic-anchored", () => {
     });
     const details = r.details as { totalMatches: number };
     expect(details.totalMatches).toBeGreaterThan(0);
+    // Wave-10 sub-agent #3 strengthening (additive): assert sum_b2_001
+    // (the canonical rerank-discussion leaf) is in the result.
+    const text = r.content[0]!.type === "text" ? r.content[0]!.text : "";
+    expect(text).toMatch(/sum_b2_001/);
   });
 
   it("B3: 'Have we hit a race condition like this empty-plan-body one before?'", async () => {
@@ -244,6 +253,10 @@ describe("THE_FIVE_QUESTIONS — Type B: Topic-anchored", () => {
     });
     const details = r.details as { totalMatches: number };
     expect(details.totalMatches).toBeGreaterThan(0);
+    // Wave-10 sub-agent #3 strengthening (additive): the canonical
+    // race-condition leaf must appear in results (not just any match).
+    const text = r.content[0]!.type === "text" ? r.content[0]!.text : "";
+    expect(text).toMatch(/sum_b3_001/);
   });
 
   it("B4: 'What have we said about Voyage rate limiting?'", async () => {
@@ -259,6 +272,10 @@ describe("THE_FIVE_QUESTIONS — Type B: Topic-anchored", () => {
     });
     const details = r.details as { totalMatches: number };
     expect(details.totalMatches).toBeGreaterThan(0);
+    // Wave-10 sub-agent #3 strengthening (additive): canonical
+    // rate-limiting leaf must be in results.
+    const text = r.content[0]!.type === "text" ? r.content[0]!.text : "";
+    expect(text).toMatch(/sum_b4_001/);
   });
 
   it("B5: 'Did we ever debate whether to keep lcm_recent or replace it?'", async () => {
@@ -274,6 +291,10 @@ describe("THE_FIVE_QUESTIONS — Type B: Topic-anchored", () => {
     });
     const details = r.details as { totalMatches: number };
     expect(details.totalMatches).toBeGreaterThan(0);
+    // Wave-10 sub-agent #3 strengthening (additive): C1 + C2 leaves
+    // both reference lcm_recent — verify at least one is in results.
+    const text = r.content[0]!.type === "text" ? r.content[0]!.text : "";
+    expect(/sum_c1_001|sum_c2_001/.test(text)).toBe(true);
   });
 
   it("B-semantic (graceful-degradation): lcm_semantic_recall returns clear error w/o Voyage creds", async () => {
@@ -416,6 +437,16 @@ describe("THE_FIVE_QUESTIONS — Type E: Drilldown", () => {
     expect(details.expansion?.children).toBeDefined();
     expect(details.expansion!.children!.length).toBeGreaterThan(0);
     expect(["ok", "capped"]).toContain(details.expansion!.childrenStatus);
+    // Wave-10 sub-agent #3 strengthening (additive): per the fixture,
+    // sum_cond_voyage_001 has childIds = ["sum_d4_001","sum_d4_002",
+    // "sum_d4_003","sum_b2_001","sum_b4_001"]. Every one of these MUST
+    // be in the expansion (suppression filter is N/A here — none are
+    // suppressed). Pins the wiring across describe → summary_parents
+    // JOIN → suppressed_at filter.
+    const childIds = details.expansion!.children!.map((c) => c.summaryId);
+    expect(childIds).toContain("sum_d4_001");
+    expect(childIds).toContain("sum_b2_001");
+    expect(childIds).toContain("sum_b4_001");
   });
 
   it("E3: lcm_get_entity drilldown — recent mentions of Voyage", async () => {

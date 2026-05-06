@@ -91,6 +91,15 @@ function insertEntity(
     entityType?: string;
     occurrenceCount?: number;
     alternateSurfaces?: string[];
+    /**
+     * Wave-10 reviewer P2 fix: lcm_get_entity now requires at least one
+     * unsuppressed mention to return the entity (suppression contract).
+     * For tests that don't care about mentions, this helper now also
+     * inserts a default unsuppressed summary + mention so the entity is
+     * findable. Tests that EXPLICITLY want the all-suppressed case
+     * pass `noDefaultMention: true` and insert their own state.
+     */
+    noDefaultMention?: boolean;
   },
 ): void {
   db.prepare(
@@ -106,6 +115,26 @@ function insertEntity(
     args.occurrenceCount ?? 1,
     JSON.stringify(args.alternateSurfaces ?? []),
   );
+  if (!args.noDefaultMention) {
+    // Auto-create one unsuppressed summary + mention so the EXISTS guard
+    // in lcm_get_entity_tool sees a visible mention.
+    const defaultSumId = `sum_default_${args.entityId}`;
+    db.prepare(
+      `INSERT OR IGNORE INTO summaries
+         (summary_id, conversation_id, kind, content, token_count, session_key, suppressed_at)
+       VALUES (?, 1, 'leaf', 'default fixture content', 1, ?, NULL)`,
+    ).run(defaultSumId, args.sessionKey ?? "sk1");
+    db.prepare(
+      `INSERT INTO lcm_entity_mentions
+         (mention_id, entity_id, summary_id, surface_form, span_start, span_end, mentioned_at)
+       VALUES (?, ?, ?, ?, 0, 5, datetime('now'))`,
+    ).run(
+      `m_default_${args.entityId}`,
+      args.entityId,
+      defaultSumId,
+      args.canonicalText,
+    );
+  }
 }
 
 function insertMention(
@@ -150,12 +179,15 @@ describe("createLcmGetEntityTool — happy path", () => {
     const db = setupDb();
     insertSummary(db, "sum_1");
     insertSummary(db, "sum_2");
+    // Wave-10 reviewer P2 fix follow-up: this test inserts its own
+    // mentions explicitly, so opt out of the default-mention auto-insert.
     insertEntity(db, {
       entityId: "ent_voyage",
       canonicalText: "Voyage",
       entityType: "tool",
       occurrenceCount: 2,
       alternateSurfaces: ["voyage", "VoyageAI"],
+      noDefaultMention: true,
     });
     insertMention(db, {
       mentionId: "m1",
@@ -236,7 +268,14 @@ describe("createLcmGetEntityTool — suppression", () => {
     const db = setupDb();
     insertSummary(db, "sum_visible");
     insertSummary(db, "sum_suppressed", "sk1", 1, new Date().toISOString());
-    insertEntity(db, { entityId: "e1", canonicalText: "TestEntity", occurrenceCount: 2 });
+    // Wave-10 reviewer P2 fix follow-up: explicit mention setup; opt out
+    // of default mention.
+    insertEntity(db, {
+      entityId: "e1",
+      canonicalText: "TestEntity",
+      occurrenceCount: 2,
+      noDefaultMention: true,
+    });
     insertMention(db, {
       mentionId: "m_visible",
       entityId: "e1",

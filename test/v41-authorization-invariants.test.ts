@@ -70,6 +70,10 @@ const DESTRUCTIVE_OPERATOR_CASES: Array<[string, string]> = [
   ],
   // Wave-9 Agent #10 P1 fix (gates this case)
   ["worker_tick_backfill", "worker tick embedding-backfill"],
+  // Wave-10 reviewer P1 fix: eval mutates lcm_eval_run + lcm_eval_query_result
+  // tables AND may cost Voyage tokens in hybrid mode. Was previously classified
+  // as READ_ONLY in Wave-9 but reviewer correctly challenged that.
+  ["eval", "eval --baseline"],
 ];
 
 /**

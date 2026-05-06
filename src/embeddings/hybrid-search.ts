@@ -40,6 +40,7 @@
 
 import type { DatabaseSync } from "node:sqlite";
 import {
+  MAX_TOKENS_PER_RERANK_CALL,
   rerankCandidates,
   VoyageError,
   type VoyageRerankerModel,
@@ -159,6 +160,14 @@ export interface HybridSearchResult {
   degradedToFtsOnly: boolean;
   /** True if rerank failed; we used RRF instead. */
   degradedSkippedRerank: boolean;
+  /**
+   * Wave-10 reviewer P1: true if the rerank input was packed to fit the
+   * 600K-token cap. Lower-rank candidates were dropped from rerank
+   * consideration (still available in `candidateCount` for backstop).
+   */
+  rerankPackTruncated?: boolean;
+  /** Wave-10: number of candidates that survived packing into rerank. */
+  rerankPackedCount?: number;
   /** Hint for caller logs / `/lcm health`. */
   modelName: string | null;
 }
@@ -304,21 +313,61 @@ export async function runHybridSearch(
   // 3. Rerank or RRF.
   const rerankRequested = opts.rerank !== false;
   let degradedSkippedRerank = false;
+  // Wave-10 reviewer P1 fix: previously sent ALL candidates' full content
+  // to rerank without enforcing the ~600K token cap, so a query with many
+  // large condensed summaries either: (a) hit Voyage's 400 bad_request
+  // and silently degraded to RRF (losing the +52.5pp paraphrastic lift),
+  // or (b) consumed the entire month's quota in one call. Pack candidates
+  // until cumulative token count would exceed the cap, with a small
+  // safety margin. Drop tail candidates (highest-rank survives by virtue
+  // of FTS/semantic ordering before this point — by the time we get to
+  // tail they're lower-confidence anyway). If no candidates would fit
+  // even individually (a single 600K-token summary), fall through to RRF.
+  let rerankPacked = candidates;
+  let rerankPackTruncated = false;
   if (rerankRequested) {
+    const RERANK_BUDGET = Math.floor(MAX_TOKENS_PER_RERANK_CALL * 0.85);
+    // Add an estimate for the query (small).
+    const queryTokenEstimate = Math.ceil(query.length / 4);
+    let cumulative = queryTokenEstimate;
+    const packed: typeof candidates = [];
+    for (const c of candidates) {
+      const candTokens = c.tokenCount ?? Math.ceil((c.content?.length ?? 0) / 4);
+      if (packed.length === 0 && candTokens > RERANK_BUDGET) {
+        // Single-candidate exceeds budget — fall back to RRF.
+        rerankPacked = [];
+        rerankPackTruncated = true;
+        break;
+      }
+      if (cumulative + candTokens > RERANK_BUDGET) {
+        rerankPackTruncated = true;
+        break;
+      }
+      packed.push(c);
+      cumulative += candTokens;
+    }
+    if (packed.length > 0) rerankPacked = packed;
+  }
+  if (rerankRequested && rerankPacked.length > 0) {
     try {
       const rerankResp = await rerankCandidates({
         model: opts.rerankerModel ?? "rerank-2.5",
         query,
-        candidates: candidates.map((c) => ({ id: c.summaryId, text: c.content })),
-        topK: Math.min(topN, candidates.length),
+        candidates: rerankPacked.map((c) => ({ id: c.summaryId, text: c.content })),
+        topK: Math.min(topN, rerankPacked.length),
         apiKey: opts.voyageApiKey,
         fetch: opts.voyageFetch,
         maxRetries: opts.voyageMaxRetries,
         timeoutMs: opts.voyageTimeoutMs,
       });
       voyageTokensConsumed += rerankResp.totalTokens;
-      // Apply rerank scores; return only items that survived rerank
-      const byId = new Map(candidates.map((c) => [c.summaryId, c] as const));
+      // Apply rerank scores; return only items that survived rerank.
+      // Note: only the packed subset went through rerank, so unpacked
+      // candidates (the dropped tail) won't have rerank scores. They
+      // remain available via `candidates` for callers that want a
+      // backstop, but the primary `hits` list is rerank-sorted within
+      // the packed subset.
+      const byId = new Map(rerankPacked.map((c) => [c.summaryId, c] as const));
       const finalHits: HybridHit[] = rerankResp.results
         .map((r) => {
           const c = byId.get(r.id);
@@ -332,6 +381,11 @@ export async function runHybridSearch(
         voyageTokensConsumed,
         degradedToFtsOnly,
         degradedSkippedRerank: false,
+        // Wave-10 reviewer P1 fix: surface when rerank input was packed
+        // to fit the 600K-token cap; callers can warn the operator that
+        // the lower-rank candidates were dropped from rerank consideration.
+        rerankPackTruncated,
+        rerankPackedCount: rerankPacked.length,
         modelName,
       };
     } catch (e: unknown) {
@@ -342,6 +396,10 @@ export async function runHybridSearch(
       // Otherwise, fall back to RRF.
       degradedSkippedRerank = true;
     }
+  } else if (rerankRequested && rerankPacked.length === 0) {
+    // Wave-10: single candidate exceeded 600K-token budget. Skip rerank
+    // entirely; RRF fallback below will handle ranking.
+    degradedSkippedRerank = true;
   }
 
   // RRF fallback (also when rerank=false explicitly)

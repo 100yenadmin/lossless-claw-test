@@ -350,6 +350,222 @@ export const FIXTURE_LEAVES: FixtureLeaf[] = [
     agedHours: 50 * 24,
     tags: ["session-scope"],
   },
+
+  // ──────────────────────────────────────────────────────────────────
+  // ADVERSARIAL FIXTURE LEAVES (Wave-10 sub-agent #3)
+  //
+  // These leaves exist to make adversarial scenarios in
+  // test/v41-adversarial-scenarios.test.ts non-trivial. They DO NOT
+  // contain the literal phrases adversarial tests query for — that's
+  // the whole point. They contain semantically-related content (for
+  // paraphrase tests) or boundary content (for ranking/negative tests)
+  // or attack content (for adversarial-content tests).
+  // ──────────────────────────────────────────────────────────────────
+
+  // ── Paraphrase target #1 (B-paraphrase): "rebase blew up" / "merge mess" ──
+  // Adversarial test queries for "merge mess". The fixture only contains
+  // "rebase blew up" — so a passing keyword-only test doesn't satisfy the
+  // intent. Embeddings/hybrid would be needed. Without embeddings, the
+  // adversarial test asserts the keyword path correctly returns 0.
+  {
+    summary_id: "sum_adv_paraphrase_rebase_001",
+    conversation_id: 2,
+    session_key: "agent:main:main",
+    content:
+      "After the rebase blew up Tuesday morning we had to manually unwind 14 commits. Took 2 hours. Lesson learned: always rebase off origin/main, not the local stale tip.",
+    token_count: 35,
+    agedHours: 18 * 24,
+    tags: ["adv-paraphrase", "B-merge-mess"],
+  },
+  // ── Paraphrase target #2: "rollup-replacement tool" semantic phrasing ──
+  // Adversarial test queries for "rollup-replacement tool we ditched".
+  // Fixture content uses different surface form. Tests fail loudly under
+  // hybrid/semantic mode if embeddings not configured.
+  {
+    summary_id: "sum_adv_paraphrase_lcmrecent_001",
+    conversation_id: 2,
+    session_key: "agent:main:main",
+    content:
+      "We replaced the periodic rollup tool with synthesize_around in period mode. The deprecated tool used pre-built daily/weekly aggregates which were always stale. Period mode builds fresh on-demand from leaves.",
+    token_count: 45,
+    agedHours: 7 * 24,
+    tags: ["adv-paraphrase", "B-rollup-replacement"],
+  },
+
+  // ── Compound query: time + topic + entity ──
+  // For: "Recent purges of operator-VM customer data"
+  // Combines (a) recent — within 48h, (b) topic — purge, (c) entity —
+  // operator-VM. Fixture has the operator-VM mentions in conv 3 but no
+  // "purge" content. This leaf is the canonical match.
+  {
+    summary_id: "sum_adv_compound_purge_recent_001",
+    conversation_id: 3,
+    session_key: "agent:operator-vm:main",
+    content:
+      "Operator-VM customer escalation: ran /lcm purge --apply on 6 messages at customer's request. Per the redaction policy, purge cascaded only to leaves where ALL referencing message ids were in the purge set.",
+    token_count: 50,
+    agedHours: 18, // recent — within last 24h
+    tags: ["adv-compound", "purge", "operator-vm-recent"],
+  },
+
+  // ── Compound: time + topic ──
+  // For: "Voyage work last week" — combines time ("last week") + entity
+  // ("Voyage"). Fixture should have a Voyage leaf in the last-week
+  // window. Already covered by sum_d4_NNN partially, but add a precise
+  // last-week-window leaf.
+  {
+    summary_id: "sum_adv_compound_voyage_lastweek_001",
+    conversation_id: 2,
+    session_key: "agent:main:main",
+    content:
+      "Voyage backfill cycle Tuesday-Thursday last week: 12K leaves embedded, 2.4M tokens spent. Rate-limit storms hit on Wednesday. Final report: 99.4% coverage, 0.6% failed retries.",
+    token_count: 55,
+    agedHours: 8 * 24, // 8 days ago — within "last week" if anchor is BASE_DATE
+    tags: ["adv-compound", "voyage-lastweek"],
+  },
+
+  // ── Negative query workaround ──
+  // For: "Show me work on rebase but NOT race-fix". The adversarial test
+  // verifies the agent can compose this via two searches (rebase, then
+  // exclude race-fix). This leaf has rebase content WITHOUT race-fix.
+  {
+    summary_id: "sum_adv_negative_rebase_norace_001",
+    conversation_id: 2,
+    session_key: "agent:main:main",
+    content:
+      "Rebase work today: pulled in 47 commits from origin/main, resolved 3 conflicts in src/store/summary-store.ts. Standard rebase workflow, nothing exotic.",
+    token_count: 35,
+    agedHours: 30, // recent
+    tags: ["adv-negative", "rebase-only"],
+  },
+  // And a leaf that DOES mention BOTH so the negative query can exclude.
+  // Note: deliberately DOESN'T include the literal commit hash 1081067476 —
+  // that would collide with C5's hits[0] assertion. We use a different
+  // anchor phrase ("race-fix patch") to make this leaf match the negative
+  // query without polluting C5's recency-ordered top result.
+  {
+    summary_id: "sum_adv_negative_rebase_andrace_001",
+    conversation_id: 2,
+    session_key: "agent:main:main",
+    content:
+      "Rebase that included the race-fix patch: cherry-picked from openclaw-pr70071-rebase. Plan-mode regression test added.",
+    token_count: 40,
+    agedHours: 32,
+    tags: ["adv-negative", "rebase-with-race"],
+  },
+
+  // ── Adversarial content #1: placeholder injection ({{date_range}}) ──
+  // A user could (intentionally or not) put `{{date_range}}` in their
+  // text. The renderPrompt code has placeholder substitution; a leaf
+  // containing literal `{{date_range}}` should NOT be confused with
+  // a template. This leaf is the test fixture for the latent bug
+  // identified in Wave-9 P1.9.
+  {
+    summary_id: "sum_adv_inject_placeholder_001",
+    conversation_id: 2,
+    session_key: "agent:main:main",
+    content:
+      "Notes: the daily/weekly templates used `{{date_range}}` as a placeholder, but renderPrompt never substituted it. Fix tracked. Until shipped, don't reference {{date_range}} in user-supplied prompts.",
+    token_count: 50,
+    agedHours: 6 * 24,
+    tags: ["adv-inject", "placeholder"],
+  },
+  // ── Adversarial content #2: XML envelope escape ──
+  // The lcm_expand_query path wraps tool output in XML envelopes. A leaf
+  // containing `</leaf-content-abc12345>` could fool a naive XML parser.
+  // Wave-7 P1 added entity-extractor pre-scan; this leaf verifies the
+  // text content is not stripped, just persisted.
+  {
+    summary_id: "sum_adv_inject_xml_001",
+    conversation_id: 2,
+    session_key: "agent:main:main",
+    content:
+      "Investigated potential XML envelope escape vector. Crafted leaf containing literal </leaf-content-abc12345> sequence — stored fine in messages table. Pre-scan in entity-extractor (Wave-7 P1) defends against extractor confusion.",
+    token_count: 50,
+    agedHours: 4 * 24,
+    tags: ["adv-inject", "xml-envelope"],
+  },
+  // ── Adversarial content #3: HTML/script injection ──
+  // Leaf containing literal HTML tags. The agent surface is markdown +
+  // text — no executable context exists. This leaf verifies storage
+  // round-trip without sanitization stripping content.
+  {
+    summary_id: "sum_adv_inject_script_001",
+    conversation_id: 2,
+    session_key: "agent:main:main",
+    content:
+      "Test leaf with HTML markup: <script>alert(\"xss\")</script>. Persisted as text. Agent surface treats this as plain content — no execution context, no DOM, no eval. The leaf is searchable for the literal string.",
+    token_count: 45,
+    agedHours: 3 * 24,
+    tags: ["adv-inject", "html-script"],
+  },
+
+  // ── Ranking sensitivity: same topic, different recency ──
+  // For: rank-by-recency tests. Two leaves about the SAME topic,
+  // different ages. Used to assert sort=recency returns newer first.
+  {
+    summary_id: "sum_adv_rank_rerank_old_001",
+    conversation_id: 2,
+    session_key: "agent:main:main",
+    content:
+      "Rerank cost analysis (initial): 600K token budget, $0.12 per 1M tokens. Coverage gap on long queries. Initial assessment.",
+    token_count: 30,
+    agedHours: 25 * 24, // 25 days ago — old
+    tags: ["adv-rank", "rerank-old"],
+  },
+  {
+    summary_id: "sum_adv_rank_rerank_new_001",
+    conversation_id: 2,
+    session_key: "agent:main:main",
+    content:
+      "Rerank follow-up: budget enforcement landed. Token cap at 600K is now hard-stop, not silent fallback. Resolves the cost issue identified earlier.",
+    token_count: 35,
+    agedHours: 6, // 6 hours ago — fresh
+    tags: ["adv-rank", "rerank-new"],
+  },
+
+  // ── FTS5 stemming sensitivity ──
+  // FTS5 unicode61 + porter tokenizer may stem "race" and "racing" the
+  // same way. But quoted phrases like "race-condition" should be matched
+  // exactly as a phrase.
+  {
+    summary_id: "sum_adv_stem_race_001",
+    conversation_id: 2,
+    session_key: "agent:main:main",
+    content:
+      "Sailing diagnostic: RACE-condition reported by participant 5 — they describe wind shifts during the third leg. Unrelated to software race conditions.",
+    token_count: 40,
+    agedHours: 10 * 24,
+    tags: ["adv-stem", "race-unrelated"],
+  },
+
+  // ── Cross-tool composition: leaf with messages backing it ──
+  // For E-cross-tool tests. Leaf with explicit known content for chained
+  // describe → grep → expand cycles.
+  {
+    summary_id: "sum_adv_xtool_001",
+    conversation_id: 2,
+    session_key: "agent:main:main",
+    content:
+      "Cross-tool test target: describe should return content; lcm_grep for the unique phrase 'crosstool-marker-X9K2A1' should also find this leaf. Used by adversarial cross-tool tests.",
+    token_count: 40,
+    agedHours: 7 * 24,
+    tags: ["adv-xtool"],
+  },
+
+  // ── Single-leaf with very specific phrase for ranking-by-relevance ──
+  // For: query "Voyage rerank-2.5" with relevance sort — this leaf has
+  // the exact phrase. Other Voyage leaves should rank below.
+  {
+    summary_id: "sum_adv_rank_relevance_001",
+    conversation_id: 2,
+    session_key: "agent:main:main",
+    content:
+      "Detailed Voyage rerank-2.5 evaluation: Voyage rerank-2.5 lifts paraphrastic recall by +52.5pp. Voyage rerank-2.5 is the production choice. Voyage rerank-2.5 token budget is 600K.",
+    token_count: 50,
+    agedHours: 35 * 24, // OLD — but should still rank #1 by relevance due to repeated matches
+    tags: ["adv-rank-relevance"],
+  },
 ];
 
 /**
@@ -536,10 +752,17 @@ export function buildTestCorpus(db: DatabaseSync): {
     `INSERT INTO summaries (summary_id, conversation_id, session_key, kind, depth, content, token_count, created_at, latest_at, suppressed_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
+  // Wave-10 sub-agent #3 fix: the actual summaries_fts schema uses
+  // `summary_id UNINDEXED, content` (see migration.ts:1217). Inserting
+  // via `(rowid, content)` doesn't populate `summary_id`, so JOINs in
+  // `searchSummaries()` (summaries_fts.summary_id = s.summary_id) fail
+  // and the summaries layer returned 0 results in the FTS search path.
+  // The pre-existing 26 scenarios passed by accident — they matched at
+  // the messages layer (which IS rowid-indexed). Adversarial tests need
+  // the summary layer to work for ranking + ID assertions.
   const insertSumFts = db.prepare(
-    `INSERT INTO summaries_fts(rowid, content) VALUES (?, ?)`,
+    `INSERT INTO summaries_fts(summary_id, content) VALUES (?, ?)`,
   );
-  let sumRowid = 1;
   for (const leaf of FIXTURE_LEAVES) {
     const createdAt = timeAgo(leaf.agedHours * HOUR);
     insertSum.run(
@@ -554,7 +777,12 @@ export function buildTestCorpus(db: DatabaseSync): {
       createdAt, // latest_at == created_at for leaves
       leaf.suppressed ? createdAt : null,
     );
-    insertSumFts.run(sumRowid++, leaf.content);
+    // Don't insert FTS rows for suppressed leaves — searchSummaries
+    // filters s.suppressed_at IS NULL post-JOIN, so this is parity
+    // with production-side FTS triggers (which exclude suppressed).
+    if (!leaf.suppressed) {
+      insertSumFts.run(leaf.summary_id, leaf.content);
+    }
   }
 
   // 4. Condensed summaries + parent links
@@ -572,7 +800,7 @@ export function buildTestCorpus(db: DatabaseSync): {
       createdAt,
       null,
     );
-    insertSumFts.run(sumRowid++, cond.content);
+    insertSumFts.run(cond.summary_id, cond.content);
     // Wire parent/child relationships. ordinal is NOT NULL — it's the
     // child's position within the parent.
     const insertParent = db.prepare(

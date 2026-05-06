@@ -65,6 +65,11 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
 function setupDb(): DatabaseSync {
   const db = new DatabaseSync(":memory:");
   runLcmMigrations(db, { fts5Available: false, seedDefaultPrompts: false });
+  // Wave-10 reviewer P2 fix follow-up: ensure default conversation exists
+  // so the auto-default mention inserts work.
+  db.prepare(
+    `INSERT OR IGNORE INTO conversations (conversation_id, session_id, session_key) VALUES (1, 's1', 'sk1')`,
+  ).run();
   return db;
 }
 
@@ -77,6 +82,14 @@ function insertEntity(
     entityType?: string;
     occurrenceCount?: number;
     lastSeenAt?: string;
+    /**
+     * Wave-10 reviewer P2 fix: lcm_search_entities now requires at least
+     * one unsuppressed mention (suppression contract). For tests that
+     * don't care about mentions, this helper auto-creates a default
+     * unsuppressed summary + mention. Tests that explicitly want the
+     * all-suppressed case pass `noDefaultMention: true`.
+     */
+    noDefaultMention?: boolean;
   },
 ): void {
   db.prepare(
@@ -92,6 +105,40 @@ function insertEntity(
     args.lastSeenAt ?? new Date().toISOString(),
     args.occurrenceCount ?? 1,
   );
+  if (!args.noDefaultMention) {
+    const defaultSumId = `sum_default_${args.entityId}`;
+    // Ensure conversation matching the sessionKey exists.
+    const sessionKey = args.sessionKey ?? "sk1";
+    const convRow = db
+      .prepare(
+        `SELECT conversation_id FROM conversations WHERE session_key = ? LIMIT 1`,
+      )
+      .get(sessionKey) as { conversation_id: number } | undefined;
+    let convId = convRow?.conversation_id;
+    if (convId == null) {
+      const result = db
+        .prepare(
+          `INSERT INTO conversations (session_id, session_key) VALUES (?, ?)`,
+        )
+        .run(`s_${sessionKey}`, sessionKey);
+      convId = Number(result.lastInsertRowid);
+    }
+    db.prepare(
+      `INSERT OR IGNORE INTO summaries
+         (summary_id, conversation_id, kind, content, token_count, session_key, suppressed_at)
+       VALUES (?, ?, 'leaf', 'default fixture content', 1, ?, NULL)`,
+    ).run(defaultSumId, convId, sessionKey);
+    db.prepare(
+      `INSERT INTO lcm_entity_mentions
+         (mention_id, entity_id, summary_id, surface_form, span_start, span_end, mentioned_at)
+       VALUES (?, ?, ?, ?, 0, 5, datetime('now'))`,
+    ).run(
+      `m_default_${args.entityId}`,
+      args.entityId,
+      defaultSumId,
+      args.canonicalText,
+    );
+  }
 }
 
 function buildLcmEngine(db: DatabaseSync, timezone = "UTC") {

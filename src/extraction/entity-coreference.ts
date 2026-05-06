@@ -422,13 +422,26 @@ export function countPendingExtractions(
   db: DatabaseSync,
   args: { kind?: "entity" | "procedure-recheck" } = {},
 ): number {
+  // Wave-10 reviewer P2 fix: previously this only filtered on
+  // `kind` + `completed_at IS NULL`, but `runCoreferenceTick`'s
+  // selector ALSO requires `attempts < 5` (dead-letter gate, line
+  // 160-167) AND `summaries.suppressed_at IS NULL` (don't process
+  // suppressed leaves). The mismatch caused the autostart loop to
+  // spin forever on rows the tick would never select — operator
+  // saw `pendingCount > 0` but no progress.
+  // Match the selector exactly so pending count = eligible work.
   const kind = args.kind ?? "entity";
+  const MAX_ATTEMPTS = 5;
   const row = db
     .prepare(
-      `SELECT COUNT(*) AS n FROM lcm_extraction_queue
-         WHERE kind = ? AND completed_at IS NULL`,
+      `SELECT COUNT(*) AS n FROM lcm_extraction_queue q
+         JOIN summaries s ON s.summary_id = q.leaf_id
+         WHERE q.kind = ?
+           AND q.completed_at IS NULL
+           AND q.attempts < ?
+           AND s.suppressed_at IS NULL`,
     )
-    .get(kind) as { n: number };
+    .get(kind, MAX_ATTEMPTS) as { n: number };
   return row.n;
 }
 

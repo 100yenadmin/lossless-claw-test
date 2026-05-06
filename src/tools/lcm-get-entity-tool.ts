@@ -159,30 +159,48 @@ export function createLcmGetEntityTool(input: {
 
       const db = lcm.getDb();
 
-      // 5. Look up the entity (COLLATE NOCASE)
+      // 5. Look up the entity (COLLATE NOCASE).
+      // Wave-10 reviewer P2 fix: previously this returned the entity row
+      // even when ALL its mentions had been suppressed via /lcm purge —
+      // canonical_text + alternate_surfaces + metadata leaked. Add an
+      // EXISTS guard requiring at least one unsuppressed mention so
+      // suppression contract holds: "suppression means invisible to
+      // agents, period." Operators wanting the audit-mode view (see
+      // suppressed entities directly) must do so via raw SQL, not the
+      // agent-facing tool.
       const entityFilters: string[] = [
-        "session_key = ?",
-        "canonical_text = ? COLLATE NOCASE",
+        "e.session_key = ?",
+        "e.canonical_text = ? COLLATE NOCASE",
+        // EXISTS guard: at least one mention whose summary is not suppressed.
+        `EXISTS (
+           SELECT 1 FROM lcm_entity_mentions m
+             JOIN summaries s ON s.summary_id = m.summary_id
+             WHERE m.entity_id = e.entity_id
+               AND s.suppressed_at IS NULL
+         )`,
       ];
       const entityBinds: (string | number)[] = [effectiveSessionKey, name];
       if (entityTypeFilter) {
-        entityFilters.push("entity_type = ?");
+        entityFilters.push("e.entity_type = ?");
         entityBinds.push(entityTypeFilter);
       }
       const entity = db
         .prepare(
-          `SELECT entity_id, session_key, canonical_text, entity_type,
-                  first_seen_at, last_seen_at, first_seen_in_summary_id,
-                  occurrence_count, alternate_surfaces, metadata
-             FROM lcm_entities
+          `SELECT e.entity_id, e.session_key, e.canonical_text, e.entity_type,
+                  e.first_seen_at, e.last_seen_at, e.first_seen_in_summary_id,
+                  e.occurrence_count, e.alternate_surfaces, e.metadata
+             FROM lcm_entities e
              WHERE ${entityFilters.join(" AND ")}
              LIMIT 1`,
         )
         .get(...entityBinds) as EntityRow | undefined;
 
       if (!entity) {
-        // Helpful error — distinguish "no such entity" from "entity exists but
-        // has been suppressed via an operator action".
+        // The "not found" branch now covers BOTH "no such entity" AND
+        // "all mentions suppressed" — they're indistinguishable to the
+        // agent by design (operator suppression is the contract). The
+        // message intentionally doesn't say "or has been suppressed" so
+        // an attacker can't infer entity existence by querying.
         return jsonResult({
           found: false,
           name,
