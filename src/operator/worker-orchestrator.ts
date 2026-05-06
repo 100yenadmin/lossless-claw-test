@@ -159,7 +159,16 @@ export async function tickExtraction(
       passId: args.passId ?? `tick-${Date.now()}`,
       onItemHeartbeat: () => heartbeatLock(db, "extraction", workerId),
     });
-    return { ...result, lockAcquired: true };
+    // Wave-7 Auditor #4/13 P1 fix: surface lockLostMidTick. The W4 fix
+    // wired the heartbeat callback + result field, but tickExtraction
+    // returned `lockAcquired: true` regardless — collapsing "lost lock
+    // partway" into "ran cleanly". Now if heartbeat returned false
+    // mid-tick, lockAcquired flips to false so callers (autostart)
+    // can pace down + treat as soft failure.
+    return {
+      ...result,
+      lockAcquired: result.lockLostMidTick ? false : true,
+    };
   } finally {
     releaseLock(db, "extraction", workerId);
   }

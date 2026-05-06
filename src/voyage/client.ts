@@ -449,12 +449,16 @@ async function postWithRetry(
     const bodyText = await safeReadBody(response);
 
     if (status === 401 || status === 403) {
+      // Wave-7 Auditor #2 P1 fix: route responseBody through summarizeBody
+      // for parity with the 400 path. Voyage 401/403 bodies are unlikely
+      // to echo input but defense-in-depth — Sentry/log capture of the
+      // exception object should never see raw input text.
       throw new VoyageError(
         "auth",
         `voyage_auth: ${status} (check VOYAGE_API_KEY)`,
         status,
         undefined,
-        bodyText,
+        summarizeBody(bodyText),
       );
     }
     if (status === 400) {
@@ -476,12 +480,13 @@ async function postWithRetry(
     }
     if (status === 429) {
       const retryAfterMs = parseRetryAfterMs(response.headers.get("Retry-After"));
+      // Wave-7 Auditor #2 P1 fix: summarize 429 body too (parity with 400)
       lastErr = new VoyageError(
         "rate_limit",
         `voyage_429: rate limited (attempt ${attempt + 1}/${maxRetries + 1})`,
         status,
         retryAfterMs,
-        bodyText,
+        summarizeBody(bodyText),
       );
       // Wave-2 Auditor #2 fix F1: previously we silently clamped Retry-After
       // against BACKOFF_CAP_MS (25s), so a server-supplied 60s wait became a
@@ -505,12 +510,13 @@ async function postWithRetry(
       throw lastErr;
     }
     if (status >= 500 && status < 600) {
+      // Wave-7 Auditor #2 P1 fix: summarize 5xx body too (parity with 400)
       lastErr = new VoyageError(
         "server_error",
         `voyage_5xx: ${status} (attempt ${attempt + 1}/${maxRetries + 1})`,
         status,
         undefined,
-        bodyText,
+        summarizeBody(bodyText),
       );
       if (attempt < maxRetries) {
         await sleep(backoffMs(attempt));
@@ -519,12 +525,13 @@ async function postWithRetry(
       throw lastErr;
     }
     // Some other 4xx — treat as bad_request, no retry.
+    // Wave-7 Auditor #2 P1 fix: summarizeBody on responseBody too
     throw new VoyageError(
       "bad_request",
       `voyage_4xx: ${status} ${summarizeBody(bodyText)}`,
       status,
       undefined,
-      bodyText,
+      summarizeBody(bodyText),
     );
   }
 

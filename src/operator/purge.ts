@@ -277,14 +277,30 @@ function runSoftPurge(
     //
     // Privacy contract: when operator says "purge this leaf for
     // confidentiality", they mean BOTH the summary AND the underlying
-    // raw messages should be unfindable via any agent surface.
+    // raw messages should be unfindable via any agent surface — UNLESS
+    // the message is shared with a non-purged leaf, in which case
+    // suppressing it would orphan that other leaf's content.
+    //
+    // Wave-7 Auditor #14 P0-2 fix: only suppress messages whose
+    // EVERY referencing leaf is being suppressed. Without this gate,
+    // purging one of two leaves that share a message would silently
+    // suppress the message for both — breaking the non-purged leaf's
+    // assemble path. The NOT EXISTS predicate checks for any
+    // non-suppressed referencing summary OUTSIDE the current purge set.
     db.prepare(
       `UPDATE messages SET suppressed_at = datetime('now')
          WHERE message_id IN (
-           SELECT message_id FROM summary_messages
-             WHERE summary_id IN (${placeholders})
+           SELECT sm.message_id FROM summary_messages sm
+             WHERE sm.summary_id IN (${placeholders})
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM summary_messages sm2
+             JOIN summaries s2 ON s2.summary_id = sm2.summary_id
+             WHERE sm2.message_id = messages.message_id
+               AND s2.suppressed_at IS NULL
+               AND sm2.summary_id NOT IN (${placeholders})
          )`,
-    ).run(...leafIds);
+    ).run(...leafIds, ...leafIds);
 
     // v4.1 Final.review.3 fix (Loop 2 Leak 2.5):
     // Invalidate any rebuildable synthesis caches that referenced the

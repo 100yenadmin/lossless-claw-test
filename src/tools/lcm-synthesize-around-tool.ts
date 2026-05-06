@@ -197,9 +197,14 @@ function parsePeriodShortcut(
       label: `last-${hours}h`,
     };
   }
-  const dMatch = period.match(/^last-(\d+)-?d(ays?)?$/);
+  // Wave-7 Auditor #6 P1 fix: tighten regex to only accept documented
+  // forms: `last-Nd` (e.g. last-3d) OR `last-N-days` (e.g. last-7-days).
+  // Previously also accepted undocumented variants like `last-3day`,
+  // `last-3-d`, `last-3-day` which silently worked but weren't in docs.
+  const dMatch = period.match(/^last-(\d+)d$|^last-(\d+)-days$/);
   if (dMatch) {
-    const days = Math.min(366, Math.max(1, parseInt(dMatch[1]!, 10)));
+    const captured = dMatch[1] ?? dMatch[2]!;
+    const days = Math.min(366, Math.max(1, parseInt(captured, 10)));
     return {
       since: new Date(now.getTime() - days * dayMs),
       before: now,
@@ -506,10 +511,46 @@ export function createLcmSynthesizeAroundTool(input: {
       let rangeStartIso: string;
       let rangeEndIso: string;
       let semanticMeta: { modelName?: string; voyageTokensConsumed?: number } | undefined;
-      const sessionKeyForCache =
+      // Wave-7 Auditor #6 P0 fix: derive a NON-EMPTY sessionKeyForCache
+      // even when targetSummary is null (period mode without anchor) AND
+      // input.sessionKey is missing. The cache UNIQUE constraint on
+      // (session_key, range_start, range_end, leaf_fingerprint, ...)
+      // collapses to "" for all such callers, causing CROSS-SESSION
+      // CACHE POLLUTION — caller A's cached synthesis surfaces in
+      // caller B's loser-path SELECT.
+      //
+      // Fallback chain:
+      //   1. targetSummary's session_key (if present)
+      //   2. input.sessionKey (if present)
+      //   3. resolved conversationIds[0]'s session_key (looked up from DB)
+      //   4. agent:main:main as the safe default for shell/CLI callers
+      //      who don't carry a session identity
+      const lookupConversationSessionKey = (convId: number): string | undefined => {
+        try {
+          const row = db
+            .prepare(`SELECT session_key FROM conversations WHERE conversation_id = ?`)
+            .get(convId) as { session_key?: string } | undefined;
+          return row?.session_key?.trim() || undefined;
+        } catch {
+          return undefined;
+        }
+      };
+      let sessionKeyForCache =
         targetSummary?.session_key?.trim() ||
         (typeof input.sessionKey === "string" && input.sessionKey.trim()) ||
         "";
+      if (!sessionKeyForCache && conversationIds && conversationIds.length > 0) {
+        sessionKeyForCache = lookupConversationSessionKey(conversationIds[0]!) ?? "";
+      }
+      if (!sessionKeyForCache && conversationScope.conversationId != null) {
+        sessionKeyForCache =
+          lookupConversationSessionKey(conversationScope.conversationId) ?? "";
+      }
+      if (!sessionKeyForCache) {
+        // Last-resort fallback. Better to silo cache to a clear default
+        // than to collapse to "" and pollute across callers.
+        sessionKeyForCache = "agent:main:main";
+      }
 
       if (windowKind === "period") {
         // Reviewer P1 fix: direct date-range / period-shortcut selection.

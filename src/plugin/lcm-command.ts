@@ -2623,7 +2623,41 @@ export function createLcmCommand(params: {
               querySetVersion: parsed.querySetVersion,
             }),
           };
-        case "purge":
+        case "purge": {
+          // Wave-7 Auditor #14 P0-1 fix: operator-session gate.
+          //
+          // /lcm purge mutates the LCM DB by suppressing leaves +
+          // cascading suppression to messages, vec0 metadata, and
+          // synthesis cache. Without a gate, ANY agent that can issue
+          // /lcm slash commands could purge another session's data —
+          // e.g. cross-session leaks via `--session-key`, or even Eva's
+          // primary thread via `--allow-main-session`.
+          //
+          // Gate via `ctx.senderIsOwner` (the OpenClaw plugin SDK's
+          // explicit owner-only flag). Authorized non-owner senders are
+          // also rejected — purge requires explicit owner privilege.
+          //
+          // Dry-run preview is also gated since it reveals which leaves
+          // exist for the targeted criteria — leaking that information
+          // is itself a confidentiality concern.
+          if (!ctx.senderIsOwner) {
+            return {
+              text: [
+                ...buildHeaderLines(),
+                "",
+                "🧹 Lossless Claw Purge — operator-only",
+                "",
+                buildSection("🚫 Rejected", [
+                  buildStatLine("status", "operator-only"),
+                  buildStatLine(
+                    "reason",
+                    "/lcm purge requires owner privileges (ctx.senderIsOwner=true). Soft-purge cascades through messages, vec0 metadata, and synthesis cache — non-owner callers cannot invoke it.",
+                  ),
+                  buildStatLine("hint", "If you are the operator, ensure your channel surface marks you as owner."),
+                ]),
+              ].join("\n"),
+            };
+          }
           return {
             text: await buildPurgeText({
               db: await getDb(),
@@ -2637,6 +2671,7 @@ export function createLcmCommand(params: {
               apply: parsed.apply,
             }),
           };
+        }
         case "help":
           return { text: buildHelpText(parsed.error) };
       }

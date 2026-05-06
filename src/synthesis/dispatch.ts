@@ -567,11 +567,53 @@ async function runBestOfNYearly(
       },
     ),
   );
-  const candidateResults = await Promise.all(candidatePromises);
+  // Wave-7 Auditor #5 P1.1 fix: Promise.allSettled instead of Promise.all
+  // so one failed candidate doesn't discard the work of successful peers.
+  // Cost: yearly already paid for the successful runs; previous behavior
+  // wasted that money. New behavior: collect successes, throw only if
+  // ALL fail; judge picks among survivors.
+  const settled = await Promise.allSettled(candidatePromises);
+  const candidateResults: Array<{
+    output: string;
+    latencyMs: number;
+    costCents: number | undefined;
+    auditId: string;
+  }> = [];
+  const candidateFailures: string[] = [];
+  for (const s of settled) {
+    if (s.status === "fulfilled") {
+      candidateResults.push(s.value);
+    } else {
+      candidateFailures.push(s.reason instanceof Error ? s.reason.message : String(s.reason));
+    }
+  }
+  if (candidateResults.length === 0) {
+    // ALL candidates failed — surface all failures
+    throw new SynthesisDispatchError(
+      "llm_failure",
+      `[synthesis.dispatch] all ${ctx.bestOfN} best-of-N candidates failed: ${candidateFailures.join(" | ").slice(0, 600)}`,
+    );
+  }
   for (const cr of candidateResults) {
     ctx.auditIds.push(cr.auditId);
     ctx.addLatency(cr.latencyMs);
     ctx.addCost(cr.costCents);
+  }
+
+  // Wave-7 Auditor #5 P1.2 fix: skip judge entirely when only ONE candidate
+  // survived (either bestOfN=1 caller OR N-1 candidates failed). Judge over
+  // a single candidate is a foot-gun (judge expected 0..N-1 but only "0"
+  // would be valid; many models emit 1-indexed and crash judge_failure).
+  if (candidateResults.length === 1) {
+    return {
+      output: candidateResults[0]!.output,
+      bestOfN: {
+        n: 1,
+        selectedIndex: 0,
+        candidates: [candidateResults[0]!.output],
+      },
+      hallucinationFlagged: undefined,
+    };
   }
 
   // Look up the judge prompt

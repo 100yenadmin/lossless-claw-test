@@ -230,9 +230,21 @@ export async function runCoreferenceTick(
         // is returned to operators via /lcm health surfaces).
         itemDetail.error =
           `${errMsg.slice(0, 500)} | dead-letter-update-failed: ${updateErrMsg.slice(0, 500)}`;
+        // Wave-7 Auditor #12 P1-E fix: try a second, simpler bump-only
+        // UPDATE so the dead-letter mechanism still progresses even if
+        // the first attempt (with last_error string) failed (e.g., due
+        // to BLOB-size constraint or a DB-locked retry). Without this,
+        // attempts stays at 0 forever and the row retries indefinitely.
+        try {
+          db.prepare(
+            `UPDATE lcm_extraction_queue SET attempts = COALESCE(attempts, 0) + 1 WHERE queue_id = ?`,
+          ).run(item.queue_id);
+        } catch {
+          // best-effort. If even the simpler bump fails, the operator
+          // sees the "dead-letter-update-failed" string in itemDetail.
+          // Operator can manually purge the queue row via /lcm.
+        }
         // Don't break the loop — other items may still be processable.
-        // But the operator will see the merged error in the per-item
-        // diagnostics.
       }
       continue; // don't mark queue row processed — next tick will retry (until attempts >= MAX_ATTEMPTS)
     }
@@ -242,10 +254,22 @@ export async function runCoreferenceTick(
 
     db.exec("BEGIN IMMEDIATE");
     try {
+      // Wave-7 Auditor #12 P0 fix: per-row SAVEPOINT inside the batch
+      // tx so a SINGLE bad surface (FK violation, encoding bomb,
+      // CHECK constraint failure, etc.) doesn't ROLLBACK the whole leaf
+      // and discard all its other valid mentions. Without this, the
+      // dead-letter mechanism (W4 fix) couldn't fire because the
+      // per-leaf BEGIN IMMEDIATE / ROLLBACK at line 361 wasn't bumping
+      // attempts — leaving poison surfaces in infinite retry.
       // 2. For each extracted entity surface, upsert + mention
+      let entityIdx = -1;
       for (const ent of extracted) {
+        entityIdx++;
         const canonical = (ent.canonicalText ?? ent.surface).trim();
         if (canonical.length === 0) continue;
+        const sp = `coref_${entityIdx}_${Date.now().toString(36)}`;
+        db.exec(`SAVEPOINT ${sp}`);
+        try {
 
         // Upsert entity (using NOCASE UNIQUE on session_key + canonical_text)
         const existing = db
@@ -342,6 +366,28 @@ export async function runCoreferenceTick(
                    last_seen_at = datetime('now')
                WHERE entity_id = ?`,
           ).run(entityId);
+        }
+        // Wave-7 Auditor #12 P0 fix: close the per-row SAVEPOINT.
+        // Releasing on success commits this entity's writes into the
+        // outer tx without affecting siblings.
+        db.exec(`RELEASE ${sp}`);
+        } catch (perRowErr: unknown) {
+          // Per-surface failure rolls back JUST this entity's writes;
+          // siblings already-committed within the outer tx survive.
+          // Record the error in itemDetail so operator/dead-letter sees
+          // partial-progress + which surface failed.
+          try {
+            db.exec(`ROLLBACK TO ${sp}`);
+            db.exec(`RELEASE ${sp}`);
+          } catch {
+            // best-effort: if SAVEPOINT rollback fails, the outer
+            // try/catch will catch + ROLLBACK the whole leaf.
+            throw perRowErr;
+          }
+          // Surface in itemDetail (truncated). Loop continues for other entities.
+          const perRowMsg = perRowErr instanceof Error ? perRowErr.message : String(perRowErr);
+          if (!itemDetail.error) itemDetail.error = "";
+          itemDetail.error += ` | per-row-failed[${entityIdx}]: ${perRowMsg.slice(0, 200)}`;
         }
       }
 

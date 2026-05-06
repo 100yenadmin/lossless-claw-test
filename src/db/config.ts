@@ -94,7 +94,21 @@ export type LcmConfig = {
   freshTailCount: number;
   /** Optional token cap for the protected fresh tail; newest message is always preserved. */
   freshTailMaxTokens?: number;
-  /** When true, budget-constrained assembly may keep older items by prompt relevance instead of pure chronology. */
+  /**
+   * When true, budget-constrained assembly may keep older items by prompt
+   * relevance instead of pure chronology.
+   *
+   * WARNING — Wave-7 Auditor #18 P1: this flag introduces a RAG-style
+   * adaptive decision into the assemble() pyramid, which violates the
+   * v4.1 architecture invariant "pyramid is structural, NOT RAG-style
+   * adaptive (locked design)". Default `false` (chronological eviction
+   * preserves cache stability across turns). Enable only with full
+   * understanding that turn-to-turn assembly may differ for the same
+   * conversation, breaking deterministic replay + breaking the pyramid's
+   * structural-correctness contract. The flag is documented as opt-in
+   * and is preserved for backward compatibility with v3 callers; the
+   * v4.1 default is OFF and we recommend keeping it off.
+   */
   promptAwareEviction: boolean;
   newSessionRetainDepth: number;
   leafMinFanout: number;

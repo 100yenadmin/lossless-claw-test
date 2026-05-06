@@ -25,9 +25,13 @@ When a conversation grows beyond the model's context window, OpenClaw (just like
 5. **Provides 8 agent tools** so agents can search and recall details from compacted history:
    - `lcm_grep` — search via regex / FTS5 / hybrid (FTS+semantic+rerank) / pure-semantic / verbatim modes
    - `lcm_semantic_recall` — paraphrastic search via Voyage embeddings + cosine similarity bands
-   - `lcm_synthesize_around` — fresh windowed synthesis around a target leaf or query
+   - `lcm_synthesize_around` — fresh windowed synthesis. Three modes:
+     - `window_kind="period"` (the `lcm_recent` replacement) — direct date-range / period-shortcut (e.g. `period: "yesterday"`, `period: "last-7-days"`); no anchor lookup required
+     - `window_kind="time"` — ±N hours around an anchor leaf (`target: "sum_xxx"`)
+     - `window_kind="semantic"` — top-K most-similar leaves to a target leaf or free-text query
    - `lcm_describe` — drill into a summary's lineage + one-hop expansion to children/messages
-   - `lcm_expand_query` / `lcm_expand` — recursive expansion gated through a sub-agent (audit ledger preserved)
+   - `lcm_expand_query` — recursive expansion via bounded sub-agent (~120s; cited summaries validated against the DB)
+   - `lcm_expand` — sub-agent-only DAG walker, gated by an explicit grant ledger
    - `lcm_get_entity` / `lcm_search_entities` — entity catalog lookup (populated by async coreference worker)
 
 Nothing is lost. Raw messages stay in the database. Summaries link back to their source messages. Agents can drill into any summary to recover the original detail.

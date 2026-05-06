@@ -250,11 +250,34 @@ export function createLcmDescribeTool(input: {
         const expandChildren = p.expandChildren === true;
         const expandMessages = p.expandMessages === true;
         if (expandChildren) {
-          if (s.childIds.length === 0) {
+          // Wave-7 Auditor #9 P0 fix: `s.childIds` is ALREADY suppression-
+          // filtered upstream by `getSummaryChildren()` (defaults to
+          // includeSuppressed=false). The previous header labeled this as
+          // "raw count BEFORE suppression filter" — a lie. Re-query the
+          // raw count separately so the header is honest. Cheap COUNT.
+          let rawChildCountForHeader = s.childIds.length;
+          try {
+            const dbForRawCount = lcm.getDb();
+            const cr = dbForRawCount
+              .prepare(
+                `SELECT COUNT(*) AS n FROM summary_parents WHERE parent_summary_id = ?`,
+              )
+              .get(id) as { n?: number } | undefined;
+            rawChildCountForHeader = cr?.n ?? s.childIds.length;
+          } catch {
+            // Fall back to filtered count if the COUNT query fails
+          }
+          if (rawChildCountForHeader === 0) {
             lines.push("expansion (children): 0 — terminal node, nothing to drill into");
-          } else {
+          } else if (s.childIds.length === 0 && rawChildCountForHeader > 0) {
             lines.push(
-              `expansion (children): ${s.childIds.length} raw candidate(s) before suppression filter; survivors + details below`,
+              `expansion (children): 0 of ${rawChildCountForHeader} raw — ALL children suppressed; details below`,
+            );
+          } else {
+            const suppressedCount = rawChildCountForHeader - s.childIds.length;
+            const suppNote = suppressedCount > 0 ? ` (${suppressedCount} suppressed and filtered)` : "";
+            lines.push(
+              `expansion (children): ${s.childIds.length} of ${rawChildCountForHeader} raw${suppNote}; details below`,
             );
           }
         }
@@ -421,7 +444,16 @@ export function createLcmDescribeTool(input: {
           | "capped"
           | "offset-past-end"
           | undefined;
-        if (expandMessages) {
+        if (expandMessages && budgetExhausted) {
+          // Wave-7 Auditor #9 P0 fix: W4 added budget=0 BLOCK only to
+          // expandChildren — expandMessages was unguarded and would
+          // continue to serve content past the delegated grant.
+          expandMessagesStatus = "skipped-non-summary"; // reuse status semantically (P1 follow-up: distinct status)
+          lines.push("");
+          lines.push(
+            `expanded source messages: SKIPPED — delegated grant has 0 tokens remaining; expansion blocked. Re-issue the grant via lcm_expand_query with a higher remainingTokens to unblock.`,
+          );
+        } else if (expandMessages) {
           if (s.kind !== "leaf") {
             expandMessagesStatus = "not-leaf";
             lines.push("");

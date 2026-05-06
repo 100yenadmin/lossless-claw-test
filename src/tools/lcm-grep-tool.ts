@@ -200,7 +200,12 @@ export function createLcmGrepTool(input: {
       const limit =
         mode === "verbatim" ? Math.min(requestedLimit, VERBATIM_HARD_CAP) : requestedLimit;
       const requestedSort = (p.sort as "recency" | "relevance" | "hybrid") ?? "recency";
+      // Wave-7 Auditor #8 P1 fix: silent sort override is misleading. If
+      // a caller explicitly passes sort=relevance with mode=regex, surface
+      // a `sortIgnored` field in details so they can see the override.
       const effectiveSort = mode === "full_text" ? requestedSort : "recency";
+      const sortIgnored =
+        p.sort != null && requestedSort !== "recency" && mode !== "full_text";
       let since: Date | undefined;
       let before: Date | undefined;
       try {
@@ -358,6 +363,10 @@ export function createLcmGrepTool(input: {
           messageCount: result.messages.length,
           summaryCount: result.summaries.length,
           totalMatches: result.totalMatches,
+          // Wave-7 Auditor #8 P1: surface sort override
+          ...(sortIgnored
+            ? { sortIgnored: true, requestedSort, effectiveSort }
+            : {}),
         },
       };
     },
@@ -522,10 +531,14 @@ async function runHybridLcmGrep(input: HybridGrepInput) {
 
   let hybridResult;
   try {
+    // Wave-7 Auditor #8 P1 fix: over-fetch ratio. Previously kFts/kSemantic
+    // = max(limit, 50) — at limit=200, this gave rerank zero headroom to
+    // reorder. Recall pipelines typically over-fetch 3-5×. Use 3× user
+    // limit floored at 50, capped at 500 (Voyage rerank budget).
     hybridResult = await runHybridSearch(db, {
       query: pattern,
-      kFts: Math.max(limit, 50),
-      kSemantic: Math.max(limit, 50),
+      kFts: Math.min(500, Math.max(50, limit * 3)),
+      kSemantic: Math.min(500, Math.max(50, limit * 3)),
       topN: limit,
       conversationIds,
       since,
@@ -623,24 +636,25 @@ async function runHybridLcmGrep(input: HybridGrepInput) {
       degradedToFtsOnly: hybridResult.degradedToFtsOnly,
       degradedSkippedRerank: hybridResult.degradedSkippedRerank,
       modelName: hybridResult.modelName,
-      // Wave-4 Auditor #21 P1 fix: emit confidenceBand for parity with
-      // semantic mode + lcm_semantic_recall. Hybrid's `score` is a rerank
-      // score (0..1 typically), not a cosine similarity, so we derive
-      // band from semanticDistance when present (it's in cosine-space
-      // for the non-reranked candidates) and fall back to "rerank" as a
-      // signal when score is the dominant signal.
-      confidenceBand: (() => {
+      // Wave-4 Auditor #21 P1 fix + Wave-7 P1: emit confidenceBand for
+      // parity with semantic mode + lcm_semantic_recall. Hybrid's `score`
+      // is a rerank score (0..1 typically), NOT a cosine similarity —
+      // calibration thresholds are tuned for cosine. Wave-7 surfaces
+      // confidenceBandSource so callers can see whether the band came
+      // from cosine (calibrated) or rerank (heuristic).
+      ...(() => {
         const top = hybridResult.hits[0];
-        if (!top) return "no-match";
-        // Prefer semanticDistance when present (cosine-derivable)
+        if (!top) return { confidenceBand: "no-match" as const, confidenceBandSource: null };
         if (typeof top.semanticDistance === "number") {
-          // L2 on unit vectors → cosine = 1 - L²/2
           const cos = 1 - (top.semanticDistance * top.semanticDistance) / 2;
-          return cos >= 0.65 ? "high" : cos >= 0.5 ? "medium" : cos >= 0.35 ? "low" : "noise";
+          const band =
+            cos >= 0.65 ? "high" : cos >= 0.5 ? "medium" : cos >= 0.35 ? "low" : "noise";
+          return { confidenceBand: band, confidenceBandSource: "cosine" as const };
         }
-        // Fallback: rerank score is normalized 0..1
         const s = top.score;
-        return s >= 0.65 ? "high" : s >= 0.5 ? "medium" : s >= 0.35 ? "low" : "noise";
+        const band =
+          s >= 0.65 ? "high" : s >= 0.5 ? "medium" : s >= 0.35 ? "low" : "noise";
+        return { confidenceBand: band, confidenceBandSource: "rerank" as const };
       })(),
       hits: hybridResult.hits.map((h) => ({
         summaryId: h.summaryId,

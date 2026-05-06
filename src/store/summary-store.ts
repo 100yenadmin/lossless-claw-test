@@ -1461,7 +1461,12 @@ export class SummaryStore {
       conversationId: row.conversation_id,
       kind: row.kind,
       snippet: createFallbackSnippet(row.content, snippetTerms),
-      createdAt: new Date(row.created_at),
+      // Wave-7 Auditor #1 P1 fix: SQLite stores 'YYYY-MM-DD HH:MM:SS'
+      // (no Z), and `new Date(naive)` parses as LOCAL time. All other
+      // search paths use parseUtcTimestamp; this CJK fallback path was
+      // the outlier. Without this, CJK matches showed timestamps offset
+      // by the host's local timezone (8h for Asia/Shanghai, etc).
+      createdAt: parseUtcTimestamp(row.created_at),
       rank: 0,
     }));
   }

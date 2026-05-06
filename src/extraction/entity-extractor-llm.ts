@@ -122,6 +122,24 @@ export function createEntityExtractorLlm(
         `[entity-extractor-llm] truncated content from ${content.length} → ${HARD_CAP} chars (${content.length - HARD_CAP} chars dropped) — entities in the truncated tail will not be extracted`,
       );
     }
+    // Wave-4 Auditor #12 P0-2 #2 (FINALLY IMPLEMENTED in Wave-7): refuse
+    // extraction if leaf content contains the literal closing-tag pattern
+    // OR raw `<leaf-content-` prefix. The XML envelope uses a random
+    // per-call token so guessing it is hard, but defense-in-depth: any
+    // attempt to inject XML that LOOKS like a closing tag should fail
+    // safe rather than reach the LLM. Returns [] (no entities) which
+    // matches the "be conservative" extractor contract.
+    if (
+      /<\/?leaf-content-[a-f0-9]{8,}/i.test(trimmedContent) ||
+      /<\/leaf-content-/i.test(trimmedContent)
+    ) {
+      if (config.deps.log?.warn) {
+        config.deps.log.warn(
+          `[entity-extractor-llm] leaf content contains XML envelope-like pattern — refusing extraction (defense-in-depth against prompt injection)`,
+        );
+      }
+      return [];
+    }
     // Wave-4 Auditor #12 P0-2 fix #1: random-per-call token in the
     // closing tag. Twelve hex chars = 48 bits — model would have to
     // guess this exactly to forge a closing tag.

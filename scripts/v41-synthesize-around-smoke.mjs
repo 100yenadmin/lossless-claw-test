@@ -47,8 +47,20 @@ if (!existsSync(SRC)) {
 }
 mkdirSync(DST_DIR, { recursive: true });
 const DST = join(DST_DIR, `lcm-synthesize-smoke-${Date.now()}.db`);
-copyFileSync(SRC, DST);
-log(`copied DB to ${DST}`);
+// Wave-7 Auditor #19 P0 fix: copyFileSync against a live WAL-mode DB
+// produces malformed snapshots when the gateway is mid-checkpoint.
+// Use VACUUM INTO for atomic snapshot (same fix W4 applied to
+// scripts/v41-live-db-harness.mjs and the preflight script).
+log(`creating atomic VACUUM INTO snapshot ${SRC} → ${DST}...`);
+{
+  const snapDb = new DatabaseSync(SRC, { readOnly: true });
+  try {
+    snapDb.exec(`VACUUM INTO '${DST.replace(/'/g, "''")}'`);
+  } finally {
+    snapDb.close();
+  }
+}
+log(`snapshot done at ${DST}`);
 
 // Run v4.1 migration on the copy so we exercise the post-migration code path
 // that lcm_synthesize_around expects (session_key, suppressed_at, etc.)

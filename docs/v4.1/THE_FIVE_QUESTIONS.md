@@ -34,7 +34,9 @@ The agent returns original text without LLM paraphrase. Critical for citation, l
 ### D. Pattern-anchored
 > "How do I rebuild the gateway?" (procedure) / "What's the history of project X?" (entity) / "What themes have we worked on this month?" (theme)
 
-The agent recalls recurring entities, procedures, and themes the system has detected automatically. This is the "real person notices patterns" capability.
+The agent recalls recurring entities the system has detected automatically. This is the "real person notices patterns" capability.
+
+**Coverage status**: Entity recall ships in v4.1 via `lcm_get_entity` + `lcm_search_entities`. Procedure mining and theme consolidation were CUT from this PR (preserved in deferred-features draft #616 with explicit cost/scope estimates). Until those ship, procedure / theme questions fall back through `lcm_grep --mode hybrid` (good for paraphrastic procedure recall) and `lcm_synthesize_around window_kind="period"` (good for theme-of-the-month queries).
 
 ### E. Drilldown
 > "Where did this come from?" / "Show me the source of the claim that Y."
