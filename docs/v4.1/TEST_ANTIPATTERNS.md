@@ -57,6 +57,54 @@ Tests run single-threaded. Race conditions (snapshot taken outside the BEGIN IMM
 
 CHECK constraints, FK declarations, prompt placeholders — these are STRINGS that the runtime parses. A typo in a CHECK constraint or an unsubstituted `{{placeholder}}` doesn't break TypeScript; it breaks at runtime when the row violates the constraint or the LLM gets `{{placeholder}}` in its prompt.
 
+### A10. Local fix, not broader contract (Wave-11 reviewer post-mortem)
+
+Tests that prove the *exact previous bug shape* is fixed, but don't exhaust the contract around it. Example: timezone tests covered Bangkok + LA on normal days but missed DST-transition days and fractional offsets like Asia/Kolkata. "UTC midnight bug fixed" passed; "local calendar day is always correct" was still false.
+
+**Fix pattern**: table-driven tests with edge-case rows (DST, fractional, north/south hemispheres, day-rollover boundaries) + property-style assertions (e.g., "today's duration is in [22h, 26h] for any tz").
+
+### A11. Test inspected the wrong source / location
+
+Test logic is right but reads from the wrong place. Example: auth invariant hardcoded `/tmp/lossless-claw-upstream` — locally that path existed (stale checkout), so tests passed; CI didn't have it, so CI failed.
+
+**Fix pattern**: resolve paths via `import.meta.url` + `path.resolve(__dirname, "...")` and assert the resolved path is INSIDE the project tree. Or run tests in clean-environment CI (different cwd, different machine, frozen lockfile).
+
+### A12. Switch case hides parsed-flag variants
+
+Case-name-based invariants miss sub-flag mutating variants. Example: `doctor` and `doctor_cleaners` cases were classified as READ_ONLY by case name, but `parsed.apply` turned them into mutating commands inside the same case body.
+
+**Fix pattern**: invariant test scans for `parsed.X` flag references inside case bodies and enforces gates per-flag, not per-case-name. Plus enumerate sample CLI invocations (`"doctor apply"`, `"doctor"`, `"doctor clean apply"`, `"doctor clean"`) and assert each routes to the right gate.
+
+### A13. Accounting after disclosure ≠ authorization before disclosure
+
+Test asserts the BUDGET WAS CHARGED but doesn't assert the CONTENT WAS NOT EMITTED. The contract for security-sensitive disclosure is "if budget exhausted, content MUST NOT be in output" — a NEGATIVE assertion. A test that checks `consumeTokenBudget` was called passes even if the content was emitted to the agent first.
+
+**Fix pattern**: negative assertion on the actual response body (`expect(text).not.toContain("SECRET_MARKER")`). Test must verify what's IN/NOT-IN the output, not what was recorded internally.
+
+### A14. Happy / obvious orderings only
+
+Tests cover "all candidates fit" or "all candidates oversized" but miss adversarial orderings like "first oversized, rest fit." Example: rerank packer broke out on FIRST oversized candidate, disabling rerank for the whole result set.
+
+**Fix pattern**: table-driven ordering matrix. For any function whose behavior depends on input order, test 3+ permutations: "good first," "bad first," "good middle, bad on edges," etc.
+
+### A15. Unit-tested components, not the integration seam
+
+Component A's unit test verifies it sends the right thing; component B's wrapper around A doesn't actually use it. Example: `dispatchSynthesis` correctly passes `args.model`, but `lcm_synthesize_around` wraps it with a legacy summarizer that ignores `args.model`. Both ends had passing tests; the seam was untested.
+
+**Fix pattern**: assert the actual external call payload at the integration seam. For Voyage: capture `fetch` body. For LLM: capture the model name in the audit row AND verify it matches what the actual provider received. Tests on mocks at one layer don't substitute for tests on the wrapped composition.
+
+### A16. Default-only configuration
+
+Tests use default values for env vars / config, missing the bug class where non-default values aren't forwarded. Example: `LCM_EMBEDDING_DIM` could register a 2048-dim profile, but `embedTexts()` never sent `output_dimension`, so Voyage returned 1024 and vec0 INSERT failed with dim mismatch — undetectable in tests using the 1024 default.
+
+**Fix pattern**: explicit configuration matrix. For any config knob with N values, test all N (or representative samples) end-to-end, asserting the value is forwarded to the external boundary.
+
+### A17. Release hygiene outside test suite
+
+`npm test` doesn't validate `pnpm-lock.yaml` sync, changeset coverage, manifest-vs-registered-tools mismatch, or `/tmp/` hardcoded paths. CI fails on a different lane (lockfile lane uses pnpm) than the test lane (uses npm).
+
+**Fix pattern**: dedicated release-readiness preflight script (`scripts/v41-release-readiness-preflight.mjs`) checks all of these, runs in CI alongside `npm test`. Failure on the preflight blocks merge.
+
 ---
 
 ## Wave 1-9 findings classified by antipattern

@@ -85,6 +85,11 @@ export function makeTestDeps(
     normalizeAgentId: (id?: string) => (id?.trim() ? id : "main"),
     buildSubagentSystemPrompt: () => "subagent prompt",
     readLatestAssistantReply: () => undefined,
+    // Wave-12: tools that resolve session_id-from-session_key (via the
+    // conversation-scope helper) need this in deps. Mock returns the
+    // sessionKey itself (acceptable for tests where session_id resolution
+    // doesn't matter).
+    resolveSessionIdFromSessionKey: async (sessionKey: string) => sessionKey,
     ...overrides,
   } as LcmDependencies;
 }

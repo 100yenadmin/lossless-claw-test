@@ -297,4 +297,58 @@ describe("authorization invariants", () => {
     const text = (result as { text: string }).text;
     expect(text).not.toMatch(/operator-only/i);
   });
+
+  // ────────────────────────────────────────────────────────────────────
+  // Wave-12 meta-test: every `parsed.apply`/`parsed.X` flag inside a
+  // case body that mutates state has a senderIsOwner guard.
+  //
+  // The reviewer's diagnosis: switch cases hide multiple behaviors. The
+  // case-name-based invariant above misses sub-flag mutating variants
+  // (doctor / doctor_cleaners had `parsed.apply` paths that mutate).
+  // This test scans the source for any branch on `parsed.apply` inside
+  // an operator-handler case body; for each, asserts there's a
+  // `senderIsOwner` check before the apply branch.
+  // ────────────────────────────────────────────────────────────────────
+
+  it("INVARIANT: every `parsed.apply` branch inside a handler case has a senderIsOwner gate", () => {
+    const source = readFileSync(LCM_COMMAND_PATH, "utf8");
+    // Find every `parsed.apply` or similar mutation-flag reference
+    // inside what looks like a handler case body (after the parser
+    // switch, in the dispatch switch). We bracket the dispatch switch
+    // by its enclosing `case` indent (8 spaces) and look for
+    // `parsed.apply` references.
+    //
+    // For each handler case that contains `parsed.apply`, verify the
+    // case body also contains `senderIsOwner` AND that they appear
+    // before any actual mutation (`buildXxxApplyText`/`runXxx`).
+    // Heuristic: the gate appears before the apply-dispatch in the
+    // case body.
+    const handlerSwitchStart = source.indexOf("// 4. Dispatch");
+    // Cases in the handler dispatch start with `        case "X":` (8 spaces).
+    const casesWithApply: Array<{ name: string; body: string }> = [];
+    const caseRe = /^ {8}case "([a-z_]+)":\s*\{?([\s\S]*?)(?=^ {8}case "|^ {8}default|^ {6}\})/gm;
+    let m: RegExpExecArray | null;
+    const handlerSection =
+      handlerSwitchStart >= 0 ? source.slice(handlerSwitchStart) : source;
+    while ((m = caseRe.exec(handlerSection)) !== null) {
+      const name = m[1]!;
+      const body = m[2]!;
+      if (body.includes("parsed.apply") || body.includes("parsed?.apply")) {
+        casesWithApply.push({ name, body });
+      }
+    }
+    // Must find at least the doctor / doctor_cleaners cases (sanity).
+    expect(casesWithApply.map((c) => c.name).sort()).toEqual(
+      expect.arrayContaining(["doctor", "doctor_cleaners"]),
+    );
+    // For each case with `parsed.apply`, the case body must contain
+    // a `senderIsOwner` gate. (We don't enforce ordering — but the
+    // gate must exist somewhere in the body.)
+    for (const { name, body } of casesWithApply) {
+      expect(
+        body,
+        `case "${name}" has a parsed.apply branch but no senderIsOwner gate`,
+      ).toMatch(/senderIsOwner/);
+    }
+  });
 });

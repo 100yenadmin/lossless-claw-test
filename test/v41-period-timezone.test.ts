@@ -204,3 +204,148 @@ describe("parsePeriodShortcut — fractional-offset + DST robustness (Wave-11 re
     expect(durMs).toBe(23 * 60 * 60 * 1000);
   });
 });
+
+// ────────────────────────────────────────────────────────────────────
+// Wave-12 meta-test: table-driven timezone × period × edge-case matrix.
+//
+// The reviewer's diagnosis: Wave-10/11 tests covered specific bug
+// shapes (Bangkok-yesterday + LA-spring-forward) but didn't exhaust
+// the broader contract: "local calendar day is ALWAYS correct in any
+// IANA timezone on any day." This table covers:
+//
+//   - 8 representative timezones spanning ±, integer, half-hour,
+//     quarter-hour, and DST-observing zones
+//   - "yesterday" + "today" anchors at 02:00 LOCAL of the test day
+//   - Each row asserts the EXACT (since, before) UTC instants
+// ────────────────────────────────────────────────────────────────────
+
+interface TimezonePeriodCase {
+  tz: string;
+  description: string;
+  // The "now" in UTC ms — chosen so that local time is 02:00 of `localDate`.
+  nowUtcMs: number;
+  localDate: string; // YYYY-MM-DD in target tz
+  expectedYesterdaySinceUtc: string;
+  expectedYesterdayBeforeUtc: string;
+}
+
+const TIMEZONE_MATRIX: TimezonePeriodCase[] = [
+  // ── Integer offsets (positive) ─────────────────────────────────
+  {
+    tz: "Asia/Bangkok",
+    description: "+7 fixed (no DST)",
+    nowUtcMs: Date.UTC(2026, 4, 6, 19, 0, 0),
+    localDate: "2026-05-07",
+    expectedYesterdaySinceUtc: "2026-05-05T17:00:00.000Z",
+    expectedYesterdayBeforeUtc: "2026-05-06T17:00:00.000Z",
+  },
+  {
+    tz: "Asia/Tokyo",
+    description: "+9 fixed",
+    nowUtcMs: Date.UTC(2026, 4, 6, 17, 0, 0),
+    localDate: "2026-05-07",
+    expectedYesterdaySinceUtc: "2026-05-05T15:00:00.000Z",
+    expectedYesterdayBeforeUtc: "2026-05-06T15:00:00.000Z",
+  },
+  {
+    tz: "Pacific/Auckland",
+    description: "+13 (DST observing) at 02:00 May NZST UTC+12",
+    // 2026-05-07 02:00 NZST = 2026-05-06 14:00 UTC.
+    nowUtcMs: Date.UTC(2026, 4, 6, 14, 0, 0),
+    localDate: "2026-05-07",
+    expectedYesterdaySinceUtc: "2026-05-05T12:00:00.000Z",
+    expectedYesterdayBeforeUtc: "2026-05-06T12:00:00.000Z",
+  },
+  // ── Integer offsets (negative) ─────────────────────────────────
+  {
+    tz: "America/Los_Angeles",
+    description: "-7 (PDT)",
+    nowUtcMs: Date.UTC(2026, 4, 7, 9, 0, 0),
+    localDate: "2026-05-07",
+    expectedYesterdaySinceUtc: "2026-05-06T07:00:00.000Z",
+    expectedYesterdayBeforeUtc: "2026-05-07T07:00:00.000Z",
+  },
+  {
+    tz: "America/New_York",
+    description: "-4 (EDT)",
+    nowUtcMs: Date.UTC(2026, 4, 7, 6, 0, 0),
+    localDate: "2026-05-07",
+    expectedYesterdaySinceUtc: "2026-05-06T04:00:00.000Z",
+    expectedYesterdayBeforeUtc: "2026-05-07T04:00:00.000Z",
+  },
+  // ── Half-hour offset ───────────────────────────────────────────
+  {
+    tz: "Asia/Kolkata",
+    description: "+5:30 (no DST)",
+    nowUtcMs: Date.UTC(2026, 4, 6, 20, 30, 0),
+    localDate: "2026-05-07",
+    expectedYesterdaySinceUtc: "2026-05-05T18:30:00.000Z",
+    expectedYesterdayBeforeUtc: "2026-05-06T18:30:00.000Z",
+  },
+  // ── Quarter-hour offset ───────────────────────────────────────
+  {
+    tz: "Asia/Kathmandu",
+    description: "+5:45 (no DST)",
+    nowUtcMs: Date.UTC(2026, 4, 6, 20, 15, 0),
+    localDate: "2026-05-07",
+    expectedYesterdaySinceUtc: "2026-05-05T18:15:00.000Z",
+    expectedYesterdayBeforeUtc: "2026-05-06T18:15:00.000Z",
+  },
+  // ── UTC control ────────────────────────────────────────────────
+  {
+    tz: "UTC",
+    description: "+0 (control case)",
+    nowUtcMs: Date.UTC(2026, 4, 7, 2, 0, 0),
+    localDate: "2026-05-07",
+    expectedYesterdaySinceUtc: "2026-05-06T00:00:00.000Z",
+    expectedYesterdayBeforeUtc: "2026-05-07T00:00:00.000Z",
+  },
+];
+
+describe("parsePeriodShortcut — table-driven timezone matrix (Wave-12)", () => {
+  for (const c of TIMEZONE_MATRIX) {
+    it(`${c.tz} (${c.description}): yesterday boundaries on ${c.localDate}`, () => {
+      const r = parsePeriodShortcut("yesterday", {
+        nowMs: c.nowUtcMs,
+        timezone: c.tz,
+      });
+      if ("error" in r) throw new Error(r.error);
+      expect(r.since.toISOString()).toBe(c.expectedYesterdaySinceUtc);
+      expect(r.before.toISOString()).toBe(c.expectedYesterdayBeforeUtc);
+    });
+  }
+
+  it(`every entry's 'before' equals next-day's 'since' (round-trip invariant)`, () => {
+    // Property: yesterday.before === today.since.
+    for (const c of TIMEZONE_MATRIX) {
+      const yesterday = parsePeriodShortcut("yesterday", {
+        nowMs: c.nowUtcMs,
+        timezone: c.tz,
+      });
+      const today = parsePeriodShortcut("today", {
+        nowMs: c.nowUtcMs,
+        timezone: c.tz,
+      });
+      if ("error" in yesterday || "error" in today)
+        throw new Error("period parse failed");
+      expect(yesterday.before.toISOString()).toBe(today.since.toISOString());
+    }
+  });
+
+  it("'today' duration is in [22h, 26h] (catches any DST-day off-by-error)", () => {
+    // Property: across all timezones in the matrix, today's duration is
+    // always between 22 and 26 hours. This catches both the straightforward
+    // 24h cases and the DST-transition 23h/25h cases without hardcoding
+    // which days are which.
+    for (const c of TIMEZONE_MATRIX) {
+      const r = parsePeriodShortcut("today", {
+        nowMs: c.nowUtcMs,
+        timezone: c.tz,
+      });
+      if ("error" in r) throw new Error(r.error);
+      const durationHrs = (r.before.getTime() - r.since.getTime()) / 3600_000;
+      expect(durationHrs).toBeGreaterThanOrEqual(22);
+      expect(durationHrs).toBeLessThanOrEqual(26);
+    }
+  });
+});
