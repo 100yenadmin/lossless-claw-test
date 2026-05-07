@@ -358,4 +358,78 @@ describe("createLcmGrepTool — verbatim mode", () => {
 
     db.close();
   });
+
+  it("INVARIANT: per-hit content cap at 5K chars + truncation flags (Wave-12 reviewer F6)", async () => {
+    // Pre-fix: details.hits[].content carried full untruncated bodies
+    // (200-385K chars/call observed) even when markdown said "*(truncated)*".
+    // Post-fix: per-hit cap at 5K chars + contentTruncated + fullContentLength
+    // flags so callers know when full body is available via lcm_describe.
+    const db = setupDb();
+    const huge = "x".repeat(8_000); // 8K chars > 5K cap
+    insertMessage(db, { messageId: 1, content: `Race condition prefix ${huge}` });
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine(db) as never,
+      sessionKey: "agent:main:main",
+    });
+    const r = await tool.execute("c", {
+      pattern: "race condition",
+      mode: "verbatim",
+      conversationId: 1,
+    });
+    const details = r.details as {
+      hits: Array<{
+        content: string;
+        contentTruncated: boolean;
+        fullContentLength: number;
+      }>;
+    };
+    expect(details.hits).toHaveLength(1);
+    // Cap is 5000 chars; truncation suffix adds a few chars more.
+    expect(details.hits[0]!.content.length).toBeLessThan(5_100);
+    expect(details.hits[0]!.contentTruncated).toBe(true);
+    expect(details.hits[0]!.fullContentLength).toBeGreaterThan(8_000);
+    expect(details.hits[0]!.content).toMatch(/lcm_describe/);
+    db.close();
+  });
+
+  it("INVARIANT: details.hits sliced to renderedRowCount when markdown truncates (Wave-12 reviewer F6)", async () => {
+    // Pre-fix: details.hits returned ALL fetched rows even when the
+    // markdown loop broke after MAX_RESULT_CHARS. So an agent reading
+    // details bypassed the markdown truncation entirely.
+    // Now: hits is sliced to the count of rows actually rendered.
+    const db = setupDb();
+    // 20 rows × 8K chars = 160K chars total; default MAX_RESULT_CHARS
+    // is 40K, so markdown truncates partway → details.hits matches.
+    for (let i = 1; i <= 20; i++) {
+      insertMessage(db, {
+        messageId: i,
+        content: `Race condition row ${i} ${"y".repeat(8_000)}`,
+      });
+    }
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine(db) as never,
+      sessionKey: "agent:main:main",
+    });
+    const r = await tool.execute("c", {
+      pattern: "race condition",
+      mode: "verbatim",
+      conversationId: 1,
+    });
+    const details = r.details as {
+      totalMatches: number;
+      truncated: boolean;
+      hits: Array<{ messageId: number }>;
+    };
+    expect(details.totalMatches).toBe(20);
+    expect(details.truncated).toBe(true);
+    // 160K chars / 40K cap → markdown fits ~5-7 hits, so hits.length must
+    // be < 20 and reflect what's in the markdown.
+    expect(details.hits.length).toBeLessThan(20);
+    expect(details.hits.length).toBeGreaterThan(0);
+    db.close();
+  });
 });

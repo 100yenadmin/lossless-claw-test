@@ -16,8 +16,7 @@ import {
 } from "../embeddings/semantic-search.js";
 import { VoyageError } from "../voyage/client.js";
 import { containsCjk } from "../store/full-text-fallback.js";
-import { evaluateNeedsCompactGate } from "../plugin/needs-compact-gate.js";
-import { tapResultForTokenAccounting } from "../plugin/token-state.js";
+import { runWithTokenGate } from "../plugin/needs-compact-gate.js";
 
 // Tool-result hard cap — protects against back-to-back tool calls
 // blowing out the agent's context window. Operators tune via env;
@@ -194,18 +193,21 @@ export function createLcmGrepTool(input: {
       "Tool result is hard-capped at LCM_TOOL_RESULT_TOKEN_BUDGET (default 10K tokens / 40K chars) — when context is near full, prefer narrower queries (smaller `limit`, more specific `pattern`) over big sweeps; chained calls accumulate context, and compaction only fires post-turn.",
     parameters: LcmGrepSchema,
     async execute(_toolCallId, params) {
-      // Wave-14 needsCompact gate.
-      const runtimeCtx = input.getRuntimeContext?.();
-      if (runtimeCtx) {
-        const refusal = evaluateNeedsCompactGate({
-          toolName: "lcm_grep",
-          toolParams: params as Record<string, unknown>,
-          currentTokenCount: runtimeCtx.currentTokenCount,
-          tokenBudget: runtimeCtx.tokenBudget,
-        });
-        if (refusal) return tapResultForTokenAccounting(input.sessionKey, jsonResult(refusal));
-      }
-
+      // Wave-12 reviewer F5 fix: migrated from inline gate + 4 hand-written
+      // taps (lines 206/222/247/252/264) leaving 9+ untapped return paths
+      // (lines 392/590/598/604/661/761/774/779/854/1063) to a single
+      // runWithTokenGate wrapper. Pre-fix, helpers like runHybridLcmGrep,
+      // runSemanticLcmGrep, runVerbatimLcmGrep had error returns + success
+      // returns that bypassed accounting entirely. The wrapper funnels
+      // every return through one tap exit, structurally eliminating the
+      // antipattern. Adversarial review caught 12 untapped paths total
+      // across grep + describe.
+      return runWithTokenGate({
+        toolName: "lcm_grep",
+        toolParams: params as Record<string, unknown>,
+        sessionKey: input.sessionKey,
+        getRuntimeContext: input.getRuntimeContext,
+        inner: async () => {
       const lcm = input.lcm ?? (await input.getLcm?.());
       if (!lcm) {
         throw new Error("LCM engine is unavailable.");
@@ -219,9 +221,9 @@ export function createLcmGrepTool(input: {
       // pattern was reaching FTS5 sanitizer which returns `'""'`,
       // causing FTS5 to match all rows. Reject explicitly.
       if (pattern.length === 0) {
-        return tapResultForTokenAccounting(input.sessionKey, jsonResult({
+        return jsonResult({
           error: "`pattern` is required and must be a non-empty string.",
-        }));
+        });
       }
       const mode =
         (p.mode as "regex" | "full_text" | "hybrid" | "semantic" | "verbatim") ?? "regex";
@@ -244,14 +246,14 @@ export function createLcmGrepTool(input: {
         since = parseIsoTimestampParam(p, "since");
         before = parseIsoTimestampParam(p, "before");
       } catch (error) {
-        return tapResultForTokenAccounting(input.sessionKey, jsonResult({
+        return jsonResult({
           error: error instanceof Error ? error.message : "Invalid timestamp filter.",
-        }));
+        });
       }
       if (since && before && since.getTime() >= before.getTime()) {
-        return tapResultForTokenAccounting(input.sessionKey, jsonResult({
+        return jsonResult({
           error: "`since` must be earlier than `before`.",
-        }));
+        });
       }
       const conversationScope = await resolveLcmConversationScope({
         lcm,
@@ -261,10 +263,10 @@ export function createLcmGrepTool(input: {
         params: p,
       });
       if (!conversationScope.allConversations && conversationScope.conversationId == null) {
-        return tapResultForTokenAccounting(input.sessionKey, jsonResult({
+        return jsonResult({
           error:
             "No LCM conversation found for this session. Provide conversationId or set allConversations=true.",
-        }));
+        });
       }
 
       if (mode === "hybrid") {
@@ -403,6 +405,8 @@ export function createLcmGrepTool(input: {
             : {}),
         },
       };
+        },  // close inner: async () => { ... }
+      });   // close runWithTokenGate({ ... })
     },
   };
 }
@@ -1044,6 +1048,19 @@ async function runVerbatimLcmGrep(input: HybridGrepInput) {
   lines.push(`**Total matches:** ${rows.length}`);
   lines.push("");
 
+  // Wave-12 reviewer F6 fix: track which rows were emitted into markdown
+  // and cap each hit's content at PER_HIT_CONTENT_CHAR_CAP. Pre-fix:
+  // `details.hits[].content` returned full untruncated body for every
+  // fetched row regardless of markdown truncation — empirical validation
+  // showed 200-385K chars/call leaking through details while markdown
+  // capped at 25-33K. Now: details.hits is sliced to renderedRowCount,
+  // each hit's content capped at 5K chars (~96th percentile of message
+  // lengths in observed corpus). Callers needing full body for a
+  // specific message follow up with lcm_describe(messageId,
+  // expandMessages=true).
+  const PER_HIT_CONTENT_CHAR_CAP = 5_000;
+  let renderedRowCount = 0;
+  let truncated = false;
   if (rows.length === 0) {
     lines.push("_No verbatim matches in raw messages. Try mode='regex' or mode='full_text' for broader search._");
   } else {
@@ -1053,10 +1070,12 @@ async function runVerbatimLcmGrep(input: HybridGrepInput) {
       const block = `${header}\n\n${row.content}\n`;
       if (currentChars + block.length > MAX_RESULT_CHARS) {
         lines.push(`*(truncated at ~${Math.round(MAX_RESULT_CHARS / 4)} tokens to protect agent context — narrow time range, lower limit, or wait for next-turn compaction; raise LCM_TOOL_RESULT_TOKEN_BUDGET env to increase the cap)*`);
+        truncated = true;
         break;
       }
       lines.push(block);
       currentChars += block.length;
+      renderedRowCount++;
     }
   }
 
@@ -1066,14 +1085,25 @@ async function runVerbatimLcmGrep(input: HybridGrepInput) {
       mode: "verbatim",
       pattern,
       totalMatches: rows.length,
-      hits: rows.map((r) => ({
-        messageId: r.message_id,
-        conversationId: r.conversation_id,
-        role: r.role,
-        content: r.content,
-        tokenCount: r.token_count,
-        createdAt: r.created_at,
-      })),
+      truncated,
+      // Only include hits actually emitted into markdown. Each hit's
+      // content is per-hit-capped at 5K chars. Full body via lcm_describe.
+      hits: rows.slice(0, renderedRowCount).map((r) => {
+        const fullLen = r.content.length;
+        const capped = fullLen > PER_HIT_CONTENT_CHAR_CAP
+          ? r.content.slice(0, PER_HIT_CONTENT_CHAR_CAP) + "…[truncated; full body via lcm_describe]"
+          : r.content;
+        return {
+          messageId: r.message_id,
+          conversationId: r.conversation_id,
+          role: r.role,
+          content: capped,
+          contentTruncated: fullLen > PER_HIT_CONTENT_CHAR_CAP,
+          fullContentLength: fullLen,
+          tokenCount: r.token_count,
+          createdAt: r.created_at,
+        };
+      }),
     },
   };
 }
