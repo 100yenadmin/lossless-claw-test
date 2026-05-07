@@ -114,9 +114,8 @@ export function makeTestEngine(
     }) => Promise<{
       ownsCompaction: boolean;
       belowFloor: boolean;
-      cacheHot: boolean;
       shouldRefuse: boolean;
-      refusalReason?: "engine-unhealthy" | "below-floor" | "cache-hot";
+      refusalReason?: "engine-unhealthy" | "below-floor";
       refusalNote?: string;
       contextRatio?: number;
     }>;
@@ -158,7 +157,6 @@ export function makeTestEngine(
       return {
         ownsCompaction: true,
         belowFloor: true,
-        cacheHot: false,
         shouldRefuse: true,
         refusalReason: "below-floor" as const,
         refusalNote: `Context is at ${(contextRatio! * 100).toFixed(1)}% of budget — below the ${(reserveFraction * 100).toFixed(0)}% floor. No need to compact yet; chained tool calls have headroom.`,
@@ -168,7 +166,6 @@ export function makeTestEngine(
     return {
       ownsCompaction: true,
       belowFloor: false,
-      cacheHot: false,
       shouldRefuse: false,
       contextRatio,
     };

@@ -27,13 +27,24 @@ import { jsonResult } from "./common.js";
  *
  * Engine-side gates (checked first via getAgentCompactionGateState):
  *   - engine-unhealthy: LCM migration didn't complete at boot
- *   - below-floor:      context% &lt; reserveFraction (default 50%)
- *   - cache-hot:        prompt cache is hot for mutation-sensitive
- *                       provider — compacting would burn the cache
+ *   - below-floor:      context% &lt; reserveFraction (default 50%) — no
+ *                       point compacting when context is already roomy
  *
  * Tool-side gates:
  *   - operator-disabled: agentCompactionToolEnabled = false
- *   - capped-this-turn:  exceeded per-window cap
+ *   - capped-this-turn:  exceeded per-window cap (cost / abuse control)
+ *
+ * # NOT a gate: prompt cache hot/cold state
+ *
+ * Agent-triggered compaction deliberately bypasses the cache-hot
+ * deferral that the AUTOMATIC threshold path consults. The agent
+ * calling this tool is making a conscious trade: pay 4× cache cost on
+ * the next call vs. fail with context_length_exceeded mid-turn. Gating
+ * on cache state would create a paradox — the cache is hot precisely
+ * because the agent just used the tools that filled the context, which
+ * is the exact moment it needs more room. (The cache-hot protection
+ * still applies to AUTOMATIC threshold drains; see
+ * `shouldDelayPromptMutatingDeferredCompaction` in engine.ts.)
  *
  * Engine.compact() reasons (mapped to tool-facing enum):
  *   - "compacted"       → success
@@ -212,7 +223,8 @@ export function createLcmCompactTool(input: {
       "PROACTIVELY compact this conversation's LCM context mid-turn to free room for chained tool calls. " +
       "Use sparingly: only when (a) context is already past 70% of budget AND (b) you reasonably expect 2+ more tool calls this turn AND (c) waiting for post-turn auto-compaction is not viable. " +
       "DOES blocking work — typical 5-30s, runs an LLM summarization call. " +
-      "REFUSES if: context is below the reserveFraction floor (default 50%), prompt cache is hot for mutation-sensitive providers (would burn the cache for 4× input cost), engine migration failed at boot, or you've exceeded 2 calls in the last 5 minutes. " +
+      "REFUSES if: context is below the reserveFraction floor (default 50% — no point compacting when context is roomy), engine migration failed at boot, or you've exceeded 2 calls in the last 5 minutes. " +
+      "DOES NOT gate on prompt-cache state — agent-triggered compaction deliberately bypasses cache deferral that the automatic threshold path uses, because the cache is hot precisely when you most need to compact. " +
       "After successful compaction, the next model call will see the compacted view automatically (LCM owns context-engine reassembly between tool calls). " +
       "Returns structured reason on success/failure.",
     parameters: LcmCompactSchema,

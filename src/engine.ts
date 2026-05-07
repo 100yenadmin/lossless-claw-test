@@ -7051,8 +7051,15 @@ export class LcmContextEngine implements ContextEngine {
    * Gates checked (in order — first refusal wins):
    *   1. ownsCompaction — engine migration succeeded at boot
    *   2. below-floor    — currentTokens / tokenBudget &lt; reserveFraction
-   *   3. cache-hot      — prompt cache is hot for a mutation-sensitive
-   *                       provider (Anthropic / OpenAI / Codex / Copilot)
+   *
+   * **DELIBERATELY NOT GATED**: prompt cache hot/cold state. The agent
+   * calling `lcm_compact` is making a CONSCIOUS trade ("pay the 4× cache
+   * cost vs. fail with context_length_exceeded"). The cache-hot gate
+   * exists in `shouldDelayPromptMutatingDeferredCompaction` for the
+   * AUTOMATIC threshold-drain path (where the system has no agent
+   * awareness) — applying it here would create a paradox: the cache is
+   * hot precisely because the agent is actively using tools, which is
+   * the exact moment it needs to compact.
    *
    * NOT checked here (engine-side concerns deferred to compact() itself):
    *   - Auth circuit breaker — surfaces inside compact()'s reason
@@ -7068,9 +7075,8 @@ export class LcmContextEngine implements ContextEngine {
   }): Promise<{
     ownsCompaction: boolean;
     belowFloor: boolean;
-    cacheHot: boolean;
     shouldRefuse: boolean;
-    refusalReason?: "engine-unhealthy" | "below-floor" | "cache-hot";
+    refusalReason?: "engine-unhealthy" | "below-floor";
     refusalNote?: string;
     /** Echo back for diagnostics. */
     contextRatio?: number;
@@ -7080,7 +7086,6 @@ export class LcmContextEngine implements ContextEngine {
       return {
         ownsCompaction: false,
         belowFloor: false,
-        cacheHot: false,
         shouldRefuse: true,
         refusalReason: "engine-unhealthy",
         refusalNote:
@@ -7112,7 +7117,6 @@ export class LcmContextEngine implements ContextEngine {
       return {
         ownsCompaction: true,
         belowFloor: true,
-        cacheHot: false,
         shouldRefuse: true,
         refusalReason: "below-floor",
         refusalNote: `Context is at ${(contextRatio! * 100).toFixed(1)}% of budget — below the ${(reserveFraction * 100).toFixed(0)}% floor. No need to compact yet; chained tool calls have headroom.`,
@@ -7120,55 +7124,9 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
 
-    // Cache-hot check: requires telemetry. If conversation isn't found
-    // (no prior turns), skip the check.
-    let cacheHot = false;
-    let cacheNote: string | undefined;
-    try {
-      const conversation = await this.conversationStore.getConversationForSession({
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-      });
-      if (conversation) {
-        const telemetry = await this.compactionTelemetryStore.getConversationCompactionTelemetry(
-          conversation.conversationId,
-        );
-        if (
-          this.shouldDelayPromptMutatingDeferredCompaction(
-            telemetry,
-            new Date(),
-            params.currentTokenCount,
-            params.tokenBudget,
-          )
-        ) {
-          cacheHot = true;
-          const ttlMs = this.resolvePromptCacheTtlMs(telemetry?.retention ?? null);
-          const cacheTtlSeconds = Math.round(ttlMs / 1000);
-          cacheNote =
-            `Prompt cache is hot for a mutation-sensitive provider (${telemetry?.provider ?? "unknown"}). Compacting now would invalidate the cache prefix (4× input cost). Retry after the cache cools (~${cacheTtlSeconds}s TTL) or set agentCompactionToolEnabled with force=true if you accept the cost.`;
-        }
-      }
-    } catch (e) {
-      // Telemetry lookup failure is non-fatal — fall through and let
-      // engine.compact() decide.
-      cacheHot = false;
-    }
-    if (cacheHot) {
-      return {
-        ownsCompaction: true,
-        belowFloor: false,
-        cacheHot: true,
-        shouldRefuse: true,
-        refusalReason: "cache-hot",
-        refusalNote: cacheNote,
-        contextRatio,
-      };
-    }
-
     return {
       ownsCompaction: true,
       belowFloor: false,
-      cacheHot: false,
       shouldRefuse: false,
       contextRatio,
     };
