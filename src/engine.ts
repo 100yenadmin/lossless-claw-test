@@ -6579,14 +6579,64 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     if (deferredCompactionDrain) {
-      this.scheduleDeferredCompactionDebtDrain({
-        conversationId: conversation.conversationId,
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        tokenBudget: deferredCompactionDrain.tokenBudget,
+      // Wave-14: at CRITICAL pressure (>= criticalBudgetPressureRatio,
+      // default 0.70), the deferred drain must run SYNCHRONOUSLY before
+      // the next assemble() so the LLM call sees the compacted view.
+      // Without this, the cache-hot deferred-drain race lets context
+      // overflow into openclaw's emergency truncation path
+      // (run.ts:1743) — LOSSY tool-result truncation that breaks the
+      // lossless guarantee. Sync at critical pressure preserves the
+      // promise; deferred-async behavior remains the default below
+      // critical to protect prompt cache.
+      const isCritical = this.isUnderCriticalBudgetPressure({
         currentTokenCount: deferredCompactionDrain.currentTokenCount,
-        reason: deferredCompactionDrain.reason,
+        tokenBudget: deferredCompactionDrain.tokenBudget,
       });
+      if (isCritical) {
+        // SYNC drain — block until done. Caller sees afterTurn complete only
+        // after compaction lands, so subsequent assemble() reads the
+        // compacted state from DB.
+        try {
+          await this.drainDeferredCompactionDebtIfIdle({
+            conversationId: conversation.conversationId,
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            tokenBudget: deferredCompactionDrain.tokenBudget,
+            currentTokenCount: deferredCompactionDrain.currentTokenCount,
+            reason: deferredCompactionDrain.reason,
+            queueKey: this.resolveSessionQueueKey(
+              params.sessionId,
+              params.sessionKey,
+            ),
+          });
+          this.deps.log.info(
+            `[lcm] afterTurn: critical-pressure synchronous drain ran conversation=${conversation.conversationId} ${sessionLabel} ratio=${(deferredCompactionDrain.currentTokenCount / deferredCompactionDrain.tokenBudget).toFixed(2)}`,
+          );
+        } catch (err) {
+          this.deps.log.warn(
+            `[lcm] afterTurn: critical-pressure sync drain failed conversation=${conversation.conversationId}: ${describeLogError(err)} — falling back to async drain`,
+          );
+          this.scheduleDeferredCompactionDebtDrain({
+            conversationId: conversation.conversationId,
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            tokenBudget: deferredCompactionDrain.tokenBudget,
+            currentTokenCount: deferredCompactionDrain.currentTokenCount,
+            reason: deferredCompactionDrain.reason,
+          });
+        }
+      } else {
+        // Below critical pressure → async drain (preserves cache-aware
+        // throttling behavior unchanged from before Wave-14).
+        this.scheduleDeferredCompactionDebtDrain({
+          conversationId: conversation.conversationId,
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          tokenBudget: deferredCompactionDrain.tokenBudget,
+          currentTokenCount: deferredCompactionDrain.currentTokenCount,
+          reason: deferredCompactionDrain.reason,
+        });
+      }
     }
 
     this.deps.log.info(

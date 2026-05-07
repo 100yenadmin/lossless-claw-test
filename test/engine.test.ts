@@ -8119,6 +8119,82 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(maintenance?.running).toBe(false);
   });
 
+  it("afterTurn drains deferred debt SYNCHRONOUSLY at critical pressure (Wave-14 safety net)", async () => {
+    // Wave-14: when currentTokenCount/tokenBudget >= criticalBudgetPressureRatio
+    // (default 0.70), the deferred drain runs INLINE (not via setImmediate).
+    // This guarantees the next assemble() sees the compacted state before
+    // openclaw's overflow-recovery path can engage emergency truncation.
+    //
+    // Test: set tokenBudget=10K, prompt usage=9K (90% — well above critical
+    // 70%). Expect drain to fire inline → maintenance.pending false on
+    // return, NO need for vi.waitFor.
+    const engine = createEngine();
+    const sessionId = "after-turn-critical-pressure-sync-drain";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number, leafChunkTokens?: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+      evaluateIncrementalCompaction: (params: unknown) => Promise<unknown>;
+      executeLeafCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: true,
+      rawTokensOutsideTail: 60_000,
+      threshold: 20_000,
+    });
+    vi.spyOn(privateEngine, "evaluateIncrementalCompaction").mockResolvedValue({
+      shouldCompact: true,
+      reason: "critical-pressure-sync",
+      maxPasses: 2,
+      allowCondensedPasses: true,
+      activityBand: "high",
+      leafChunkTokens: 30_000,
+      fallbackLeafChunkTokens: [30_000, 20_000],
+      rawTokensOutsideTail: 60_000,
+      threshold: 30_000,
+      cacheState: "any",
+    });
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below threshold",
+      currentTokens: 1_024,
+      threshold: 3_072,
+    });
+    vi.spyOn(privateEngine, "executeLeafCompactionCore").mockResolvedValue({
+      ok: true,
+      compacted: true,
+      reason: "compacted",
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-critical-pressure-sync-drain"),
+      messages: [makeMessage({ role: "assistant", content: "critical-pressure turn" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 10_000,  // small budget for clear ratio math
+      runtimeContext: {
+        provider: "openai-codex",
+        model: "gpt-5.4-mini",
+        currentTokenCount: 9_000,  // 90% — above critical 70%
+      },
+    });
+
+    // CRITICAL: NO vi.waitFor here. If the drain ran sync as expected,
+    // maintenance is already settled by the time afterTurn resolves.
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation!.conversationId);
+    expect(maintenance?.pending).toBe(false);
+    expect(maintenance?.running).toBe(false);
+  });
+
   it("maintain() leaves deferred compaction debt pending until the host opts in", async () => {
     const engine = createEngine();
     const sessionId = "maintain-deferred-compaction-disabled";
@@ -10087,7 +10163,12 @@ describe("LcmContextEngine fidelity and token budget", () => {
       sessionFile: createSessionFilePath("after-turn-low-cache-read-share-cold-debt"),
       messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
       prePromptMessageCount: 0,
-      tokenBudget: 4_096,
+      // Wave-14: tokenBudget raised so currentRatio stays BELOW critical
+      // pressure (default 0.70), exercising the deferred-debt-recorded-async
+      // path. Old test value (4_096) put currentTokenCount=10K well above
+      // budget — that's now the synchronous-drain path; covered separately
+      // by `afterTurn at critical pressure drains synchronously` below.
+      tokenBudget: 100_000,
       runtimeContext: {
         promptCache: {
           retention: "long",
