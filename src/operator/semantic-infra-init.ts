@@ -97,10 +97,12 @@ export function initSemanticInfraIfPossible(
     // Wave-10 reviewer P2 fix: bumped from log.info to log.warn so the
     // operator visibly sees the warning at boot. Previously the lack of
     // sqlite-vec was silently logged at info-level, leaving operators to
-    // wonder why `lcm_semantic_recall` and `lcm_grep --mode hybrid`
+    // wonder why `lcm_grep --mode semantic` and `lcm_grep --mode hybrid`
     // returned degraded results despite VOYAGE_API_KEY being configured.
+    // (Wave-12 SA: lcm_semantic_recall removed; semantic surfaces are
+    // now both modes of `lcm_grep`.)
     log.warn(
-      "[lcm] semantic infra: sqlite-vec extension not loaded; semantic retrieval (lcm_semantic_recall, lcm_grep --mode hybrid) will be unavailable. " +
+      "[lcm] semantic infra: sqlite-vec extension not loaded; semantic retrieval (lcm_grep --mode semantic, lcm_grep --mode hybrid) will be unavailable. " +
         "Install via `npm install sqlite-vec` (added as an optionalDependency in v4.1) " +
         "or manually place vec0.dylib at ~/.openclaw/extensions/node_modules/sqlite-vec-darwin-arm64/vec0.dylib and restart the gateway.",
     );

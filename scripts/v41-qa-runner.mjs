@@ -960,6 +960,93 @@ SUITES.full = [
     },
     severity: "important",
   },
+  // Type F — Discovery / browse (5 cases, NEW 2026-05-08)
+  // Wave-12 reach-for analysis surfaced a scenario-coverage gap: the
+  // original 25 questions assumed users knew canonical entity names,
+  // PR numbers, exact commits. Real users often DON'T — F-cases exercise
+  // browse / fuzzy-name / type-filter / cost-cheap discovery.
+  {
+    id: "full-F1-browse-by-type",
+    questionType: "F",
+    description: "Browse entities by type (entityType filter, no query)",
+    tool: "lcm_search_entities",
+    args: { entityType: "pr_number", limit: 30 },
+    expect: (r) => {
+      if (r.error) return `errored: ${r.error}`;
+      if (r.details?.totalMatches === 0 && r.details?.catalogStatus == null) {
+        return "empty without catalogStatus";
+      }
+      return null;
+    },
+    severity: "important",
+  },
+  {
+    id: "full-F2-fuzzy-name",
+    questionType: "F",
+    description: "Fuzzy-name lookup (partial, mode=like)",
+    tool: "lcm_search_entities",
+    args: { query: "VM", mode: "like", limit: 10 },
+    expect: (r) => {
+      if (r.error) return `errored: ${r.error}`;
+      if (r.details?.totalMatches === 0 && r.details?.catalogStatus == null) {
+        return "empty without catalogStatus";
+      }
+      return null;
+    },
+    severity: "important",
+  },
+  {
+    id: "full-F3-vague-summary",
+    questionType: "F",
+    description: "Vague recent-work summary (synthesize_around fallback)",
+    tool: "lcm_synthesize_around",
+    args: { window_kind: "period", period: "last-7d" },
+    expect: (r) => {
+      if (r.error) return `errored: ${r.error}`;
+      // Recent-work period mode should return either a synthesis or a
+      // structured no-data response — not throw.
+      if (r.details == null) return "no details";
+      return null;
+    },
+    severity: "important",
+  },
+  {
+    id: "full-F4-type-filter",
+    questionType: "F",
+    description: "List all entities of a specific entity_type",
+    tool: "lcm_search_entities",
+    args: { entityType: "person_name", limit: 20 },
+    expect: (r) => {
+      if (r.error) return `errored: ${r.error}`;
+      if (r.details?.totalMatches === 0 && r.details?.catalogStatus == null) {
+        return "empty without catalogStatus";
+      }
+      return null;
+    },
+    severity: "important",
+  },
+  {
+    id: "full-F5-paraphrastic-cheap",
+    questionType: "F",
+    description: "Cost-cheap paraphrastic exploration (lcm_grep mode='semantic')",
+    tool: "lcm_grep",
+    args: { pattern: "rate limiting", mode: "semantic", limit: 10, allConversations: true },
+    expect: (r) => {
+      if (r.error) return `errored: ${r.error}`;
+      // Without Voyage creds in offline mode, graceful degradation is OK.
+      const errInDetails = r.details && typeof r.details === "object" && "error" in r.details
+        ? String(r.details.error)
+        : null;
+      if (errInDetails && /vec0|voyage|embedding|VOYAGE_API/i.test(errInDetails)) {
+        return null; // graceful-degradation contract
+      }
+      if (r.details?.totalMatches == null && !errInDetails) {
+        return "no totalMatches and no error";
+      }
+      return null;
+    },
+    severity: "important",
+  },
   // Type E — Drilldown (5 cases)
   ...["expandChildren", "expandMessages", "lineage", "manifest", "subtree"].map((tag, i) => ({
     id: `full-E${i + 1}-${tag}`,

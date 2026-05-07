@@ -105,6 +105,20 @@ FALLBACK (theme/procedure sub-cases — preserved in draft PR #616 for future cy
 
 For Type E with main-agent access (no sub-agent delegation needed), use `lcm_describe` with the new `expandChildren=true` or `expandMessages=true` flags (one-hop, capped at 20). For deeper traversal, fall back to `lcm_expand_query` (which delegates to a sub-agent).
 
+### Type F — Discovery / browse (NEW 2026-05-08, addresses reach-for gap)
+
+The original 25 scenarios assumed the user already knows the canonical entity names, specific PRs, exact commits. Real users often DON'T know — they need to browse first to discover what's there. These scenarios exercise the catalog-discovery use case the previous tests missed.
+
+- **F1**: "What kinds of entities have come up in our conversations?" (catalog-type browse — should reach for `lcm_search_entities` with no `entityType` filter, then summarize the type distribution)
+- **F2**: "I'm looking for that customer — the one with the VM issues, can't remember the exact name." (fuzzy-name lookup — should reach for `lcm_search_entities { query: 'VM', mode: 'like' }`)
+- **F3**: "Give me a vague summary of what I've been working on lately — don't need specifics." (cost-cheap exploration — could reach for `lcm_semantic_recall` with `summaryKinds: ['condensed']` for breadth, OR `lcm_synthesize_around` period='last-7-days')
+- **F4**: "What PRs have we discussed?" (entity_type filter — `lcm_search_entities { entityType: 'pr_number' }`)
+- **F5**: "Find anything similar to 'lock TTL' in spirit, doesn't have to be precise — I just want to see related discussions." (paraphrastic exploration without keyword precision — `lcm_semantic_recall` niche, OR `lcm_grep mode='semantic'`)
+
+These five fill a gap the original 25 didn't exercise: scenarios where the user genuinely doesn't have the canonical handle and needs to browse/discover first. They specifically test whether `lcm_search_entities` and `lcm_semantic_recall` are reachable when the question shape favors them.
+
+**Note**: F-scenarios are exploratory tests, not yet baked into `scripts/v41-qa-runner.mjs`. Use them in reach-for analysis to validate description-level discoverability.
+
 ### Coverage summary
 
 22/25 test cases have PRIMARY tool coverage. The 3 D-pattern theme/procedure sub-cases (D1, D3, D5) have adequate-fallback coverage. Themes consolidation worker + procedure mining worker are preserved in draft PR #616 for a focused future-cycle PR.

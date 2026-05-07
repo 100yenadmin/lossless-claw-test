@@ -1887,11 +1887,11 @@ async function buildWorkerTickBackfillText(params: { db: DatabaseSync }): Promis
   } else if (overCapPending > 0) {
     lines.push("");
     lines.push(
-      `⚠️  In-range backfill complete, but ${overCapPending} over-cap leaves remain unembedded. Semantic recall coverage is partial — over-cap leaves will not surface via \`lcm_semantic_recall\` or \`lcm_grep --mode hybrid\`.`,
+      `⚠️  In-range backfill complete, but ${overCapPending} over-cap leaves remain unembedded. Semantic recall coverage is partial — over-cap leaves will not surface via \`lcm_grep --mode semantic\` or \`lcm_grep --mode hybrid\`.`,
     );
   } else {
     lines.push("");
-    lines.push("✅ Backfill complete. `lcm_semantic_recall` and `lcm_grep --mode hybrid` should now return real results.");
+    lines.push("✅ Backfill complete. `lcm_grep --mode semantic` and `lcm_grep --mode hybrid` should now return real results.");
   }
   return lines.join("\n");
 }

@@ -28,7 +28,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createLcmGrepTool } from "../src/tools/lcm-grep-tool.js";
-import { createLcmSemanticRecallTool } from "../src/tools/lcm-semantic-recall-tool.js";
 import { buildTestCorpus } from "./fixtures/v41-test-corpus.js";
 import { makeTestDeps, makeTestEngine } from "./fixtures/v41-tool-harness.js";
 
@@ -47,54 +46,28 @@ afterEach(() => {
 // Question B parity: lcm_grep --mode semantic vs lcm_semantic_recall
 // ────────────────────────────────────────────────────────────────────
 
-describe("tool-parity invariant — Question B (lcm_grep semantic + lcm_semantic_recall)", () => {
-  it("Both surfaces return a structured error (no thrown exception) when Voyage is unavailable", async () => {
-    // Without Voyage credentials, both tools should return a graceful
-    // error in `details.error` — NOT throw. Wave-9 P1.3 caught a
-    // divergence where lcm_grep threw and lcm_semantic_recall returned
-    // gracefully. This pins the parity.
+describe("tool-parity invariant — Question B (lcm_grep semantic error contract)", () => {
+  // Wave-12 consolidation SA: lcm_semantic_recall was removed and folded
+  // into `lcm_grep mode='semantic'`. The previous parity invariant
+  // ensured the two surfaces returned the same error shape on Voyage
+  // failure. With one surface remaining, the test simplifies to a
+  // graceful-error contract for `lcm_grep mode='semantic'` itself.
+  it("lcm_grep mode='semantic' returns a structured error when Voyage is unavailable (no thrown exception)", async () => {
     const grep = createLcmGrepTool({
       deps: makeTestDeps(),
       lcm: makeTestEngine(db),
       sessionKey: "agent:main:main",
     });
-    const recall = createLcmSemanticRecallTool({
-      deps: makeTestDeps(),
-      lcm: makeTestEngine(db),
-      sessionKey: "agent:main:main",
+    const result = await grep.execute("p1", {
+      pattern: "test",
+      mode: "semantic",
+      allConversations: true,
     });
-
-    // Both should NOT throw.
-    const [grepResult, recallResult] = await Promise.all([
-      grep.execute("p1", {
-        pattern: "test",
-        mode: "semantic",
-        allConversations: true,
-      }),
-      recall.execute("p2", {
-        query: "test",
-        allConversations: true,
-      }),
-    ]);
-
-    // Both should be defined (no throw).
-    expect(grepResult).toBeDefined();
-    expect(recallResult).toBeDefined();
-    expect(grepResult.details).toBeDefined();
-    expect(recallResult.details).toBeDefined();
-
-    // If either has an error, both should follow the structured shape:
-    // { error: string, ... } in details.
-    const grepDetails = grepResult.details as { error?: string };
-    const recallDetails = recallResult.details as { error?: string };
-
-    if (grepDetails.error) {
-      // Error must mention vec0 / Voyage / embedding so the agent can
-      // make sense of it.
-      expect(grepDetails.error).toMatch(/vec0|voyage|embedding|VOYAGE_API/i);
-    }
-    if (recallDetails.error) {
-      expect(recallDetails.error).toMatch(/vec0|voyage|embedding|VOYAGE_API/i);
+    expect(result).toBeDefined();
+    expect(result.details).toBeDefined();
+    const details = result.details as { error?: string };
+    if (details.error) {
+      expect(details.error).toMatch(/vec0|voyage|embedding|VOYAGE_API/i);
     }
   });
 });

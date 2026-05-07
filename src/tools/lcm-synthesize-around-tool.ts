@@ -639,7 +639,7 @@ export function createLcmSynthesizeAroundTool(input: {
       "operator's configured summarizer chain (summaryModel/summaryProvider) for inheritance of auth " +
       "retries + fallback handling; the audit table records the resolved model that actually ran " +
       "(Wave-12 fix — was previously recording the dispatched recommendation). Distinct from " +
-      "lcm_semantic_recall (which returns ranked snippets, not a synthesized rollup).",
+      "lcm_grep --mode semantic (which returns ranked snippets, not a synthesized rollup).",
     parameters: LcmSynthesizeAroundSchema,
     async execute(_toolCallId, params) {
       const lcm = input.lcm ?? (await input.getLcm?.());

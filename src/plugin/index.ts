@@ -27,7 +27,6 @@ import {
   inferTokenBudget,
   getRuntimeContext as getTokenStateRuntimeContext,
 } from "./token-state.js";
-import { createLcmSemanticRecallTool } from "../tools/lcm-semantic-recall-tool.js";
 import { createLcmSynthesizeAroundTool } from "../tools/lcm-synthesize-around-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
 import {
@@ -260,7 +259,7 @@ const LOSSLESS_RECALL_POLICY_PROMPT = [
   "",
   "**Specialized tools beyond the 1/2/3 escalation** (use when the question type clearly matches):",
   "- **Time-anchored** (\"what did we work on yesterday/last week?\"): `lcm_synthesize_around` with `window_kind=\"period\"` and a period shortcut (`yesterday`, `last-7-days`, `this-month`, `last-12h`, etc.) OR explicit `since`/`before`. No anchor lookup needed.",
-  "- **Topic-anchored / paraphrastic** (\"did we discuss X?\"): `lcm_grep mode=\"hybrid\"` (FTS + Voyage rerank — strongest recall) or `lcm_grep mode=\"semantic\"` / `lcm_semantic_recall` (embedding-only, cheaper, with confidence band).",
+  "- **Topic-anchored / paraphrastic** (\"did we discuss X?\"): `lcm_grep mode=\"hybrid\"` (FTS + Voyage rerank — strongest recall) or `lcm_grep mode=\"semantic\"` (embedding-only, cheaper, with confidence band; supports `summaryKinds` filter for kind-scoped recall).",
   "- **Verbatim citation** (\"quote exactly what was said\"): `lcm_grep mode=\"verbatim\"` returns FULL untruncated message rows with optional `role` filter (user/assistant/tool/system).",
   "- **Entity / pattern** (\"who is this person?\", \"history of project X\"): `lcm_get_entity` (exact name) or `lcm_search_entities` (fuzzy). Entity catalog is populated by an async worker; if empty, the tools return a `catalogStatus` field.",
   "- **Drilldown** (\"where did this come from?\"): `lcm_describe` with `expandChildren=true` or `expandMessages=true` for inline one-hop expansion (no sub-agent). For deeper traversal, `lcm_expand_query`.",
@@ -2412,16 +2411,13 @@ function wirePluginHandlers(
     }),
     { name: "lcm_grep" },
   );
-  api.registerTool(
-    (ctx) =>
-      createLcmSemanticRecallTool({
-        deps,
-        getLcm: shared.waitForEngine,
-        sessionKey: ctx.sessionKey,
-        getRuntimeContext: () => getTokenStateRuntimeContext(ctx.sessionKey),
-      }),
-    { name: "lcm_semantic_recall" },
-  );
+  // Wave-12 consolidation SA: lcm_semantic_recall removed and folded
+  // into `lcm_grep mode='semantic'`. Reach-for analysis (Step 1.7 v2)
+  // showed semantic_recall remained gravitationally orphaned even with
+  // its tailor-made F5 scenario; the `summaryKinds` filter that was
+  // its main differentiator now lives on lcm_grep. See the methodology
+  // run at /tmp/decision-consolidation-final.md (and feat/lcm-v4.1-omnibus
+  // commit for context). Audit-mode telemetry should validate the merge.
   api.registerTool(
     (ctx) => createLcmDescribeTool({
       deps,

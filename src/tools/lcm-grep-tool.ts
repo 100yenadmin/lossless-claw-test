@@ -112,6 +112,20 @@ const LcmGrepSchema = Type.Object({
       enum: ["user", "assistant", "tool", "system", "all"],
     }),
   ),
+  // Wave-12 consolidation SA: summaryKinds was previously a
+  // lcm_semantic_recall-only param. Folded into lcm_grep when
+  // semantic_recall consolidated into mode='semantic'. Honored only by
+  // mode='semantic' and 'hybrid' (modes that target summaries); ignored
+  // by regex/full_text/verbatim.
+  summaryKinds: Type.Optional(
+    Type.Array(
+      Type.String({ enum: ["leaf", "condensed"] }),
+      {
+        description:
+          "Filter by summary kind. Defaults to both 'leaf' and 'condensed'. Honored only by mode='semantic' and 'hybrid'. Useful when the agent wants to scope to high-level rollups (kind='condensed') or fresh leaves (kind='leaf') instead of both.",
+      },
+    ),
+  ),
 });
 
 function truncateSnippet(content: string, maxLen: number = 200): string {
@@ -186,9 +200,10 @@ export function createLcmGrepTool(input: {
       "Search compacted conversation history with FIVE modes (`mode` parameter): " +
       "(1) `regex` — literal or regex pattern over summary content; " +
       "(2) `full_text` — FTS5 keyword search; queries use FTS5 AND semantics by default, so keep them short and focused; quoted phrases stay intact and optional sort modes can prioritize relevance for older topics; " +
-      "(3) `hybrid` — FTS5 + Voyage semantic + rerank (PRIMARY for Type B topic-anchored queries: 'have we ever discussed X', 'what work has been done on Y' — handles paraphrases like 'merge mess' → 'rebase blew up'). Hybrid hits are summaries only; for purely-semantic exploration prefer lcm_semantic_recall; " +
-      "(4) `semantic` — vector-only, no rerank (cheaper than hybrid); " +
+      "(3) `hybrid` — FTS5 + Voyage semantic + rerank (PRIMARY for Type B topic-anchored queries: 'have we ever discussed X', 'what work has been done on Y' — handles paraphrases like 'merge mess' → 'rebase blew up'); " +
+      "(4) `semantic` — pure-vector KNN over summaries via Voyage embed (no rerank, cheaper than hybrid). Use for paraphrastic exploration where keyword precision doesn't matter; " +
       "(5) `verbatim` — returns FULL untruncated source messages (PRIMARY for Type C verbatim/citation queries: 'what exactly did X say about Y', 'quote me the original wording'). " +
+      "Optional `summaryKinds` filter (mode='semantic' / 'hybrid' only) scopes hits to ['leaf'] or ['condensed'] — useful when you want fresh source leaves vs higher-level rollups. " +
       "Returns matching snippets with summary/message IDs for follow-up with lcm_describe (one-hop) or lcm_expand_query (multi-hop drilldown). " +
       "Tool result is hard-capped at LCM_TOOL_RESULT_TOKEN_BUDGET (default 10K tokens / 40K chars) — when context is near full, prefer narrower queries (smaller `limit`, more specific `pattern`) over big sweeps; chained calls accumulate context, and compaction only fires post-turn.",
     parameters: LcmGrepSchema,
@@ -282,6 +297,9 @@ export function createLcmGrepTool(input: {
       }
 
       if (mode === "semantic") {
+        const summaryKindsParam = Array.isArray(p.summaryKinds)
+          ? (p.summaryKinds as Array<"leaf" | "condensed">)
+          : undefined;
         return runSemanticLcmGrep({
           lcm,
           pattern,
@@ -290,6 +308,7 @@ export function createLcmGrepTool(input: {
           before,
           limit,
           timezone,
+          summaryKinds: summaryKindsParam,
         });
       }
 
@@ -426,6 +445,11 @@ interface HybridGrepInput {
   // P6 fix: optional role filter, honored only by verbatim mode (other
   // paths run on summaries which have no role).
   roleFilter?: string;
+  // Wave-12 consolidation SA: summaryKinds was lcm_semantic_recall-only
+  // pre-consolidation. Now plumbed through grep mode='semantic' so the
+  // capability survives the recall→grep merge. Honored only by semantic
+  // mode (other modes run against FTS or raw messages).
+  summaryKinds?: Array<"leaf" | "condensed">;
 }
 
 /**
@@ -733,7 +757,7 @@ function hitProvenanceTag(hit: HybridHit): string {
  * raw messages — embeddedKinds defaults to ['summary']).
  */
 async function runSemanticLcmGrep(input: HybridGrepInput) {
-  const { lcm, pattern, conversationScope, since, before, limit, timezone } = input;
+  const { lcm, pattern, conversationScope, since, before, limit, timezone, summaryKinds } = input;
   const db = lcm.getDb();
 
   let semResult;
@@ -756,6 +780,12 @@ async function runSemanticLcmGrep(input: HybridGrepInput) {
       since,
       before,
       embeddedKinds: ["summary"],
+      // Wave-12 consolidation SA: summaryKinds came from lcm_semantic_recall.
+      // Pre-consolidation, runSemanticSearch's underlying SQL post-filters on
+      // summary kind via Set membership; pass it through when the agent supplies
+      // it. Defaults to undefined (no filter) for parity with the prior
+      // grep mode='semantic' behavior.
+      ...(summaryKinds && summaryKinds.length > 0 ? { summaryKinds } : {}),
       excludeSuppressed: true,
       voyageMaxRetries: 1,
       voyageTimeoutMs: 15_000,

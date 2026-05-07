@@ -218,10 +218,20 @@ describe("createLcmGrepTool — hybrid mode metadata", () => {
     expect(params.properties.mode?.enum).toContain("full_text");
   });
 
-  it("description mentions hybrid mode and points to lcm_semantic_recall for purely-semantic", () => {
+  it("description mentions all 5 modes and the consolidated mode='semantic' path", () => {
+    // Wave-12 consolidation SA: lcm_semantic_recall removed; folded
+    // into `lcm_grep mode='semantic'`. Test now asserts the description
+    // reflects the new arrangement (all 5 modes documented, semantic
+    // surfaced as the pure-vector entry point).
     const tool = createLcmGrepTool({ deps: makeDeps() });
-    expect(tool.description.toLowerCase()).toContain("hybrid");
-    expect(tool.description).toContain("lcm_semantic_recall");
+    const desc = tool.description.toLowerCase();
+    expect(desc).toContain("hybrid");
+    expect(desc).toContain("semantic");
+    expect(desc).toContain("verbatim");
+    expect(desc).toContain("regex");
+    expect(desc).toContain("full_text");
+    // No more cross-defer to a separate lcm_semantic_recall tool.
+    expect(tool.description).not.toContain("lcm_semantic_recall");
   });
 });
 

@@ -21,8 +21,7 @@
  *
  * # Tools that use this
  *
- * - lcm_grep (all modes)
- * - lcm_semantic_recall
+ * - lcm_grep (all modes — including the merged `mode='semantic'` post Wave-12 SA)
  * - lcm_describe (most important — biggest blow-up risk)
  * - lcm_expand_query (sub-agent path; uniform behavior)
  * - lcm_get_entity / lcm_search_entities (uniform; rarely trips)
@@ -80,10 +79,9 @@ export function estimateResultTokens(
       return 1500;
     }
 
-    case "lcm_semantic_recall": {
-      const chars = 250 + limit * 215;
-      return Math.min(HARD_CAP_TOKENS, Math.ceil(chars / charsPerToken));
-    }
+    // Wave-12 consolidation SA: lcm_semantic_recall removed; its
+    // estimator coefficient (250 + limit * 215) folded into lcm_grep's
+    // mode='semantic' branch above. Estimate parity preserved.
 
     case "lcm_describe": {
       // Base: ~5 subtree nodes × 250 chars + ~3200 chars summary content + 350 header

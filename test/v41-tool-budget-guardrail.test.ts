@@ -21,7 +21,6 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createLcmGrepTool } from "../src/tools/lcm-grep-tool.js";
-import { createLcmSemanticRecallTool } from "../src/tools/lcm-semantic-recall-tool.js";
 import { createLcmGetEntityTool } from "../src/tools/lcm-get-entity-tool.js";
 import { makeTestDeps } from "./fixtures/v41-tool-harness.js";
 
@@ -32,11 +31,9 @@ describe("LCM_TOOL_RESULT_TOKEN_BUDGET — context-overflow guardrail", () => {
     expect(tool.description).toContain("context is near full");
   });
 
-  it("lcm_semantic_recall description tells the agent about the cap + when to narrow", () => {
-    const tool = createLcmSemanticRecallTool({ deps: makeTestDeps() });
-    expect(tool.description).toContain("LCM_TOOL_RESULT_TOKEN_BUDGET");
-    expect(tool.description).toContain("context is near full");
-  });
+  // Wave-12 consolidation SA: lcm_semantic_recall removed; folded into
+  // `lcm_grep mode='semantic'`. The cap-coverage assertion lives on the
+  // grep description test above (which already contains the same prose).
 });
 
 // ───────────────────────────────────────────────────────────────────

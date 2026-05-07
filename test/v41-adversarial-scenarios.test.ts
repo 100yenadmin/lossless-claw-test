@@ -53,7 +53,6 @@ import { createLcmGrepTool } from "../src/tools/lcm-grep-tool.js";
 import { createLcmDescribeTool } from "../src/tools/lcm-describe-tool.js";
 import { createLcmGetEntityTool } from "../src/tools/lcm-get-entity-tool.js";
 import { createLcmSearchEntitiesTool } from "../src/tools/lcm-search-entities-tool.js";
-import { createLcmSemanticRecallTool } from "../src/tools/lcm-semantic-recall-tool.js";
 import { createLcmSynthesizeAroundTool } from "../src/tools/lcm-synthesize-around-tool.js";
 import {
   buildTestCorpus,
@@ -210,27 +209,25 @@ describe("Adversarial — Paraphrase scenarios", () => {
     expect(text).toMatch(/sum_adv_paraphrase_lcmrecent_001/);
   });
 
-  it("paraphrase-5: semantic_recall returns graceful error WITHOUT Voyage creds", async () => {
-    // Sister-tool of grep --hybrid for paraphrase queries. Without
-    // Voyage creds the tool MUST return a structured error, not throw.
-    // Wave-9 P1.3 fix pinned this contract.
-    const tool = createLcmSemanticRecallTool({
+  it("paraphrase-5: lcm_grep mode='semantic' returns graceful error WITHOUT Voyage creds", async () => {
+    // Wave-12 consolidation SA: was previously paired with
+    // lcm_semantic_recall as a sister-tool parity test. Recall removed
+    // (folded into `lcm_grep mode='semantic'`). Test simplified to
+    // assert the same graceful-error contract on the surviving surface.
+    const tool = createLcmGrepTool({
       deps: makeTestDeps(),
       lcm: makeTestEngine(db),
       sessionKey: "agent:main:main",
     });
     const r = await tool.execute("test-adv-p5", {
-      query: "rollup-replacement tool we ditched",
+      pattern: "rollup-replacement tool we ditched",
+      mode: "semantic",
       allConversations: true,
     });
     const details = r.details as { error?: string };
-    // In offline harness Voyage is unreachable → must report it.
     if (details.error) {
       expect(details.error).toMatch(/voyage|embedding|vec0|VOYAGE_API/i);
     } else {
-      // If it actually returned hits (would only happen if tests have
-      // Voyage credentials), the result should still have a sensible
-      // shape.
       expect(r.details).toBeDefined();
     }
   });

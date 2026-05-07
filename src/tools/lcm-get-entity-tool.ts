@@ -7,8 +7,8 @@
  * src/operator/extraction-autostart.ts).
  *
  * Use this when the agent or user asks "tell me about X" or "what work has been
- * done on X" — distinct from `lcm_search_entities` (fuzzy text search) and
- * `lcm_semantic_recall` (similarity over leaf content).
+ * done on X" — distinct from `lcm_search_entities` (fuzzy / browse) and
+ * `lcm_grep --mode semantic` (similarity over leaf content, no entity needed).
  *
  * Caller-provided `name` is matched COLLATE NOCASE against `canonical_text`.
  * Optional filters: session_key (defaults to current session_key), entity_type
@@ -131,8 +131,9 @@ export function createLcmGetEntityTool(input: {
       "entity ('have we discussed X-shaped problems', 'what work has been done " +
       "on rate limiting'), prefer lcm_grep --mode hybrid instead — it handles " +
       "paraphrase across the corpus without needing a canonical entity to exist. " +
-      "For browsing many entities by substring, use lcm_search_entities. For " +
-      "raw leaf content similarity (no entity needed), use lcm_semantic_recall.",
+      "For browsing many entities by substring or by entity_type, use " +
+      "lcm_search_entities. For raw leaf content similarity (no entity " +
+      "needed), use lcm_grep --mode semantic.",
     parameters: LcmGetEntitySchema,
     async execute(_toolCallId, params) {
       return runWithTokenGate({

@@ -41,12 +41,16 @@ const MAX_LIMIT = 100;
 type SearchMode = "like" | "prefix" | "exact";
 
 const LcmSearchEntitiesSchema = Type.Object({
-  query: Type.String({
-    description:
-      "Search query. Default mode is substring (LIKE %query%). Use the `mode` " +
-      "param to switch to 'prefix' (LIKE query%) or 'exact' (= query). " +
-      "All matches are COLLATE NOCASE.",
-  }),
+  query: Type.Optional(
+    Type.String({
+      description:
+        "Search query (substring by default; use `mode` to switch to 'prefix' or 'exact'). " +
+        "All matches are COLLATE NOCASE. " +
+        "OPTIONAL when `entityType` is provided — empty query + entityType browses all " +
+        "entities of a given type (e.g. browse all PRs by setting entityType='pr_number'). " +
+        "REQUIRED when entityType is absent.",
+    }),
+  ),
   mode: Type.Optional(
     Type.String({
       enum: ["like", "prefix", "exact"],
@@ -131,11 +135,19 @@ export function createLcmSearchEntitiesTool(input: {
     name: "lcm_search_entities",
     label: "LCM Search Entities",
     description:
-      "Browse / search the entity catalog by name (substring, prefix, or exact " +
-      "match — all COLLATE NOCASE). Returns ranked entities with their type + " +
-      "occurrence count + last-seen time. For full mention list of a single " +
-      "entity, follow up with lcm_get_entity. Backed by the async entity " +
-      "coreference worker.",
+      "PRIMARY tool for entity discovery / browse — use when you DON'T know " +
+      "the canonical name yet, or want to see what's in the catalog. " +
+      "Three use modes covered by this single tool: " +
+      "(1) **browse by type**: pass `entityType` (e.g. 'pr_number', 'person_name', 'file_path') " +
+      "with no query to list all entities of a type — useful for 'what PRs have we discussed?', " +
+      "'what kinds of entities are in this corpus?'; " +
+      "(2) **fuzzy lookup**: pass partial / approximate `query` with `mode='like'` (default, " +
+      "substring) or `mode='prefix'` — useful for 'I'm looking for that customer with the VM " +
+      "issues, can't remember the exact name' or 'show me anything starting with Voy'; " +
+      "(3) **catalog probe**: empty-query + entityType filter to enumerate. " +
+      "Returns ranked entities (occurrence_count DESC, last_seen DESC) with their type + " +
+      "occurrence count + last-seen time. Once you have a canonical name, follow up with " +
+      "`lcm_get_entity` for the full mention list. Backed by the async entity coreference worker.",
     parameters: LcmSearchEntitiesSchema,
     async execute(_toolCallId, params) {
       return runWithTokenGate({
@@ -152,8 +164,18 @@ export function createLcmSearchEntitiesTool(input: {
       const p = params as Record<string, unknown>;
 
       const query = typeof p.query === "string" ? p.query.trim() : "";
-      if (query.length === 0) {
-        return jsonResult({ error: "`query` is required (non-empty)." });
+      const entityTypeFilterRaw =
+        typeof p.entityType === "string" && p.entityType.trim().length > 0
+          ? p.entityType.trim().toLowerCase()
+          : null;
+      // Wave-12 consolidation: allow empty query when entityType is set
+      // (browse-by-type use case). Otherwise query is still required —
+      // empty query + no entityType is too broad to be useful.
+      if (query.length === 0 && !entityTypeFilterRaw) {
+        return jsonResult({
+          error:
+            "`query` is required (non-empty), unless you provide `entityType` to browse all entities of a type (e.g. entityType='pr_number' lists all known PRs).",
+        });
       }
 
       const mode = normalizeMode(p.mode);
@@ -167,10 +189,7 @@ export function createLcmSearchEntitiesTool(input: {
         });
       }
 
-      const entityTypeFilter =
-        typeof p.entityType === "string" && p.entityType.trim().length > 0
-          ? p.entityType.trim().toLowerCase()
-          : null;
+      const entityTypeFilter = entityTypeFilterRaw;
 
       const limit =
         typeof p.limit === "number" && Number.isFinite(p.limit)
@@ -198,19 +217,25 @@ export function createLcmSearchEntitiesTool(input: {
       ];
       const binds: (string | number)[] = [effectiveSessionKey];
 
-      const escaped = escapeLike(query);
-      let pattern: string;
-      if (mode === "prefix") {
-        pattern = `${escaped}%`;
-        filters.push("e.canonical_text LIKE ? ESCAPE '\\' COLLATE NOCASE");
-        binds.push(pattern);
-      } else if (mode === "exact") {
-        filters.push("e.canonical_text = ? COLLATE NOCASE");
-        binds.push(query);
-      } else {
-        pattern = `%${escaped}%`;
-        filters.push("e.canonical_text LIKE ? ESCAPE '\\' COLLATE NOCASE");
-        binds.push(pattern);
+      // Wave-12 consolidation: empty query is allowed in the browse-by-type
+      // case (entityType filter must be present, validated upstream). Skip
+      // the LIKE/exact predicate when query is empty so we don't add
+      // `e.canonical_text LIKE '%%'` (matches everything but obfuscates intent).
+      if (query.length > 0) {
+        const escaped = escapeLike(query);
+        let pattern: string;
+        if (mode === "prefix") {
+          pattern = `${escaped}%`;
+          filters.push("e.canonical_text LIKE ? ESCAPE '\\' COLLATE NOCASE");
+          binds.push(pattern);
+        } else if (mode === "exact") {
+          filters.push("e.canonical_text = ? COLLATE NOCASE");
+          binds.push(query);
+        } else {
+          pattern = `%${escaped}%`;
+          filters.push("e.canonical_text LIKE ? ESCAPE '\\' COLLATE NOCASE");
+          binds.push(pattern);
+        }
       }
       if (entityTypeFilter) {
         filters.push("e.entity_type = ?");

@@ -17,7 +17,7 @@
  * # What's covered
  *
  *   A1-A5 — Time-anchored:    PRIMARY = lcm_synthesize_around
- *   B1-B5 — Topic-anchored:    PRIMARY = lcm_grep --mode hybrid + lcm_semantic_recall
+ *   B1-B5 — Topic-anchored:    PRIMARY = lcm_grep --mode hybrid + lcm_grep --mode semantic
  *   C1-C5 — Verbatim:          PRIMARY = lcm_grep --mode verbatim
  *   D1-D5 — Pattern-anchored:  PRIMARY = lcm_get_entity / lcm_search_entities (D2/D4 only;
  *                              D1/D3/D5 are theme/procedure fallback per #616)
@@ -40,7 +40,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createLcmGrepTool } from "../src/tools/lcm-grep-tool.js";
-import { createLcmSemanticRecallTool } from "../src/tools/lcm-semantic-recall-tool.js";
 import { createLcmDescribeTool } from "../src/tools/lcm-describe-tool.js";
 import { createLcmGetEntityTool } from "../src/tools/lcm-get-entity-tool.js";
 import { createLcmSearchEntitiesTool } from "../src/tools/lcm-search-entities-tool.js";
@@ -297,26 +296,22 @@ describe("THE_FIVE_QUESTIONS — Type B: Topic-anchored", () => {
     expect(/sum_c1_001|sum_c2_001/.test(text)).toBe(true);
   });
 
-  it("B-semantic (graceful-degradation): lcm_semantic_recall returns clear error w/o Voyage creds", async () => {
-    // When Voyage isn't configured, semantic_recall should return a
-    // friendly error — NOT throw. Wave-9 P1.3 fixed grep --mode semantic
-    // to match this contract. This test pins both surfaces' behavior.
-    const tool = createLcmSemanticRecallTool({
+  it("B-semantic (graceful-degradation): lcm_grep mode='semantic' returns clear error w/o Voyage creds", async () => {
+    // Wave-12 consolidation SA: lcm_semantic_recall removed; folded
+    // into `lcm_grep mode='semantic'`. Test now pins the surviving
+    // surface's graceful-error contract (was Wave-9 P1.3 parity guard).
+    const tool = createLcmGrepTool({
       deps: makeTestDeps(),
       lcm: makeTestEngine(db),
       sessionKey: "agent:main:main",
     });
     const r = await tool.execute("test-b-sem", {
-      query: "voyage embeddings",
+      pattern: "voyage embeddings",
+      mode: "semantic",
       allConversations: true,
     });
-    // Either returns an error (graceful) OR returns hits (if Voyage is
-    // available). MUST NOT throw. The error is in details.error per
-    // jsonResult shape.
     const details = r.details as { error?: string };
     if (details.error) {
-      // Graceful error path — must mention vec0/Voyage/embedding so
-      // the agent knows what to do next.
       expect(details.error).toMatch(/vec0|voyage|embedding|VOYAGE_API/i);
     } else {
       expect(r.details).toBeDefined();
