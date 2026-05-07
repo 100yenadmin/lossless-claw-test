@@ -2383,38 +2383,50 @@ function wirePluginHandlers(
 
   api.registerContextEngine("lossless-claw", () => shared.getCachedEngine() ?? shared.waitForEngine());
 
-  api.registerTool((ctx) =>
-    createLcmGrepTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  api.registerTool(
+    (ctx) => createLcmGrepTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    { name: "lcm_grep" },
   );
-  api.registerTool((ctx) =>
-    createLcmSemanticRecallTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  api.registerTool(
+    (ctx) =>
+      createLcmSemanticRecallTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    { name: "lcm_semantic_recall" },
   );
-  api.registerTool((ctx) =>
-    createLcmDescribeTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  api.registerTool(
+    (ctx) => createLcmDescribeTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    { name: "lcm_describe" },
   );
-  api.registerTool((ctx) =>
-    createLcmExpandTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  api.registerTool(
+    (ctx) => createLcmExpandTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    { name: "lcm_expand" },
   );
-  api.registerTool((ctx) =>
-    createLcmExpandQueryTool({
-      deps,
-      getLcm: shared.waitForEngine,
-      sessionKey: ctx.sessionKey,
-      requesterSessionKey: ctx.sessionKey,
-    }),
+  api.registerTool(
+    (ctx) =>
+      createLcmExpandQueryTool({
+        deps,
+        getLcm: shared.waitForEngine,
+        sessionKey: ctx.sessionKey,
+        requesterSessionKey: ctx.sessionKey,
+      }),
+    { name: "lcm_expand_query" },
   );
-  api.registerTool((ctx) =>
-    createLcmSynthesizeAroundTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  api.registerTool(
+    (ctx) =>
+      createLcmSynthesizeAroundTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    { name: "lcm_synthesize_around" },
   );
   // Final.review.3 — entity tool surface (Scenario 4 fix). Read tools over
   // lcm_entities + lcm_entity_mentions, populated by the async coreference
   // worker. Without these the entity worker writes records that no agent can
   // query, which the doc audit (Slice 1 BLOCKER) flagged as vapor.
-  api.registerTool((ctx) =>
-    createLcmGetEntityTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  api.registerTool(
+    (ctx) => createLcmGetEntityTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    { name: "lcm_get_entity" },
   );
-  api.registerTool((ctx) =>
-    createLcmSearchEntitiesTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  api.registerTool(
+    (ctx) =>
+      createLcmSearchEntitiesTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    { name: "lcm_search_entities" },
   );
 
   api.registerCommand(
