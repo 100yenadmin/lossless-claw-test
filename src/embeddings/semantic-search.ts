@@ -2,7 +2,7 @@
  * Semantic search service — LCM v4.1 §13 / Group C.
  *
  * Wraps the embed-query → KNN → join-back-to-summary flow used by
- * `lcm_semantic_recall` AND by the hybrid mode of `lcm_grep`.
+ * the `semantic` and `hybrid` modes of `lcm_grep`.
  *
  * Caller passes a free-text query + optional filters. We embed it via
  * Voyage (with `inputType='query'` for asymmetric retrieval), run KNN
@@ -124,7 +124,7 @@ export interface SemanticHit {
    * Higher = more similar. The agent-facing tool maps this into bands:
    *   ≥0.65 high / ≥0.5 medium / ≥0.35 low / <0.35 noise.
    * (Calibrated against Eva's live DB on 2026-05-06; see
-   *  `lcm-semantic-recall-tool.ts` for the band logic.)
+   *  `lcm-grep-tool.ts` semantic mode for the band logic.)
    */
   cosineSimilarity: number;
   /** From summaries: content + metadata (after suppression-filter join). */
@@ -286,7 +286,7 @@ export async function runSemanticSearch(
   const summaryIds = summaryHits.map((c) => c.embeddedId);
   if (summaryIds.length === 0) {
     // All candidates were entity/theme — return them with no JOIN. Caller
-    // tools (lcm_semantic_recall) may or may not handle these.
+    // tools (lcm_grep semantic mode) may or may not handle these.
     // Audit 1 finding #1 (HIGH): cosineSimilarity is a required field —
     // omitting it crashes downstream `.toFixed(3)` calls. Compute it here.
     return {

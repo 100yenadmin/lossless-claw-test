@@ -23,8 +23,7 @@ When a conversation grows beyond the model's context window, OpenClaw (just like
 3. **Condenses summaries** into higher-level nodes as they accumulate, forming a DAG (directed acyclic graph)
 4. **Assembles context** each turn by combining summaries + recent raw messages
 5. **Provides 8 agent tools** so agents can search and recall details from compacted history:
-   - `lcm_grep` — search via regex / FTS5 / hybrid (FTS+semantic+rerank) / pure-semantic / verbatim modes
-   - `lcm_semantic_recall` — paraphrastic search via Voyage embeddings + cosine similarity bands
+   - `lcm_grep` — search via regex / FTS5 / hybrid (FTS+semantic+rerank) / pure-semantic (absorbs the prior `lcm_semantic_recall` surface — Wave-12 consolidation) / verbatim modes; `summaryKinds` filter scopes hits to leaves vs condensed
    - `lcm_synthesize_around` — fresh windowed synthesis. Three modes:
      - `window_kind="period"` (the `lcm_recent` replacement) — direct date-range / period-shortcut (e.g. `period: "yesterday"`, `period: "last-7-days"`); no anchor lookup required
      - `window_kind="time"` — ±N hours around an anchor leaf (`target: "sum_xxx"`)
@@ -32,7 +31,8 @@ When a conversation grows beyond the model's context window, OpenClaw (just like
    - `lcm_describe` — drill into a summary's lineage + one-hop expansion to children/messages
    - `lcm_expand_query` — recursive expansion via bounded sub-agent (~120s; cited summaries validated against the DB)
    - `lcm_expand` — sub-agent-only DAG walker, gated by an explicit grant ledger
-   - `lcm_get_entity` / `lcm_search_entities` — entity catalog lookup (populated by async coreference worker)
+   - `lcm_get_entity` / `lcm_search_entities` — entity catalog lookup (populated by async coreference worker; `lcm_search_entities` supports browse-by-`entityType` with empty query)
+   - `lcm_compact` — agent-triggered LCM compaction escape valve (operator opt-in via `agentCompactionToolEnabled`; gated by reserve floor + per-window cap)
 
 Nothing is lost. Raw messages stay in the database. Summaries link back to their source messages. Agents can drill into any summary to recover the original detail.
 

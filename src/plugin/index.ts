@@ -2442,9 +2442,17 @@ function wirePluginHandlers(
       }),
     { name: "lcm_expand_query" },
   );
+  // Wave-12 audit (W2A1 P0 #2): pass getRuntimeContext so the
+  // wrapper's needsCompact gate + post-call tap fire correctly.
+  // Synthesize was previously off the token-accounting bus.
   api.registerTool(
     (ctx) =>
-      createLcmSynthesizeAroundTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+      createLcmSynthesizeAroundTool({
+        deps,
+        getLcm: shared.waitForEngine,
+        sessionKey: ctx.sessionKey,
+        getRuntimeContext: () => getTokenStateRuntimeContext(ctx.sessionKey),
+      }),
     { name: "lcm_synthesize_around" },
   );
   // Final.review.3 — entity tool surface (Scenario 4 fix). Read tools over

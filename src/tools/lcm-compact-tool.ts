@@ -3,6 +3,7 @@ import type { LcmContextEngine } from "../engine.js";
 import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
+import { noteSuccessfulCompact } from "../plugin/token-state.js";
 
 /**
  * Agent-triggered LCM compaction tool.
@@ -335,6 +336,15 @@ export function createLcmCompactTool(input: {
           currentTokenCount,
           force: false, // honors engine-side cache-hot + threshold gates
         });
+        // Wave-12 audit (W2A1 P0): on successful compaction, clear the
+        // token-state cache. Without this, the cache stays at the pre-
+        // compact 184K-class value until next llm_output, and the very
+        // next wrapped tool spuriously refuses with needsCompact: true —
+        // the agent can wedge in compact→refuse→compact loops. Clearing
+        // lets the next llm_output snap fresh ground truth.
+        if (result.ok && result.compacted) {
+          noteSuccessfulCompact(sessionKey);
+        }
         const mapped = mapEngineReason(result.reason);
         return jsonResult({
           ok: result.ok,

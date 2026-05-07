@@ -1180,8 +1180,8 @@ export class SummaryStore {
     const where: string[] = ["summaries_fts MATCH ?"];
     const args: Array<string | number> = [sanitizeFts5Query(query)];
     // v4.1 §10 invariant: every retrieval surface defaults to
-    // exclude-suppressed. lcm_grep / lcm_semantic_recall flow through
-    // here; operator/admin tools that need to see suppressed should
+    // exclude-suppressed. lcm_grep (all modes) flows through here;
+    // operator/admin tools that need to see suppressed should
     // bypass searchSummaries entirely.
     where.push("s.suppressed_at IS NULL");
     appendConversationScopeConstraint({

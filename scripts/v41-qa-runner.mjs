@@ -984,11 +984,15 @@ SUITES.full = [
   // PR numbers, exact commits. Real users often DON'T — F-cases exercise
   // browse / fuzzy-name / type-filter / cost-cheap discovery.
   {
+    // Wave-12 audit (W2A2 P1): F1 doc says "What kinds of entities have
+    // come up" — catalog-type browse with NO entityType filter (relies on
+    // empty-query browse-all-entities path post-consolidation). Args
+    // were previously crossed with F4 (had pr_number); now matches doc.
     id: "full-F1-browse-by-type",
     questionType: "F",
-    description: "Browse entities by type (entityType filter, no query)",
+    description: "Browse entire entity catalog (no type filter)",
     tool: "lcm_search_entities",
-    args: { entityType: "pr_number", limit: 30 },
+    args: { query: "%", mode: "like", limit: 30 },
     expect: (r) => {
       if (r.error) return `errored: ${r.error}`;
       if (r.details?.totalMatches === 0 && r.details?.catalogStatus == null) {
@@ -1038,11 +1042,16 @@ SUITES.full = [
     severity: "important",
   },
   {
+    // Wave-12 audit (W2A2 P1): F4 doc says "What PRs have we discussed?"
+    // — entityType filter on `pr_number`. Args were previously crossed
+    // with F1 (had person_name); now matches doc. This case exercises
+    // the new browse-by-type capability (empty query + entityType set,
+    // post-consolidation).
     id: "full-F4-type-filter",
     questionType: "F",
-    description: "List all entities of a specific entity_type",
+    description: "List all entities of entity_type='pr_number' (PRs discussed)",
     tool: "lcm_search_entities",
-    args: { entityType: "person_name", limit: 20 },
+    args: { entityType: "pr_number", limit: 20 },
     expect: (r) => {
       if (r.error) return `errored: ${r.error}`;
       if (r.details?.totalMatches === 0 && r.details?.catalogStatus == null) {

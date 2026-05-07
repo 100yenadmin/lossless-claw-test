@@ -150,6 +150,33 @@ export function __resetTokenStateForTesting(): void {
 }
 
 /**
+ * Wave-12 audit (W2A1 P0 #1): post-compact cache reset.
+ *
+ * After a successful `lcm_compact` the engine's actual context drops
+ * dramatically (e.g. 184K → 70K). The token-state cache, however, still
+ * carries the pre-compact value until the NEXT `llm_output` event fires.
+ * Without this hook, the very next wrapped tool's `evaluateNeedsCompactGate`
+ * runs against the stale 184K and refuses spuriously — exactly what
+ * compact was meant to prevent. Worst case: agent loops compact→refuse
+ * →compact until the per-window cap (2/5min) blocks further attempts.
+ *
+ * Strategy: clear the cache entry. The next wrapped tool call sees no
+ * snapshot → `evaluateNeedsCompactGate` bypasses (its documented behavior
+ * when telemetry is missing) → tool runs → `tapResultForTokenAccounting`
+ * recreates the entry with the size of the new result (small).
+ * Subsequent calls accumulate normally; on the next `llm_output` we snap
+ * back to ground truth.
+ *
+ * This is conservative — it temporarily disables the gate for one or
+ * two tool calls until the next llm_output. That trade is correct here:
+ * the alternative (stale-cache spurious refusal) is observably worse.
+ */
+export function noteSuccessfulCompact(sessionKey: string | undefined): void {
+  if (!sessionKey) return;
+  tokensBySession.delete(sessionKey);
+}
+
+/**
  * Convenience helper used by tools to wrap their result emissions:
  * extracts the rendered text and calls accumulateToolResultTokens.
  * Tools call this on every return path (success + error) so the cache

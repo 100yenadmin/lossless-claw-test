@@ -23,12 +23,17 @@
  *
  * - lcm_grep (all modes — including the merged `mode='semantic'` post Wave-12 SA)
  * - lcm_describe (most important — biggest blow-up risk)
+ * - lcm_synthesize_around (Wave-12 audit W2A1: previously skipped; the
+ *   "self-protecting via 50K source cap" reasoning covered SOURCE input
+ *   bounds, not OUTPUT — and the markdown response is 4K-8K tokens of
+ *   LLM-generated rollup that flowed past the cache silently. Fixed.)
  * - lcm_expand_query (sub-agent path; uniform behavior)
  * - lcm_get_entity / lcm_search_entities (uniform; rarely trips)
  *
  * Skipped:
- * - lcm_synthesize_around (self-protecting via internal 50K source cap)
- * - lcm_compact (status response, ~100 tokens)
+ * - lcm_compact (status response, ~100 tokens; on success it CLEARS the
+ *   cache via noteSuccessfulCompact so the next call re-bootstraps from
+ *   the post-compact ground truth)
  * - lcm_expand (sub-agent only; has its own grant ledger)
  */
 
@@ -140,10 +145,11 @@ export function estimateResultTokens(
       return 150;
 
     case "lcm_synthesize_around":
-      // Self-protecting via internal 50K source cap; output prompt-bounded
-      // ~2000-3000 tokens. Per Wave-14 Agent B: doesn't NEED a refusal gate
-      // (output can't blow context), but estimator returns a sensible value
-      // for any caller that does check.
+      // Wave-12 audit W2A1: lcm_synthesize_around is now wrapped by
+      // runWithTokenGate so this estimate IS consulted. Output is the
+      // synthesized markdown rollup (typically 2K-3K tokens; bounded by
+      // the summarizer's max-output-tokens). Source-input cap (50K) is
+      // separate and not the OUTPUT we're estimating here.
       return 3_000;
 
     default:
@@ -282,6 +288,27 @@ export async function runWithTokenGate<
       return tapResultForTokenAccounting(opts.sessionKey, jsonResult(refusal)) as unknown as T;
     }
   }
-  const result = await opts.inner();
+  // Wave-12 audit (W2A1 P1): catch throws and tap before re-throwing.
+  // Without this, every "throw new Error(...)" inside inner() (e.g.
+  // "LCM engine is unavailable" — present in 6+ tools, plus 13 throw
+  // sites in lcm_expand_query) propagated past the wrapper, skipping
+  // tapResultForTokenAccounting entirely. The error message itself
+  // costs tokens (the runtime serializes it for the agent), and that
+  // cost was silently un-counted, drifting downstream gate decisions
+  // low by exactly the size of the error message.
+  let result: T;
+  try {
+    result = await opts.inner();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // Tap an error-shaped result so the cache absorbs the size of the
+    // error message the runtime will surface. Re-throw so callers can
+    // still observe the failure.
+    tapResultForTokenAccounting(
+      opts.sessionKey,
+      jsonResult({ error: `${opts.toolName}: ${msg}` }),
+    );
+    throw e;
+  }
   return tapResultForTokenAccounting(opts.sessionKey, result);
 }

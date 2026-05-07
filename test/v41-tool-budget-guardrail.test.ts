@@ -1,8 +1,11 @@
 /**
  * Tool-result token budget guardrail tests.
  *
- * Pins the `LCM_TOOL_RESULT_TOKEN_BUDGET` env contract for `lcm_grep` and
- * `lcm_semantic_recall`: tool output is hard-capped at the configured
+ * Pins the `LCM_TOOL_RESULT_TOKEN_BUDGET` env contract for `lcm_grep`
+ * (the prior `lcm_semantic_recall` surface was consolidated INTO
+ * `lcm_grep mode='semantic'` in Wave-12 SA, so the env knob is now
+ * single-tool by design — see audit-w2a3 finding for full reasoning).
+ * Tool output is hard-capped at the configured
  * budget × 4 chars (default 10K tokens / 40K chars), with a floor of
  * 2K tokens to keep the tool useful even if an operator misconfigures.
  *

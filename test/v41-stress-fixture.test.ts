@@ -264,7 +264,7 @@ describe("v4.1 stress fixture — corpus-shape edges", () => {
     if (!VEC0_AVAILABLE) {
       // Graceful skip when vec0 isn't installed — see the SEMANTIC tests
       // pattern. CI may not have the dylib. We mark the test as a no-op
-      // PASS in this case (mirrors test/lcm-semantic-recall-tool.test.ts).
+      // PASS in this case (mirrors lcm_grep semantic-mode tests).
       // eslint-disable-next-line no-console
       console.log(`[stress-fixture] vec0 not available at ${VEC0_PATH} — skipping KNN test`);
       return;
