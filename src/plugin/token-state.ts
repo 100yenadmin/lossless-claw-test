@@ -196,6 +196,15 @@ export function inferTokenBudget(
   if (ref.includes("haiku")) {
     return 200_000;
   }
-  // Fallback — undefined means caller should use config or skip.
-  return undefined;
+  // Wave-12 audit (W1A1 P1): previously returned undefined for any model
+  // outside the recognized tiers (gpt-4 / gpt-4o / claude-3.x / o1 / Gemini /
+  // Mistral / Ollama / etc). evaluateNeedsCompactGate treats undefined as a
+  // bypass signal, so the gate was silently disabled for the majority of
+  // operators not on the recognized list. Conservative default of 200K
+  // covers most modern frontier-tier models (GPT-4 32K-128K, Claude 3.5
+  // 200K, o1 128K, Gemini 1.5 Pro 1M but capped here, etc). Operators on
+  // smaller-context models (8K-32K) over-protect, but per-call MAX_RESULT_CHARS
+  // already bounds the worst case at 10K tokens / call. Operators wanting a
+  // different default should set explicit tokenBudget via runtime config.
+  return 200_000;
 }

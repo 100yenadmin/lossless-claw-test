@@ -284,6 +284,14 @@ export function createLcmGrepTool(input: {
         });
       }
 
+      // Wave-12 audit (W1A5 P1): summaryKinds was previously plumbed only
+      // through `mode='semantic'` even though the schema description claims
+      // both 'semantic' AND 'hybrid' honor it. Now resolved once and passed
+      // to both helper functions.
+      const summaryKindsParam = Array.isArray(p.summaryKinds)
+        ? (p.summaryKinds as Array<"leaf" | "condensed">)
+        : undefined;
+
       if (mode === "hybrid") {
         return runHybridLcmGrep({
           lcm,
@@ -293,13 +301,11 @@ export function createLcmGrepTool(input: {
           before,
           limit,
           timezone,
+          summaryKinds: summaryKindsParam,
         });
       }
 
       if (mode === "semantic") {
-        const summaryKindsParam = Array.isArray(p.summaryKinds)
-          ? (p.summaryKinds as Array<"leaf" | "condensed">)
-          : undefined;
         return runSemanticLcmGrep({
           lcm,
           pattern,
@@ -463,7 +469,7 @@ interface HybridGrepInput {
  * degraded-mode warnings when vec0 or rerank is unavailable.
  */
 async function runHybridLcmGrep(input: HybridGrepInput) {
-  const { lcm, pattern, conversationScope, since, before, limit, timezone } = input;
+  const { lcm, pattern, conversationScope, since, before, limit, timezone, summaryKinds } = input;
   const summaryStore = lcm.getSummaryStore();
   const db = lcm.getDb();
 
@@ -605,6 +611,10 @@ async function runHybridLcmGrep(input: HybridGrepInput) {
       conversationIds,
       since,
       before,
+      // Wave-12 audit (W1A5 P1): summaryKinds was schema-documented for
+      // hybrid mode but never plumbed to runHybridSearch. Now passed
+      // through for parity with semantic mode.
+      ...(summaryKinds && summaryKinds.length > 0 ? { summaryKinds } : {}),
       ftsSearch,
       // Final review Finding #2: cap Voyage wall-time on agent hot path.
       // Embed call + rerank call each capped at 15s × 1 retry ≈ 30s

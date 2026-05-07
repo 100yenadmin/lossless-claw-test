@@ -12,7 +12,9 @@
  *
  * After this completes, the harness DB has every leaf embedded + vec0 table
  * populated. The agent harness can then exercise lcm_grep --mode hybrid /
- * lcm_semantic_recall against real embedded data and get real semantic hits.
+ * lcm_grep --mode semantic against real embedded data and get real semantic
+ * hits. (Wave-12 SA: standalone lcm_semantic_recall removed; folded into
+ * lcm_grep mode='semantic'.)
  *
  * USAGE:
  *   VOYAGE_API_KEY=$(cat ~/.openclaw/credentials/voyage-api-key) \

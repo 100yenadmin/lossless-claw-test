@@ -224,9 +224,7 @@ const sessionKey = "agent:main:main";
 const toolFactories = {};
 toolFactories.lcm_grep = (await import(`${process.cwd()}/src/tools/lcm-grep-tool.js`))
   .createLcmGrepTool;
-toolFactories.lcm_semantic_recall = (
-  await import(`${process.cwd()}/src/tools/lcm-semantic-recall-tool.js`)
-).createLcmSemanticRecallTool;
+// Wave-12 SA: lcm_semantic_recall removed; folded into lcm_grep mode='semantic'.
 toolFactories.lcm_synthesize_around = (
   await import(`${process.cwd()}/src/tools/lcm-synthesize-around-tool.js`)
 ).createLcmSynthesizeAroundTool;
@@ -383,11 +381,19 @@ const SUITES = {
       severity: "critical",
     },
     {
+      // Wave-12 SA: was tool: "lcm_semantic_recall". Tool removed; the
+      // same surface is now lcm_grep mode='semantic' (same underlying
+      // runSemanticSearch path, same confidenceBand calibration).
       id: "smoke-semantic-cosine-band",
       questionType: "B",
-      description: "Semantic recall exposes cosineSimilarity + confidenceBand",
-      tool: "lcm_semantic_recall",
-      args: { query: "embedding backfill voyage", limit: 3, allConversations: true },
+      description: "lcm_grep mode='semantic' exposes cosineSimilarity + confidenceBand",
+      tool: "lcm_grep",
+      args: {
+        pattern: "embedding backfill voyage",
+        mode: "semantic",
+        limit: 3,
+        allConversations: true,
+      },
       expect: (r) => {
         if (r.details?.confidenceBand == null) return "missing confidenceBand";
         const hits = r.details?.hits ?? [];
@@ -398,10 +404,13 @@ const SUITES = {
       severity: "critical",
     },
     {
+      // Wave-12 SA: was tool: "lcm_semantic_recall" with `query` arg.
+      // Now lcm_grep mode='semantic' with `pattern` arg. Same Voyage
+      // path; equivalent test surface.
       id: "smoke-filtered-knn-windowed",
       questionType: "A",
       description: "P1 regression check: time-windowed semantic returns hits in window",
-      tool: "lcm_semantic_recall",
+      tool: "lcm_grep",
       // Wave-10 fix v2: previously hardcoded 2026-05-05 to 2026-05-07
       // (time-bombed). Wave-10 v1 used a fixed query against latest-48h
       // (failed when snapshot had insufficient embedded content). Now
@@ -421,10 +430,9 @@ const SUITES = {
           )
           .get();
         if (!seed) {
-          // No embedded leaves at all — sentinel query that we'll accept
-          // 0-hits on (predicate checks the same condition).
           return {
-            query: "__qa_noop_no_embedded_content__",
+            pattern: "__qa_noop_no_embedded_content__",
+            mode: "semantic",
             limit: 5,
             allConversations: true,
           };
@@ -432,9 +440,6 @@ const SUITES = {
         const seedMs = new Date(seed.latest_at).getTime();
         const since = new Date(seedMs - 1 * 60 * 60 * 1000).toISOString();
         const before = new Date(seedMs + 1 * 60 * 60 * 1000).toISOString();
-        // Use first 8 words of the seed leaf's content as the query.
-        // Semantic recall on Voyage SHOULD find the seed itself or
-        // very-close neighbors.
         const queryWords = String(seed.content)
           .replace(/\s+/g, " ")
           .trim()
@@ -442,7 +447,8 @@ const SUITES = {
           .slice(0, 8)
           .join(" ");
         return {
-          query: queryWords,
+          pattern: queryWords,
+          mode: "semantic",
           limit: 5,
           allConversations: true,
           since,
@@ -678,15 +684,19 @@ const SUITES = {
       severity: "critical",
     },
     {
+      // Wave-12 SA: was tool: "lcm_semantic_recall". Now lcm_grep mode='semantic'.
       id: "adv-low-confidence-warning",
       questionType: "B",
       description: "Low-confidence query emits warning + low/noise band",
-      tool: "lcm_semantic_recall",
-      // A query so generic it shouldn't have strong matches in any LCM corpus.
-      args: { query: "purple unicorn quantum waterfall", limit: 3, allConversations: true },
+      tool: "lcm_grep",
+      args: {
+        pattern: "purple unicorn quantum waterfall",
+        mode: "semantic",
+        limit: 3,
+        allConversations: true,
+      },
       expect: (r) => {
         const band = r.details?.confidenceBand;
-        // If there are 0 hits we get "no-match"; if hits exist they should be low/noise.
         if (band !== "no-match" && band !== "low" && band !== "noise") {
           return `expected low/noise/no-match band for nonsense query, got ${band}`;
         }
@@ -695,16 +705,15 @@ const SUITES = {
       severity: "important",
     },
     {
+      // Wave-12 SA: was tool: "lcm_semantic_recall". Now lcm_grep mode='semantic'.
       id: "adv-cosine-on-entity-only",
       questionType: "B",
       description: "Audit HIGH#1: entity-only path exposes cosineSimilarity",
-      // We can't easily force entity-only (entity coref worker hasn't run on snapshots).
-      // Instead, verify ANY hit returned by semantic-recall has cosineSimilarity.
-      tool: "lcm_semantic_recall",
-      args: { query: "test", limit: 1, allConversations: true },
+      tool: "lcm_grep",
+      args: { pattern: "test", mode: "semantic", limit: 1, allConversations: true },
       expect: (r) => {
         const hits = r.details?.hits ?? [];
-        if (hits.length === 0) return null; // no-hit case is fine
+        if (hits.length === 0) return null;
         if (hits[0].cosineSimilarity == null)
           return "AUDIT HIGH#1 regression: hit missing cosineSimilarity";
         return null;
@@ -1002,9 +1011,18 @@ SUITES.full = [
     tool: "lcm_synthesize_around",
     args: { window_kind: "period", period: "last-7d" },
     expect: (r) => {
+      // Wave-12 audit fix: r.error is r.details.error (qa-runner flatten
+      // at line 1132). synthesize_around in offline mode emits a
+      // structured "No summarization model resolved" error — that's
+      // graceful degradation, not failure. Match the same pattern as
+      // A-cases for LLM-unavailable scenarios.
+      if (
+        r.error &&
+        /summarization model|summaryModel|summaryProvider|LCM_SUMMARY_MODEL/i.test(String(r.error))
+      ) {
+        return null; // LLM-unavailable graceful-degradation contract
+      }
       if (r.error) return `errored: ${r.error}`;
-      // Recent-work period mode should return either a synthesis or a
-      // structured no-data response — not throw.
       if (r.details == null) return "no details";
       return null;
     },
@@ -1032,15 +1050,17 @@ SUITES.full = [
     tool: "lcm_grep",
     args: { pattern: "rate limiting", mode: "semantic", limit: 10, allConversations: true },
     expect: (r) => {
-      if (r.error) return `errored: ${r.error}`;
-      // Without Voyage creds in offline mode, graceful degradation is OK.
-      const errInDetails = r.details && typeof r.details === "object" && "error" in r.details
-        ? String(r.details.error)
-        : null;
-      if (errInDetails && /vec0|voyage|embedding|VOYAGE_API/i.test(errInDetails)) {
+      // Wave-12 audit fix (W1A6): r.error is r.details.error. Graceful
+      // degradation when Voyage is unreachable must be checked BEFORE
+      // the bare `if (r.error)` short-circuit, otherwise offline runs
+      // always fail this case. Pattern matches the v41-tool-parity-
+      // invariants.test.ts:Question-B test and matches the same shape
+      // as the smoke-semantic-cosine-band case above.
+      if (r.error && /vec0|voyage|embedding|VOYAGE_API/i.test(String(r.error))) {
         return null; // graceful-degradation contract
       }
-      if (r.details?.totalMatches == null && !errInDetails) {
+      if (r.error) return `errored: ${r.error}`;
+      if (r.details?.totalMatches == null) {
         return "no totalMatches and no error";
       }
       return null;

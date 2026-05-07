@@ -9,7 +9,7 @@ A real person with continuity of memory can answer 5 types of questions about th
 | Type | Question | Primary tool(s) |
 |---|---|---|
 | **A. Time-anchored** | "What did we work on yesterday?" / "Last week?" | `lcm_synthesize_around` (with `window_kind="period"` + period shortcut OR explicit since/before) |
-| **B. Topic-anchored** | "Have we ever discussed X?" | `lcm_grep` (modes: `hybrid` / `semantic` / `full_text` / `regex`) + `lcm_semantic_recall` |
+| **B. Topic-anchored** | "Have we ever discussed X?" | `lcm_grep` (modes: `hybrid` / `semantic` / `full_text` / `regex`) — `mode='hybrid'` for best recall, `mode='semantic'` for cost-cheap pure-vector |
 | **C. Verbatim** | "Quote what Eva exactly said" | `lcm_grep` mode=`verbatim` |
 | **D. Pattern-anchored / entity** | "Who is this person?" / "history of project X" | `lcm_get_entity`, `lcm_search_entities` |
 | **E. Drilldown** | "Where did this come from?" | `lcm_describe` (with `expandChildren` / `expandMessages`), `lcm_expand_query` |
@@ -19,7 +19,7 @@ A real person with continuity of memory can answer 5 types of questions about th
 ```
 Question references a specific time / period?       → A: lcm_synthesize_around (window_kind=period or time)
 Question references a topic / paraphrastic concept? → B: lcm_grep mode=hybrid (best recall)
-                                                          OR lcm_semantic_recall (cheaper, embedding-only)
+                                                          OR lcm_grep mode=semantic (cheaper, embedding-only)
 Need exact wording / quote?                         → C: lcm_grep mode=verbatim (full message rows, role filter)
 Question references a recurring entity / person?    → D: lcm_get_entity (exact) / lcm_search_entities (fuzzy)
 Need to drill from a summary back to its source?    → E: lcm_describe (one-hop) / lcm_expand_query (deep, sub-agent)
@@ -59,13 +59,9 @@ Search messages and summaries via FTS5, regex, embeddings, rerank, or full verba
 - **FTS5 syntax**: defaults to AND. Quote multi-word phrases. Bare boolean operators (`AND`/`OR`/`NOT`) without operands will error.
 - **`v4.1`-style patterns** with dots/brackets/leading-hyphen are auto-sanitized for verbatim mode (they error in raw FTS5 otherwise).
 
-### lcm_semantic_recall — pure embedding similarity
+### Note: pure-vector recall lives in `lcm_grep mode='semantic'` (Wave-12 consolidation)
 
-Standalone Voyage-embedding KNN with confidence bands. Cheaper than hybrid (no rerank).
-
-**Parameters:** `query`, `limit`, `sessionKey?`, `conversationId?`, `allConversations?`, `since?`, `before?`.
-
-**Returns** `details.hits[]` with `summaryId`, `conversationId`, `cosineSimilarity` (0..1, higher = more similar), `tokenCount`, `createdAt`, plus a top-level `confidenceBand` (`high` ≥0.65 / `medium` ≥0.5 / `low` ≥0.35 / `noise` <0.35 / `no-match`). When the band is `low`/`noise`/`no-match`, treat results as candidates, not answers.
+The standalone `lcm_semantic_recall` tool was removed and folded into `lcm_grep` as `mode='semantic'`. Same Voyage embed call, same confidence-band calibration, same output shape (`details.hits[]` with `cosineSimilarity` + top-level `confidenceBand`). Use `lcm_grep { pattern, mode: 'semantic', summaryKinds?: ['leaf'|'condensed'] }` for cost-cheap paraphrastic exploration without rerank.
 
 ### lcm_synthesize_around — fresh windowed synthesis
 
@@ -192,7 +188,6 @@ lcm_expand_query(summaryIds: ["sum_abc123"], prompt: "Show me the source leaves 
 | `lcm_grep` modes `regex`/`full_text`/`verbatim` | Free | <100ms | FTS5 sanitized + indexed |
 | `lcm_grep` mode `semantic` | ~$0.0002/query | ~400ms | Voyage embed only; capped 1×15s retry |
 | `lcm_grep` mode `hybrid` | ~$0.0005/query | ~800ms | Voyage embed + rerank; capped 1×15s × 2 calls |
-| `lcm_semantic_recall` | ~$0.0002/query | ~400ms | Same Voyage embed |
 | `lcm_get_entity` / `lcm_search_entities` | Free | <50ms | Pre-built catalog |
 | `lcm_synthesize_around` | LLM-backed | 5–30s | Cached by (session, range, leaves); 2nd identical call returns cached |
 | `lcm_expand_query` | LLM-backed | 30–120s | Sub-agent with bounded budget |

@@ -5,11 +5,12 @@
 LCM v4.1 — agent memory rebuild (replaces #516).
 
 **New agent tools** (8 total):
-- `lcm_grep` with new modes: `verbatim` (full message rows for citation/quote) and `semantic` (cheap embed-only). Hybrid mode now uses Voyage rerank for +52.5pp paraphrastic recall.
-- `lcm_semantic_recall` — pure semantic recall via Voyage embeddings.
+- `lcm_grep` with new modes: `verbatim` (full message rows for citation/quote), `semantic` (pure-vector KNN via Voyage; absorbs the prior `lcm_semantic_recall` surface — Wave-12 consolidation). Hybrid mode uses Voyage rerank for +52.5pp paraphrastic recall. `summaryKinds` filter scopes hits to `['leaf']` or `['condensed']`.
 - `lcm_synthesize_around` — time-anchored synthesis with three modes: `period` (yesterday/this-week/last-month/last-Nh/last-Nd, **timezone-aware**), `time` (±N hours around an anchor leaf), `semantic` (top-K most similar). Replaces v3 `lcm_recent`.
 - `lcm_describe` extended with `expandChildren` / `expandMessages` flags for one-hop drilldown without sub-agent delegation.
-- `lcm_get_entity` + `lcm_search_entities` — entity catalog tools (canonical names + mentions, scoped per session_key, suppressed-mention filtered).
+- `lcm_expand` (sub-agent only) + `lcm_expand_query` (delegated multi-hop drilldown).
+- `lcm_get_entity` + `lcm_search_entities` — entity catalog tools (canonical names + mentions, scoped per session_key, suppressed-mention filtered). `lcm_search_entities` supports browse-by-`entityType` with empty query.
+- `lcm_compact` — agent-triggered LCM compaction (Wave-14; opt-in via `agentCompactionToolEnabled`).
 
 **New schemas** (16 tables): per-model embedding tables (`lcm_embeddings_voyage4large`), embedding profile registry, synthesis cache + audit, prompt registry, entity catalog + mentions, extraction queue, worker locks, eval run tables, session-key audit. All migrations idempotent.
 

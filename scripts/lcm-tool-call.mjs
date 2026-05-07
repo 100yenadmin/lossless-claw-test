@@ -21,12 +21,8 @@
  *       NOTE: pass `allConversations: true` when running against a session
  *       key that has no resolved conversation (e.g. agent:main:main on a
  *       fresh snapshot) — otherwise the scope resolver returns no rows.
- *   - lcm_semantic_recall
- *       args: {query, limit?, conversationId?, allConversations?, since?,
- *              before?, summaryKinds?}
- *       NOTE: schema uses `allConversations: boolean` (NOT `scope`); there
- *       is NO `minScore` parameter. Distances are L2 floats; lower = more
- *       similar. Currently un-normalized → distances commonly >1.0 (P2 bug).
+ *   (note: standalone lcm_semantic_recall removed in Wave-12 SA — pure-vector
+ *    KNN now lives at lcm_grep mode='semantic' with the same shape)
  *   - lcm_synthesize_around (returns assembled source text only — no LLM call;
  *     the calling subagent should synthesize itself given the source)
  *   - lcm_describe (with expandChildren / expandMessages)
@@ -233,13 +229,7 @@ async function callTool() {
       tool = createLcmGrepTool({ deps, lcm: lcmEngine, sessionKey });
       break;
     }
-    case "lcm_semantic_recall": {
-      const { createLcmSemanticRecallTool } = await import(
-        `${process.cwd()}/src/tools/lcm-semantic-recall-tool.js`
-      );
-      tool = createLcmSemanticRecallTool({ deps, lcm: lcmEngine, sessionKey });
-      break;
-    }
+    // Wave-12 SA: lcm_semantic_recall removed; route via lcm_grep mode='semantic'.
     case "lcm_synthesize_around": {
       const { createLcmSynthesizeAroundTool } = await import(
         `${process.cwd()}/src/tools/lcm-synthesize-around-tool.js`

@@ -145,10 +145,21 @@ describe("token-state — inferTokenBudget", () => {
   it("infers 200K for sonnet-4-5", () => {
     expect(inferTokenBudget("anthropic", "claude-sonnet-4-5")).toBe(200_000);
   });
-  it("returns undefined for unknown providers", () => {
-    expect(inferTokenBudget("unknown-provider", "unknown-model")).toBeUndefined();
+  it("returns 200K conservative default for unknown providers (Wave-12 audit fix)", () => {
+    // Wave-12 audit (W1A1 P1): previously returned undefined for unknown
+    // models, which evaluateNeedsCompactGate treated as a bypass signal —
+    // gate was silently disabled for gpt-4 / gpt-4o / claude-3.x / o1 / Gemini /
+    // Mistral / Ollama. Now returns 200K conservative default so the gate
+    // protects every operator. Per-call MAX_RESULT_CHARS bounds worst case.
+    expect(inferTokenBudget("unknown-provider", "unknown-model")).toBe(200_000);
+    expect(inferTokenBudget("openai", "gpt-4")).toBe(200_000);
+    expect(inferTokenBudget("openai", "gpt-4o")).toBe(200_000);
+    expect(inferTokenBudget("anthropic", "claude-3-5-sonnet")).toBe(200_000);
+    expect(inferTokenBudget("openai", "o1-preview")).toBe(200_000);
   });
-  it("handles missing provider/model gracefully", () => {
-    expect(inferTokenBudget(undefined, undefined)).toBeUndefined();
+  it("handles missing provider/model gracefully (200K default)", () => {
+    // Wave-12 audit (W1A1 P1): missing provider/model also gets the default.
+    // The hook handler checks `!event.usage` upstream; this is the safety net.
+    expect(inferTokenBudget(undefined, undefined)).toBe(200_000);
   });
 });

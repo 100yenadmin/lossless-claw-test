@@ -139,9 +139,8 @@ v4 RAG-leak adversarial agent finding: themes in the assemble pyramid violate th
 | `/lcm health` | ✅ | F.02 |
 | `/lcm reconcile-session-keys` | ✅ | F.04 |
 | `/lcm eval` | ✅ | F.05 (recall only; quality judge primitive present, production wiring deferred) |
-| `lcm_semantic_recall` agent tool | ✅ | C.01b (returns empty until backfill runs) |
 | `lcm_grep --mode hybrid` | ✅ | C.02b (degrades to FTS-only without embeddings) |
-| `lcm_grep --mode semantic` | ✅ | NEW (Phase 2) — pure semantic, no rerank cost |
+| `lcm_grep --mode semantic` | ✅ | NEW (Phase 2 + Wave-12 consolidation) — pure semantic, no rerank cost; absorbs the previously-standalone `lcm_semantic_recall` surface (deleted in Wave-12 SA) |
 | `lcm_grep --mode verbatim` | ✅ | NEW (Phase 2) — full untruncated message rows; closes Type C verbatim gap |
 | `lcm_describe` extension (sessionKey + timeRange) | ✅ | C.05 |
 | `lcm_describe expandChildren / expandMessages flags` | ✅ | NEW (Phase 2) — one-hop main-agent expansion without delegating to sub-agent |
@@ -196,7 +195,7 @@ v4 RAG-leak adversarial agent finding: themes in the assemble pyramid violate th
 
 ## Debugging playbook
 
-### "lcm_semantic_recall returns 0 hits"
+### "lcm_grep mode='semantic' returns 0 hits" (was: lcm_semantic_recall, removed Wave-12 SA)
 
 ```sql
 -- Is vec0 loaded?

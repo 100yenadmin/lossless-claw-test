@@ -112,7 +112,7 @@ console.log(`**Leaves in this window:** ${leavesForWindow.cnt} leaves, ${leavesF
 console.log("");
 console.log("**Retrieval:**");
 console.log(
-  "- Each leaf gets a Voyage embedding → `lcm_semantic_recall(\"any topic\")` finds it across the whole corpus, not just this window.",
+  "- Each leaf gets a Voyage embedding → `lcm_grep({ pattern: \"any topic\", mode: \"semantic\" })` finds it across the whole corpus, not just this window.",
 );
 console.log(
   "- `lcm_grep --mode hybrid` does FTS5 + semantic + Voyage rerank merge. Eva's eval showed +52.5pp recall on paraphrastic queries vs FTS-only.",
@@ -155,7 +155,7 @@ console.log("| Storage | Pre-built rollup rows | Raw leaves (lossless) |");
 console.log("| Build cost | $0 per build, but built nightly | $0 until called |");
 console.log("| Per-call cost | $0 (read pre-built) | $0.005 (haiku) - $5 (yearly opus-thinking) |");
 console.log("| LLM used? | No (concatenation only) | Yes (per-tier model dispatch) |");
-console.log("| Cross-time topic search | Not supported | `lcm_semantic_recall`, `lcm_grep --mode hybrid` |");
+console.log("| Cross-time topic search | Not supported | `lcm_grep --mode semantic`, `lcm_grep --mode hybrid` |");
 console.log("| Hard-forget | Not supported | `runPurge` cascades through 7 read paths |");
 console.log("| Re-prompt without re-roll | Not supported | Yes — new prompt = new synthesis on next call |");
 

@@ -68,7 +68,7 @@ Every PR that touches LCM must show how it affects each test case below. PRs tha
 - **A4**: "What was happening around the time the rebase fix landed (commit `1081067476`)?"
 - **A5**: "Show me the work we did between the v2026.4.24 cut and the race-fix commit."
 
-### Type B — Topic-anchored (5/5 PRIMARY: lcm_grep --mode hybrid + lcm_semantic_recall)
+### Type B — Topic-anchored (5/5 PRIMARY: lcm_grep --mode hybrid + lcm_grep --mode semantic)
 
 - **B1**: "Have we ever discussed worker_threads heartbeat isolation?"
 - **B2**: "What work has been done on hybrid search rerank?"
@@ -111,13 +111,13 @@ The original 25 scenarios assumed the user already knows the canonical entity na
 
 - **F1**: "What kinds of entities have come up in our conversations?" (catalog-type browse — should reach for `lcm_search_entities` with no `entityType` filter, then summarize the type distribution)
 - **F2**: "I'm looking for that customer — the one with the VM issues, can't remember the exact name." (fuzzy-name lookup — should reach for `lcm_search_entities { query: 'VM', mode: 'like' }`)
-- **F3**: "Give me a vague summary of what I've been working on lately — don't need specifics." (cost-cheap exploration — could reach for `lcm_semantic_recall` with `summaryKinds: ['condensed']` for breadth, OR `lcm_synthesize_around` period='last-7-days')
+- **F3**: "Give me a vague summary of what I've been working on lately — don't need specifics." (cost-cheap exploration — could reach for `lcm_grep mode='semantic'` with `summaryKinds: ['condensed']` for breadth, OR `lcm_synthesize_around` period='last-7-days')
 - **F4**: "What PRs have we discussed?" (entity_type filter — `lcm_search_entities { entityType: 'pr_number' }`)
-- **F5**: "Find anything similar to 'lock TTL' in spirit, doesn't have to be precise — I just want to see related discussions." (paraphrastic exploration without keyword precision — `lcm_semantic_recall` niche, OR `lcm_grep mode='semantic'`)
+- **F5**: "Find anything similar to 'lock TTL' in spirit, doesn't have to be precise — I just want to see related discussions." (paraphrastic exploration without keyword precision — `lcm_grep mode='semantic'` niche)
 
-These five fill a gap the original 25 didn't exercise: scenarios where the user genuinely doesn't have the canonical handle and needs to browse/discover first. They specifically test whether `lcm_search_entities` and `lcm_semantic_recall` are reachable when the question shape favors them.
+These five fill a gap the original 25 didn't exercise: scenarios where the user genuinely doesn't have the canonical handle and needs to browse/discover first. They specifically test whether `lcm_search_entities` and `lcm_grep mode='semantic'` are reachable when the question shape favors them.
 
-**Note**: F-scenarios are exploratory tests, not yet baked into `scripts/v41-qa-runner.mjs`. Use them in reach-for analysis to validate description-level discoverability.
+**Note**: F-scenarios are baked into `scripts/v41-qa-runner.mjs` as `full-F1`-`full-F5` cases (severity: `important`). They also continue to support reach-for analysis for description-level discoverability validation.
 
 ### Coverage summary
 

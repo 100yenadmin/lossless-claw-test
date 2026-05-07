@@ -144,7 +144,7 @@ flowchart LR
     Q[Agent's question]
     Q --> A{What kind?}
     A -->|Time-anchored<br/>'yesterday' / 'last week'| TA[lcm_synthesize_around<br/>period mode]
-    A -->|Topic-anchored<br/>'discussed X?'| TB[lcm_grep --mode hybrid<br/>OR lcm_semantic_recall]
+    A -->|Topic-anchored<br/>'discussed X?'| TB[lcm_grep --mode hybrid<br/>OR lcm_grep --mode semantic]
     A -->|Verbatim<br/>'exact wording'| TC[lcm_grep --mode verbatim]
     A -->|Pattern entity<br/>'history of X'| TD[lcm_get_entity<br/>+ lcm_search_entities]
     A -->|Drilldown<br/>'where did this come from?'| TE[lcm_describe<br/>+ lcm_expand_query]
@@ -274,9 +274,9 @@ await lcm_grep({
 // Returns ranked hits with cosineSimilarity, confidenceBand, ftsRank
 ```
 
-### `lcm_semantic_recall` — pure semantic search
+### `lcm_grep mode='semantic'` — pure semantic search (Wave-12 consolidation)
 
-Same cost profile as `lcm_grep --mode semantic` (~$0.0001/query); kept as a distinct tool for clarity. Returns ranked snippets with `cosineSimilarity` + `confidenceBand`.
+Pure-vector KNN via Voyage embed (no rerank). Cheaper than `mode='hybrid'` (~$0.0001/query). Returns `details.hits[]` with `cosineSimilarity` + top-level `confidenceBand`. Originally lived in a standalone `lcm_semantic_recall` tool; consolidated into `lcm_grep` because reach-for analysis showed agents always picked grep first regardless. The `summaryKinds: ['leaf'|'condensed']` filter (previously recall-only) is now plumbed through both `mode='semantic'` and `mode='hybrid'`.
 
 ### `lcm_synthesize_around` — time-anchored synthesis (the `lcm_recent` replacement)
 
@@ -407,7 +407,7 @@ A year of heavy use is ~$5-10 in Voyage costs. Not a budget concern.
 | Voyage embedding backfill (4187 leaves) | ~$1 | n/a |
 | New leaf embedding | n/a | ~$0.000045/leaf |
 | `lcm_grep --mode hybrid` (per query) | n/a | ~$0.001 |
-| `lcm_grep --mode semantic` / `lcm_semantic_recall` | n/a | ~$0.0001 |
+| `lcm_grep --mode semantic` (incl. consolidated recall surface) | n/a | ~$0.0001 |
 | `lcm_grep --mode verbatim` / `regex` / `full_text` | n/a | $0 (DB only) |
 | Daily synthesis (haiku-4-5) | n/a | ~$0.005 |
 | Weekly synthesis (sonnet-4-5) | n/a | ~$0.05 |

@@ -13,7 +13,8 @@
  *   3. Registers voyage-4-large + ensureEmbeddingsTable
  *   4. Runs ONE backfill tick (perTickLimit=20 to keep cost low)
  *   5. Validates retrieval against the freshly-embedded slice:
- *        - lcm_semantic_recall: query "rebase" → expect any hits
+ *        - lcm_grep --mode semantic: query "rebase" → expect any hits
+ *          (was lcm_semantic_recall pre Wave-12 SA — same Voyage path)
  *        - lcm_grep --mode hybrid: query "rebase" → expect any hits
  *        - Suppression filter: suppress one leaf, verify it's hidden
  *   6. Emits a verdict report (PASS / FAIL with diagnostics)
@@ -169,7 +170,10 @@ async function main() {
   expect(backfill.voyageTokensConsumed > 0, `Voyage tokens consumed: ${backfill.voyageTokensConsumed}`);
 
   // ── Semantic recall validation ────────────────────────────────────
-  log("Validating lcm_semantic_recall...");
+  // Wave-12 SA: this calls runSemanticSearch directly (not the agent
+  // tool), which still backs `lcm_grep mode='semantic'`. Renamed log
+  // line to reflect the new tool surface.
+  log("Validating lcm_grep mode='semantic' (via runSemanticSearch)...");
   const semHits = await runSemanticSearch(db, {
     query: "rebase plan-mode openclaw",
     voyageMaxRetries: 1,
