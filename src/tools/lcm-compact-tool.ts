@@ -209,10 +209,20 @@ export function createLcmCompactTool(input: {
   getLcm?: () => Promise<LcmContextEngine>;
   sessionId?: string;
   sessionKey?: string;
-  /** Live runtime-context provider — operator-supplied. */
+  /**
+   * Live runtime-context provider. Wired to `getTokenStateRuntimeContext`
+   * in `src/plugin/index.ts` (Wave-14) — pulls the cached current token
+   * count + budget populated by the `llm_output` hook handler.
+   *
+   * Returns undefined fields when no LLM call has fired yet for this
+   * session. The tool tolerates undefined and skips token-aware logic
+   * (floor check) in that case — equivalent to "operator hasn't wired
+   * runtime telemetry yet."
+   */
   getRuntimeContext?: () => {
     currentTokenCount?: number;
     tokenBudget?: number;
+    /** sessionFile passthrough (deprecated — use deps/runtime resolution). */
     sessionFile?: string;
   };
 }): AnyAgentTool {

@@ -22,6 +22,11 @@ import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
 import { createLcmGetEntityTool } from "../tools/lcm-get-entity-tool.js";
 import { createLcmSearchEntitiesTool } from "../tools/lcm-search-entities-tool.js";
 import { createLcmCompactTool } from "../tools/lcm-compact-tool.js";
+import {
+  recordLlmOutput,
+  inferTokenBudget,
+  getRuntimeContext as getTokenStateRuntimeContext,
+} from "./token-state.js";
 import { createLcmSemanticRecallTool } from "../tools/lcm-semantic-recall-tool.js";
 import { createLcmSynthesizeAroundTool } from "../tools/lcm-synthesize-around-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
@@ -2361,6 +2366,20 @@ function wirePluginHandlers(
   deps: LcmDependencies,
   shared: SharedLcmInit,
 ): void {
+  // Wave-14: subscribe to llm_output to feed the per-session token-state
+  // cache. Tool factories then close over this cache via
+  // `getTokenStateRuntimeContext(sessionKey)` to learn live context state
+  // at execute() time. See src/plugin/token-state.ts for the contract.
+  api.on("llm_output", async (event, ctx) => {
+    const sessionKey = ctx.sessionKey ?? event.sessionId;
+    if (!sessionKey || !event.usage) return;
+    recordLlmOutput({
+      sessionKey,
+      usage: event.usage,
+      tokenBudget: inferTokenBudget(event.provider, event.model),
+    });
+  });
+
   api.on("before_reset", async (event, ctx) => {
     await (await shared.waitForEngine()).handleBeforeReset({
       reason: event.reason,
@@ -2441,6 +2460,10 @@ function wirePluginHandlers(
         getLcm: shared.waitForEngine,
         sessionId: ctx.sessionId,
         sessionKey: ctx.sessionKey,
+        // Wave-14: wire the live token-state cache. Was previously vapor —
+        // factory declared the callback but registration never passed one.
+        // Now feeds real currentTokenCount + tokenBudget from llm_output hook.
+        getRuntimeContext: () => getTokenStateRuntimeContext(ctx.sessionKey),
       }),
     { name: "lcm_compact" },
   );
