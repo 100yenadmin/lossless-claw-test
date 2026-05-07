@@ -9,8 +9,7 @@ import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 import { formatTimestamp } from "../compaction.js";
-import { evaluateNeedsCompactGate } from "../plugin/needs-compact-gate.js";
-import { tapResultForTokenAccounting } from "../plugin/token-state.js";
+import { runWithTokenGate } from "../plugin/needs-compact-gate.js";
 
 function formatDisplayTime(
   value: Date | string | number | null | undefined,
@@ -123,20 +122,19 @@ export function createLcmDescribeTool(input: {
       "and (with expand flags) one-hop child/message detail.",
     parameters: LcmDescribeSchema,
     async execute(_toolCallId, params) {
-      // Wave-14 needsCompact gate: refuse with structured payload if the
-      // projected result size would push context past REFUSAL_THRESHOLD.
-      // Bypass when no runtime telemetry is available yet.
-      const runtimeCtx = input.getRuntimeContext?.();
-      if (runtimeCtx) {
-        const refusal = evaluateNeedsCompactGate({
-          toolName: "lcm_describe",
-          toolParams: params as Record<string, unknown>,
-          currentTokenCount: runtimeCtx.currentTokenCount,
-          tokenBudget: runtimeCtx.tokenBudget,
-        });
-        if (refusal) return tapResultForTokenAccounting(input.sessionKey, jsonResult(refusal));
-      }
-
+      // Wave-12 reviewer F5 fix: migrated from inline gate + hand-written
+      // taps to `runWithTokenGate` wrapper. Pre-fix, the file had THREE
+      // return paths (summary at line 661, file at 707, fallthrough at
+      // 713) but only the early refusal + fallthrough were tapped — the
+      // two largest emitters silently skipped accounting. The wrapper
+      // funnels every return through a single tap exit, structurally
+      // eliminating the antipattern.
+      return runWithTokenGate({
+        toolName: "lcm_describe",
+        toolParams: params as Record<string, unknown>,
+        sessionKey: input.sessionKey,
+        getRuntimeContext: input.getRuntimeContext,
+        inner: async () => {
       const lcm = input.lcm ?? (await input.getLcm?.());
       if (!lcm) {
         throw new Error("LCM engine is unavailable.");
@@ -710,7 +708,9 @@ export function createLcmDescribeTool(input: {
         };
       }
 
-      return tapResultForTokenAccounting(input.sessionKey, jsonResult(result));
+      return jsonResult(result);
+        },  // close inner: async () => { ... }
+      });   // close runWithTokenGate({ ... })
     },
   };
 }
