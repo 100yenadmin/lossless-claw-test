@@ -7465,12 +7465,17 @@ describe("LcmContextEngine fidelity and token budget", () => {
       threshold: 300,
     });
 
+    // tokenBudget chosen so 480/budget < 0.70 (criticalBudgetPressureRatio).
+    // At critical pressure the Wave-14 sync drain fires and leaves
+    // pending=false; this test pins the deferred-async path, so we keep ratio
+    // below the critical threshold (480/1_000 = 0.48 < 0.70). The
+    // sync-at-critical behavior has its own dedicated test.
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("after-turn-threshold-deferred-compaction-debt"),
       messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
       prePromptMessageCount: 0,
-      tokenBudget: 400,
+      tokenBudget: 1_000,
     });
 
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
@@ -7481,7 +7486,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(maintenance?.pending).toBe(true);
     expect(maintenance?.running).toBe(false);
     expect(maintenance?.reason).toBe("threshold");
-    expect(maintenance?.tokenBudget).toBe(400);
+    expect(maintenance?.tokenBudget).toBe(1_000);
   });
 
   it("afterTurn schedules a deferred drain even when compactionTelemetry has no provider/model (D4)", async () => {

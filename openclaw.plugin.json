@@ -308,9 +308,6 @@
       "dbPath": {
         "type": "string"
       },
-      "largeFilesDir": {
-        "type": "string"
-      },
       "ignoreSessionPatterns": {
         "type": "array",
         "items": {

@@ -313,10 +313,14 @@ export function parsePeriodShortcut(
       label: "yesterday",
     };
   }
-  if (period === "this-week") {
-    // ISO week: Monday = day 1. Compute day-of-week in the target tz by
-    // checking which weekday `localMidnight` (which IS local-today's
-    // midnight) corresponds to.
+  // Wave-12 reviewer P2 fix: weekly periods previously used fixed
+  // dayMs = 24h * 3600_000 arithmetic, which is wrong on the weeks
+  // containing DST transitions (week is 167h or 169h, not 168h). We now
+  // overshoot by ±12h then snap with `getLocalDayStartUtc`, mirroring
+  // the today/yesterday pattern. ±12h buffer absorbs the ±1h DST shift.
+  const HALF_DAY_MS = 12 * 3600_000;
+  const DAY_MS = dayMs;
+  const computeDow = (): number => {
     const weekdayFmt = new Intl.DateTimeFormat("en-US", {
       timeZone: timezone,
       weekday: "short",
@@ -325,22 +329,37 @@ export function parsePeriodShortcut(
     const dowMap: Record<string, number> = {
       Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7,
     };
-    const dow = dowMap[weekdayName] ?? 1;
-    const monday = new Date(localMidnight.getTime() - (dow - 1) * dayMs);
-    return { since: monday, before: new Date(monday.getTime() + 7 * dayMs), label: "this-week" };
+    return dowMap[weekdayName] ?? 1;
+  };
+  if (period === "this-week") {
+    // ISO week: Monday = day 1. Land at this-Monday-noon (overshoot
+    // by 12h) then snap to local-midnight to absorb DST shift.
+    const dow = computeDow();
+    const offsetToMondayMs = (dow - 1) * DAY_MS - HALF_DAY_MS;
+    const monday = getLocalDayStartUtc(
+      new Date(localMidnight.getTime() - offsetToMondayMs),
+      timezone,
+    );
+    // Next Monday: +7 days, overshoot +12h, snap.
+    const nextMonday = getLocalDayStartUtc(
+      new Date(monday.getTime() + 7 * DAY_MS + HALF_DAY_MS),
+      timezone,
+    );
+    return { since: monday, before: nextMonday, label: "this-week" };
   }
   if (period === "last-week") {
-    const weekdayFmt = new Intl.DateTimeFormat("en-US", {
-      timeZone: timezone,
-      weekday: "short",
-    });
-    const weekdayName = weekdayFmt.format(localMidnight);
-    const dowMap: Record<string, number> = {
-      Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7,
-    };
-    const dow = dowMap[weekdayName] ?? 1;
-    const thisMonday = new Date(localMidnight.getTime() - (dow - 1) * dayMs);
-    const lastMonday = new Date(thisMonday.getTime() - 7 * dayMs);
+    const dow = computeDow();
+    const offsetToMondayMs = (dow - 1) * DAY_MS - HALF_DAY_MS;
+    const thisMonday = getLocalDayStartUtc(
+      new Date(localMidnight.getTime() - offsetToMondayMs),
+      timezone,
+    );
+    // Last Monday: 7 local-days before this-Monday. Use -156h
+    // (7*24-12) so we always land in the target local-day.
+    const lastMonday = getLocalDayStartUtc(
+      new Date(thisMonday.getTime() - 7 * DAY_MS + HALF_DAY_MS),
+      timezone,
+    );
     return { since: lastMonday, before: thisMonday, label: "last-week" };
   }
   if (period === "this-month") {
