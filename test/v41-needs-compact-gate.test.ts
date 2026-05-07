@@ -25,12 +25,18 @@ describe("estimateResultTokens — empirical formulas (Wave-14 Agent C calibrati
     expect(t).toBe(10_000);  // hits HARD_CAP_TOKENS
   });
 
-  it("lcm_describe expandMessages=true expandMessagesLimit=20 estimates ~13K tokens (capped)", () => {
+  it("lcm_describe expandMessages=true expandMessagesLimit=20 estimates ~4K tokens (Wave-12 F2 recalibration)", () => {
+    // Wave-12 reviewer F2: live-DB validation showed real
+    // expandMessages=20 emits 2,551–3,604 tokens, not 12-13K.
+    // Estimator recalibrated from 600 chars/msg to ~150 tokens/msg
+    // (600 chars/msg). New estimate: (350 + 1250 + 3200 + 20*600) / 4
+    // = 4200 tokens. No longer hits HARD_CAP.
     const t = estimateResultTokens("lcm_describe", {
       expandMessages: true,
       expandMessagesLimit: 20,
     });
-    expect(t).toBe(10_000);  // capped
+    expect(t).toBeGreaterThanOrEqual(3_500);
+    expect(t).toBeLessThanOrEqual(5_000);
   });
 
   it("lcm_describe with no expand flags is small", () => {
@@ -72,10 +78,13 @@ describe("evaluateNeedsCompactGate — refusal logic", () => {
   });
 
   it("refuses when projected ratio exceeds threshold", () => {
+    // Wave-12 F2: estimator recalibrated; expandMessages=20 now ~4200 tokens
+    // (was 10K). To trip 0.92 from 184K anchor, projected = 184K + 4200 =
+    // 188.2K / 200K = 0.941 > 0.92 ✓
     const result = evaluateNeedsCompactGate({
       toolName: "lcm_describe",
-      toolParams: { expandMessages: true, expandMessagesLimit: 20 },  // capped 10K
-      currentTokenCount: 184_000,  // already at 92%
+      toolParams: { expandMessages: true, expandMessagesLimit: 20 },
+      currentTokenCount: 184_000,
       tokenBudget: 200_000,
     });
     expect(result).not.toBeNull();
@@ -85,6 +94,8 @@ describe("evaluateNeedsCompactGate — refusal logic", () => {
   });
 
   it("refusal includes contextRatio + projectedRatio", () => {
+    // Wave-12 F2 recalibration: expandMessages=20 → ~4200 tokens.
+    // currentRatio=185K/200K=0.925; projected=189.2K/200K=0.946.
     const result = evaluateNeedsCompactGate({
       toolName: "lcm_describe",
       toolParams: { expandMessages: true, expandMessagesLimit: 20 },
@@ -92,8 +103,9 @@ describe("evaluateNeedsCompactGate — refusal logic", () => {
       tokenBudget: 200_000,
     });
     expect(result?.currentRatio).toBeCloseTo(0.925, 2);
-    expect(result?.projectedRatio).toBeCloseTo(0.975, 2);
-    expect(result?.estimatedResultTokens).toBe(10_000);
+    expect(result?.projectedRatio).toBeCloseTo(0.946, 2);
+    expect(result?.estimatedResultTokens).toBeGreaterThanOrEqual(3_500);
+    expect(result?.estimatedResultTokens).toBeLessThanOrEqual(5_000);
   });
 
   it("refusal suggests narrowing for tools with limit", () => {
@@ -175,10 +187,13 @@ describe("evaluateNeedsCompactGate — boundary cases", () => {
   });
 
   it("refuses just over threshold", () => {
+    // Wave-12 F2 recalibration: expandMessages=20 → ~4200 tokens.
+    // To trip 0.92 from a "just over" anchor: 184_000 + 4200 = 188.2K /
+    // 200K = 0.941. Was previously calibrated for 10K estimator output.
     const result = evaluateNeedsCompactGate({
       toolName: "lcm_describe",
-      toolParams: { expandMessages: true, expandMessagesLimit: 20 },  // 10K
-      currentTokenCount: 175_000,  // 87.5%; +5% = 92.5% (over)
+      toolParams: { expandMessages: true, expandMessagesLimit: 20 },
+      currentTokenCount: 184_000,  // 92.0%; +4200 → 94.1%
       tokenBudget: 200_000,
     });
     expect(result).not.toBeNull();
