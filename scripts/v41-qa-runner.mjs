@@ -418,6 +418,13 @@ const SUITES = {
       // own content as the query — guarantees the test can pass when
       // semantic recall is working, fails only when it's actually broken.
       args: () => {
+        // Wave-12 audit fix: previously picked the latest embedded leaf
+        // by mtime alone. When that leaf was an `[LCM fallback summary —
+        // model unavailable]` (summarizer was down when it was written),
+        // its embedding has no specific semantic neighbors in a tight
+        // ±1h window, so this test always returned 0 hits regardless of
+        // the semantic pipeline being healthy. Filter out fallback
+        // leaves so the seed has real content to anchor the test.
         const seed = db
           .prepare(
             `SELECT s.summary_id, s.content, s.latest_at
@@ -425,6 +432,8 @@ const SUITES = {
                JOIN lcm_embedding_meta m
                  ON m.embedded_id = s.summary_id AND m.embedded_kind='summary' AND m.archived = 0
                WHERE s.kind='leaf' AND s.suppressed_at IS NULL
+                 AND s.content NOT LIKE '[LCM fallback summary%'
+                 AND length(s.content) > 200
                ORDER BY s.latest_at DESC
                LIMIT 1`,
           )
