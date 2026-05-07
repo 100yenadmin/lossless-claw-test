@@ -15,9 +15,10 @@
  *
  * REFUSAL_THRESHOLD = 0.92 (calibrated from real DB sampling, Wave-14
  * Agent A). With 200K context × 0.05 cushion (the 0.95 alternative)
- * = 10K headroom — but every tool's hard cap IS 10K tokens (per
- * MAX_RESULT_CHARS / 4). A single capped call leaves zero margin.
- * 0.92 → 16K headroom = one full-cap call + agent's own response.
+ * = 10K headroom — but every tool's hard cap IS up to MAX_RESULT_TOKENS
+ * (default 10K, operator-tunable via `LCM_TOOL_RESULT_TOKEN_BUDGET`).
+ * A single capped call leaves zero margin. 0.92 → 16K headroom = one
+ * full-cap call + agent's own response (at the default cap).
  *
  * # Tools that use this
  *
@@ -42,14 +43,22 @@ export const REFUSAL_THRESHOLD = 0.92;
 /**
  * Per-tool result-token estimator. Math from Wave-14 Agent C
  * (calibrated against actual format strings + Agent A's live-DB
- * distributions). Capped at 10_000 tokens (the MAX_RESULT_CHARS
- * default of 40K chars / 4). Confidence per tool varies from ~88-95%.
+ * distributions). Capped at MAX_RESULT_TOKENS (default 10_000 tokens /
+ * ~40K chars; operator-tunable via `LCM_TOOL_RESULT_TOKEN_BUDGET`).
+ * Wave-12 audit W1A1 #2: the cap now tracks the env knob instead of
+ * being hard-coded at 10_000 — previously, raising the env from 10K
+ * to e.g. 30K let tools emit 30K but the estimator still capped its
+ * projection at 10K, drifting needsCompact decisions low (refusals
+ * missed when they should fire).
+ * Confidence per tool varies from ~88-95%.
  */
 export function estimateResultTokens(
   toolName: string,
   params: Record<string, unknown>,
 ): number {
-  const HARD_CAP_TOKENS = 10_000;  // matches MAX_RESULT_CHARS / 4
+  // Pulled from result-budget.ts so this estimator and per-tool
+  // MAX_RESULT_CHARS truncation share one knob.
+  const HARD_CAP_TOKENS = MAX_RESULT_TOKENS;
   const limit = typeof params.limit === "number" ? params.limit : 20;
   const charsPerToken = 4;
 
@@ -264,6 +273,7 @@ export function evaluateNeedsCompactGate(params: {
  */
 import { tapResultForTokenAccounting } from "./token-state.js";
 import { jsonResult } from "../tools/common.js";
+import { MAX_RESULT_TOKENS } from "./result-budget.js";
 
 export async function runWithTokenGate<
   T extends { content?: Array<{ type?: string; text?: string }> },

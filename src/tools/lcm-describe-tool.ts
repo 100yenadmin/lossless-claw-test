@@ -10,6 +10,39 @@ import { jsonResult } from "./common.js";
 import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 import { formatTimestamp } from "../compaction.js";
 import { runWithTokenGate } from "../plugin/needs-compact-gate.js";
+import { MAX_RESULT_CHARS, truncationNotice } from "../plugin/result-budget.js";
+
+/**
+ * Wave-12 audit (W1A8 #3): describe was previously unbounded — a single
+ * `describe(condensed_id, expandChildren=true)` against a wide condensed
+ * could emit ~210K tokens (10K base + 20×10K children). The estimator's
+ * needsCompact gate caught the worst cases via projection, but a tool
+ * that genuinely needed to emit large amounts under the gate's threshold
+ * still had no per-tool char cap. Mirror lcm_grep's truncation policy:
+ * cap the joined output at MAX_RESULT_CHARS and append a clear notice
+ * when we trim. Sub-agent grant ledger (consumeTokenBudget below) is a
+ * separate enforcement layer for delegated sessions; this is the main-
+ * agent equivalent.
+ */
+function truncateLinesToCap(
+  lines: string[],
+  reasonHint: string,
+): { text: string; truncated: boolean } {
+  let total = 0;
+  const out: string[] = [];
+  for (const line of lines) {
+    // +1 for the newline that join("\n") will insert between lines.
+    const next = total + line.length + (out.length > 0 ? 1 : 0);
+    if (next > MAX_RESULT_CHARS) {
+      out.push("");
+      out.push(truncationNotice(reasonHint));
+      return { text: out.join("\n"), truncated: true };
+    }
+    out.push(line);
+    total = next;
+  }
+  return { text: out.join("\n"), truncated: false };
+}
 
 function formatDisplayTime(
   value: Date | string | number | null | undefined,
@@ -656,8 +689,12 @@ export function createLcmDescribeTool(input: {
           }
         }
 
+        const trimmed = truncateLinesToCap(
+          lines,
+          "lower expandChildrenLimit / expandMessagesLimit, or request a narrower id",
+        );
         return {
-          content: [{ type: "text", text: lines.join("\n") }],
+          content: [{ type: "text", text: trimmed.text }],
           details: {
             ...result,
             manifest: {
@@ -669,6 +706,7 @@ export function createLcmDescribeTool(input: {
                     ? "delegated_grant_remaining"
                     : "config_default",
               nodes: manifestNodes,
+              truncated: trimmed.truncated,
             },
             expansion: {
               children: expandedChildren,
@@ -702,9 +740,13 @@ export function createLcmDescribeTool(input: {
           lines.push("*No exploration summary available.*");
         }
 
+        const trimmed = truncateLinesToCap(
+          lines,
+          "the file's exploration summary is large; trim externally if needed",
+        );
         return {
-          content: [{ type: "text", text: lines.join("\n") }],
-          details: result,
+          content: [{ type: "text", text: trimmed.text }],
+          details: { ...result, truncated: trimmed.truncated },
         };
       }
 

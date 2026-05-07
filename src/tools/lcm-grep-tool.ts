@@ -17,18 +17,14 @@ import {
 import { VoyageError } from "../voyage/client.js";
 import { containsCjk } from "../store/full-text-fallback.js";
 import { runWithTokenGate } from "../plugin/needs-compact-gate.js";
+import { MAX_RESULT_CHARS, truncationNotice } from "../plugin/result-budget.js";
 
 // Tool-result hard cap — protects against back-to-back tool calls
-// blowing out the agent's context window. Operators tune via env;
-// default 10K tokens (~40K chars) preserves prior behavior. Lower
-// during testing or for cost-sensitive deployments.
-function resolveMaxResultChars(): number {
-  const raw = process.env.LCM_TOOL_RESULT_TOKEN_BUDGET?.trim();
-  const parsed = raw ? Number.parseInt(raw, 10) : NaN;
-  const tokens = Number.isFinite(parsed) && parsed > 0 ? parsed : 10_000;
-  return Math.max(2_000, tokens) * 4;  // floor: 8K chars (~2K tokens) — anything less makes the tool useless
-}
-const MAX_RESULT_CHARS = resolveMaxResultChars();
+// blowing out the agent's context window. Operators tune via the
+// `LCM_TOOL_RESULT_TOKEN_BUDGET` env var (default 10K tokens / ~40K chars).
+// Wave-12 audit (W1A1 #2 + W1A8 #3): MAX_RESULT_CHARS now lives in
+// `src/plugin/result-budget.ts` so the needs-compact gate's HARD_CAP
+// estimator and per-tool char cap stay in lockstep.
 
 function formatDisplayTime(
   value: Date | string | number | null | undefined,

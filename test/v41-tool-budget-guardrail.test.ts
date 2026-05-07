@@ -272,6 +272,170 @@ describe("LCM_SUMMARY_MODEL — env-driven default reaches the LLM call boundary
   });
 });
 
+// ───────────────────────────────────────────────────────────────────
+// W1A1 #2 + W1A8 #3 — env knob propagates to BOTH the per-tool char
+// cap AND the estimator's HARD_CAP_TOKENS. Previously the estimator
+// was hard-coded at 10_000, so raising the env knob to e.g. 30_000
+// let tools emit 30K but the gate's projection still capped at 10K
+// (underestimator drift up to 3×). After Wave-12 audit fix, both
+// pull from src/plugin/result-budget.ts.
+// ───────────────────────────────────────────────────────────────────
+
+describe("LCM_TOOL_RESULT_TOKEN_BUDGET — estimator HARD_CAP tracks env knob", () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it("env=30000 raises MAX_RESULT_TOKENS so the estimator's projection ceiling rises with it", async () => {
+    vi.stubEnv("LCM_TOOL_RESULT_TOKEN_BUDGET", "30000");
+    vi.resetModules();
+    const { MAX_RESULT_TOKENS, MAX_RESULT_CHARS } = await import(
+      "../src/plugin/result-budget.js"
+    );
+    expect(MAX_RESULT_TOKENS).toBe(30_000);
+    expect(MAX_RESULT_CHARS).toBe(120_000);
+
+    // Behavioral: estimator must surface the raised cap as the
+    // saturation ceiling. Pass params that — at the previous hard-coded
+    // 10_000 cap — would have saturated the estimator. After the fix,
+    // the projection rises to a value higher than 10_000, proving the
+    // cap is no longer the floor.
+    const { estimateResultTokens } = await import(
+      "../src/plugin/needs-compact-gate.js"
+    );
+    // Verbatim mode at limit=20 = 20 × 2400 chars = 48_000 chars
+    // = 12_000 tokens at 4 chars/token. Pre-fix: capped at 10_000.
+    // Post-fix: cap is now 30_000, so 12_000 surfaces unmolested.
+    const projection = estimateResultTokens("lcm_grep", {
+      mode: "verbatim",
+      limit: 20,
+    });
+    expect(projection).toBeGreaterThan(10_000);
+    expect(projection).toBeLessThanOrEqual(30_000);
+  });
+
+  it("env unset uses default MAX_RESULT_TOKENS=10_000", async () => {
+    vi.stubEnv("LCM_TOOL_RESULT_TOKEN_BUDGET", "");
+    vi.resetModules();
+    const { MAX_RESULT_TOKENS } = await import("../src/plugin/result-budget.js");
+    expect(MAX_RESULT_TOKENS).toBe(10_000);
+  });
+
+  it("env below 2000-token floor clamps UP to floor", async () => {
+    vi.stubEnv("LCM_TOOL_RESULT_TOKEN_BUDGET", "100");
+    vi.resetModules();
+    const { MAX_RESULT_TOKENS } = await import("../src/plugin/result-budget.js");
+    expect(MAX_RESULT_TOKENS).toBe(2_000);
+  });
+
+  it("non-numeric env value falls back to default 10_000", async () => {
+    vi.stubEnv("LCM_TOOL_RESULT_TOKEN_BUDGET", "garbage");
+    vi.resetModules();
+    const { MAX_RESULT_TOKENS } = await import("../src/plugin/result-budget.js");
+    expect(MAX_RESULT_TOKENS).toBe(10_000);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────
+// W1A8 #3 — lcm_describe was unbounded; a single
+// describe(condensed_id, expandChildren=true) on a wide condensed
+// could emit 200K+ tokens. Cap mirrors lcm_grep's truncation policy.
+// ───────────────────────────────────────────────────────────────────
+
+describe("lcm_describe — MAX_RESULT_CHARS truncation (W1A8 #3)", () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it("describe truncates at MAX_RESULT_CHARS and emits the standard notice", async () => {
+    // Tight env=2000 (floor) → MAX_RESULT_CHARS=8000. Build a leaf with
+    // ~30K chars of content; describe must clamp under 10K with the notice.
+    vi.stubEnv("LCM_TOOL_RESULT_TOKEN_BUDGET", "2000");
+    vi.resetModules();
+
+    const { DatabaseSync } = await import("node:sqlite");
+    const { runLcmMigrations } = await import("../src/db/migration.js");
+    const { createLcmDescribeTool } = await import(
+      "../src/tools/lcm-describe-tool.js"
+    );
+    const { makeTestEngine } = await import("./fixtures/v41-tool-harness.js");
+
+    const db = new DatabaseSync(":memory:");
+    runLcmMigrations(db, { fts5Available: false, seedDefaultPrompts: false });
+    db.prepare(
+      `INSERT INTO conversations (conversation_id, session_id, session_key, active) VALUES (1, 'sess', 'agent:main:main', 1)`,
+    ).run();
+    // 30_000-char leaf content (~7500 tokens) — easily exceeds 8K char floor.
+    const big = "X".repeat(30_000);
+    db.prepare(
+      `INSERT INTO summaries (summary_id, conversation_id, kind, content, token_count, session_key, created_at)
+         VALUES ('sum_big', 1, 'leaf', ?, 7500, 'agent:main:main', '2026-01-01T00:00:00Z')`,
+    ).run(big);
+
+    const tool = createLcmDescribeTool({
+      deps: makeTestDeps(),
+      lcm: makeTestEngine(db),
+      sessionKey: "agent:main:main",
+    });
+    const r = await tool.execute("test-truncate", { id: "sum_big" });
+    const text = r.content[0]?.type === "text" ? r.content[0].text : "";
+    // Behavioral assertion: response must be bounded near the 8K floor
+    // (with ~500 char overhead for header lines + truncation notice).
+    expect(text.length).toBeLessThan(10_000);
+    // Behavioral assertion: the truncation marker MUST appear — if a
+    // refactor deletes truncateLinesToCap, this assertion fails.
+    expect(text).toMatch(/truncated at ~\d+ tokens to protect agent context/);
+
+    db.close();
+  });
+
+  it("describe under-budget emits the full content without the notice", async () => {
+    // Default env (10K token cap = 40K char cap) is plenty for a small leaf.
+    vi.stubEnv("LCM_TOOL_RESULT_TOKEN_BUDGET", "");
+    vi.resetModules();
+
+    const { DatabaseSync } = await import("node:sqlite");
+    const { runLcmMigrations } = await import("../src/db/migration.js");
+    const { createLcmDescribeTool } = await import(
+      "../src/tools/lcm-describe-tool.js"
+    );
+    const { makeTestEngine } = await import("./fixtures/v41-tool-harness.js");
+
+    const db = new DatabaseSync(":memory:");
+    runLcmMigrations(db, { fts5Available: false, seedDefaultPrompts: false });
+    db.prepare(
+      `INSERT INTO conversations (conversation_id, session_id, session_key, active) VALUES (1, 'sess', 'agent:main:main', 1)`,
+    ).run();
+    db.prepare(
+      `INSERT INTO summaries (summary_id, conversation_id, kind, content, token_count, session_key, created_at)
+         VALUES ('sum_small', 1, 'leaf', 'small content here', 5, 'agent:main:main', '2026-01-01T00:00:00Z')`,
+    ).run();
+
+    const tool = createLcmDescribeTool({
+      deps: makeTestDeps(),
+      lcm: makeTestEngine(db),
+      sessionKey: "agent:main:main",
+    });
+    const r = await tool.execute("test-untruncated", { id: "sum_small" });
+    const text = r.content[0]?.type === "text" ? r.content[0].text : "";
+    // Negative assertion: well under the cap, no truncation marker.
+    expect(text).not.toMatch(/truncated at ~\d+ tokens to protect agent context/);
+    expect(text).toContain("small content here");
+
+    db.close();
+  });
+});
+
 describe("lcm_get_entity — fallback hints when not found", () => {
   it("missing entity result includes concrete fallback suggestions", async () => {
     // Wire up a minimal in-memory DB so the tool can query without crashing.
