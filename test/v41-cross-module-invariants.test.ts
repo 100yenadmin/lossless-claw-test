@@ -65,6 +65,57 @@ describe("cross-module invariant — needs-compact-gate's HARD_CAP equals result
   });
 });
 
+describe("cross-module invariant — toolResultTokenBudget config precedence (Wave-12 retro A1)", () => {
+  it("env LCM_TOOL_RESULT_TOKEN_BUDGET wins over LcmConfig.toolResultTokenBudget (env-first precedence)", async () => {
+    // Standard precedence pattern: every other LCM env knob wins over
+    // plugin config. result-budget.ts honors it via `applyResultBudgetConfig`
+    // checking `envValueAtLoad` first.
+    const { resolveLcmConfigWithDiagnostics } = await import("../src/db/config.js");
+    const { config } = resolveLcmConfigWithDiagnostics(
+      { LCM_TOOL_RESULT_TOKEN_BUDGET: "30000" },
+      { toolResultTokenBudget: 50000 },
+    );
+    expect(config.toolResultTokenBudget).toBe(30_000);
+  });
+
+  it("LcmConfig.toolResultTokenBudget honored when env unset (config wins over default)", async () => {
+    const { resolveLcmConfigWithDiagnostics } = await import("../src/db/config.js");
+    const { config } = resolveLcmConfigWithDiagnostics(
+      {},
+      { toolResultTokenBudget: 50000 },
+    );
+    expect(config.toolResultTokenBudget).toBe(50_000);
+  });
+
+  it("undefined when neither env nor config set (default applied downstream in result-budget.ts)", async () => {
+    const { resolveLcmConfigWithDiagnostics } = await import("../src/db/config.js");
+    const { config } = resolveLcmConfigWithDiagnostics({}, {});
+    expect(config.toolResultTokenBudget).toBeUndefined();
+  });
+
+  it("applyResultBudgetConfig updates live bindings when env wasn't set", async () => {
+    const { __resetResultBudgetForTesting, applyResultBudgetConfig } = await import(
+      "../src/plugin/result-budget.js"
+    );
+    __resetResultBudgetForTesting();
+    // No env set in this test process → config can override
+    if (process.env.LCM_TOOL_RESULT_TOKEN_BUDGET) {
+      // Env is set in the runner; skip the override-when-env-unset assertion
+      // because it would require unstubEnv + module reset, and the simpler
+      // "is env honored" path is covered above.
+      return;
+    }
+    applyResultBudgetConfig(50_000);
+    const { MAX_RESULT_TOKENS, MAX_RESULT_CHARS } = await import(
+      "../src/plugin/result-budget.js"
+    );
+    expect(MAX_RESULT_TOKENS).toBe(50_000);
+    expect(MAX_RESULT_CHARS).toBe(200_000);
+    // Reset for downstream tests
+    __resetResultBudgetForTesting();
+  });
+});
+
 describe("cross-module invariant — REFUSAL_THRESHOLD calibration (Wave-14 Agent A)", () => {
   it("REFUSAL_THRESHOLD is 0.92 — calibrated against MAX_RESULT_TOKENS headroom", async () => {
     const { REFUSAL_THRESHOLD } = await import(

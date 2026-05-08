@@ -166,6 +166,13 @@ export type LcmConfig = {
   autoRotateSessionFiles: AutoRotateSessionFilesConfig;
   /** Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. */
   maxAssemblyTokenBudget?: number;
+  /**
+   * Per-call token cap for any single LCM tool's emitted result (Wave-12 retro A1).
+   * Default 10_000 tokens (~40K chars). Floor 2_000 (~8K chars). Both per-tool
+   * MAX_RESULT_CHARS truncation AND the needs-compact-gate's HARD_CAP estimator
+   * read from this. Env: `LCM_TOOL_RESULT_TOKEN_BUDGET`.
+   */
+  toolResultTokenBudget?: number;
   /** Maximum allowed overage factor for summaries relative to target tokens (default 3). */
   summaryMaxOverageFactor: number;
   /** Custom instructions injected into all summarization prompts. */
@@ -553,6 +560,11 @@ export function resolveLcmConfigWithDiagnostics(
       maxAssemblyTokenBudget:
         parseFiniteInt(env.LCM_MAX_ASSEMBLY_TOKEN_BUDGET)
           ?? toNumber(pc.maxAssemblyTokenBudget) ?? undefined,
+      // Wave-12 retro A1: env→pluginConfig→undefined (default applied
+      // downstream in result-budget.ts). Standard precedence pattern.
+      toolResultTokenBudget:
+        parseFiniteInt(env.LCM_TOOL_RESULT_TOKEN_BUDGET)
+          ?? toNumber(pc.toolResultTokenBudget) ?? undefined,
       summaryMaxOverageFactor:
         parseFiniteNumber(env.LCM_SUMMARY_MAX_OVERAGE_FACTOR)
           ?? toNumber(pc.summaryMaxOverageFactor) ?? 3,

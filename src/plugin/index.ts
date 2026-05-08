@@ -9,6 +9,7 @@ import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type { OpenClawPluginApi } from "../openclaw-bridge.js";
 import { resolveLcmConfigWithDiagnostics, resolveOpenclawStateDir } from "../db/config.js";
+import { applyResultBudgetConfig } from "./result-budget.js";
 import { closeLcmConnection, createLcmDatabaseConnection, normalizePath } from "../db/connection.js";
 import { LcmContextEngine } from "../engine.js";
 import { createLcmLogger, describeLogError } from "../lcm-log.js";
@@ -1675,6 +1676,11 @@ function createLcmDependencies(
   const pluginConfig = registrationConfig.pluginConfig;
   const log = createLcmLogger(api);
   const { config, diagnostics } = resolveLcmConfigWithDiagnostics(process.env, pluginConfig);
+
+  // Wave-12 retro A1: propagate `toolResultTokenBudget` plugin-config
+  // value to the result-budget module's live bindings. No-op when env
+  // is set (env wins, same precedence as every other LcmConfig field).
+  applyResultBudgetConfig(config.toolResultTokenBudget);
 
   if (diagnostics.ignoreSessionPatternsEnvOverridesPluginConfig) {
     logStartupBannerOnce({

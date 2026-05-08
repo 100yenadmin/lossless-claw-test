@@ -148,6 +148,10 @@
       "label": "Max Assembly Token Budget",
       "help": "Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. Set for smaller context-window models (e.g., 30000 for 32k models)"
     },
+    "toolResultTokenBudget": {
+      "label": "Tool Result Token Budget",
+      "help": "Per-call token cap for any single LCM tool's emitted result. Default 10000 tokens (~40K chars). Floor 2000. Both per-tool truncation AND the needs-compact gate's projection ceiling read from this. Env override: LCM_TOOL_RESULT_TOKEN_BUDGET."
+    },
     "summaryMaxOverageFactor": {
       "label": "Summary Max Overage Factor",
       "help": "Maximum allowed overage factor for summaries relative to target tokens (default 3). Summaries exceeding this are deterministically truncated."
@@ -359,6 +363,10 @@
       "maxAssemblyTokenBudget": {
         "type": "integer",
         "minimum": 1000
+      },
+      "toolResultTokenBudget": {
+        "type": "integer",
+        "minimum": 2000
       },
       "summaryMaxOverageFactor": {
         "type": "number",
