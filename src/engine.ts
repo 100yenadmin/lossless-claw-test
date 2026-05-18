@@ -556,6 +556,7 @@ const REPLAY_CRITICAL_RAW_TYPES: ReadonlySet<string> = new Set([
   "thinking",
   "reasoning",
 ]);
+const BASE64_IMAGE_MAGIC_PREFIXES = ["/9j/", "iVBOR", "R0lGOD", "UklGR", "PHN2Zy"] as const;
 const RAW_PAYLOAD_EXTERNALIZATION_REASON = "large_raw_message";
 
 function looksLikeJsonPayload(value: string): boolean {
@@ -568,6 +569,18 @@ function looksLikeJsonPayload(value: string): boolean {
     (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
     (trimmed.startsWith("[") && trimmed.endsWith("]"))
   );
+}
+
+function looksLikeBase64ImagePayload(value: string): boolean {
+  const trimmed = value.trim();
+  if (estimateTokens(trimmed) < 100) {
+    return false;
+  }
+  if (!BASE64_IMAGE_MAGIC_PREFIXES.some((prefix) => trimmed.startsWith(prefix))) {
+    return false;
+  }
+  const base64Chars = trimmed.replace(/[^A-Za-z0-9+/=\s]/g, "");
+  return base64Chars.length / trimmed.length >= 0.8;
 }
 
 function extractStructuredText(value: unknown, depth: number = 0): string | undefined {
@@ -1148,27 +1161,49 @@ type StoredMessage = {
   tokenCount: number;
 };
 
-/** Block types that require structural persistence into the `message_parts`
- *  table (tool calls, tool results, reasoning/thinking traces, function-call
- *  shapes).  Bootstrap must NOT take the bulk-insert fast path when any
- *  message contains these — bulk insert only writes the `messages` row, so
- *  structural blocks would be lost on replay. */
-const STRUCTURAL_BLOCK_TYPES = new Set([
-  "tool_use",
-  "toolUse",
-  "toolCall",
-  "tool-use",
-  "tool_result",
-  "toolResult",
+/**
+ * Block types that require structural persistence into the `message_parts`
+ * table. Keep this aligned with replay-critical raw types so bootstrap never
+ * bulk-inserts blocks that `ingestSingle` would preserve structurally.
+ */
+const STRUCTURAL_BLOCK_TYPES: ReadonlySet<string> = new Set([
+  ...REPLAY_CRITICAL_RAW_TYPES,
   "tool-result",
-  "function_call",
-  "functionCall",
-  "function_call_output",
-  "thinking",
   "redacted_thinking",
-  "reasoning",
   "image",
 ]);
+
+/** Return true when live ingest would reject this message before persistence. */
+function shouldSkipPersistedMessage(message: AgentMessage, isHeartbeat?: boolean): boolean {
+  if (isHeartbeat) {
+    return true;
+  }
+  if (!hasPersistableMessageRole(message)) {
+    return true;
+  }
+  if (message.role !== "assistant") {
+    return false;
+  }
+
+  const topLevel = message as unknown as Record<string, unknown>;
+  const stopReason =
+    typeof topLevel.stopReason === "string"
+      ? topLevel.stopReason
+      : typeof topLevel.stop_reason === "string"
+        ? topLevel.stop_reason
+        : undefined;
+  if (stopReason !== "error" && stopReason !== "aborted") {
+    return false;
+  }
+
+  const content = topLevel.content;
+  return (
+    content === undefined ||
+    content === null ||
+    content === "" ||
+    (Array.isArray(content) && content.length === 0)
+  );
+}
 
 /**
  * Cheap pre-scan: should bootstrap take the bulk-insert fast path for this
@@ -1195,6 +1230,15 @@ function bootstrapMessageWouldTriggerInterceptor(
   const threshold = Math.max(1, largeFileTokenThreshold);
   const role = (message as { role?: unknown }).role;
   const content = "content" in message ? message.content : undefined;
+  const contentTextWouldTriggerInterceptor = (text: string): boolean => {
+    // interceptInlineImages: explicit media marker or a long base64 run.
+    if (text.startsWith("[media attached:")) return true;
+    if (looksLikeBase64ImagePayload(text)) return true;
+    // interceptLargeFiles: presence of a file block — match `<file>`,
+    // `<file ...>`, and `<file\n...>` forms. The interceptor decides on
+    // size; we only need a robust open-tag detector here.
+    return /<file(?:\s|>)/.test(text);
+  };
 
   // Tool/toolResult roles need the per-message path regardless of payload —
   // they go through `interceptInlineImagesInToolMessage` and have their own
@@ -1207,50 +1251,61 @@ function bootstrapMessageWouldTriggerInterceptor(
   // calls, images) need `message_parts` rows for replay; bulk-insert only
   // writes the `messages` row, so any such block forces per-message ingest.
   if (Array.isArray(content)) {
+    if (content.length !== 1) {
+      return true;
+    }
     for (const block of content) {
-      if (!block || typeof block !== "object") continue;
-      const blockType = (block as { type?: unknown }).type;
-      if (typeof blockType === "string" && STRUCTURAL_BLOCK_TYPES.has(blockType)) {
+      if (typeof block === "string") {
+        return true;
+      }
+
+      if (!block || typeof block !== "object") return true;
+      const blockRecord = block as Record<string, unknown> & { type?: unknown; rawType?: unknown };
+      const blockType = typeof blockRecord.type === "string" ? blockRecord.type : undefined;
+      const rawBlockType = typeof blockRecord.rawType === "string" ? blockRecord.rawType : undefined;
+      const isCanonicalTextBlock =
+        blockType === "text" &&
+        rawBlockType === undefined &&
+        typeof blockRecord.text === "string" &&
+        Object.keys(blockRecord).every((key) => key === "type" || key === "text");
+      if (!isCanonicalTextBlock) {
+        return true;
+      }
+      if (
+        (blockType && STRUCTURAL_BLOCK_TYPES.has(blockType)) ||
+        (rawBlockType && STRUCTURAL_BLOCK_TYPES.has(rawBlockType))
+      ) {
+        return true;
+      }
+      const extractedText = extractStructuredText(block);
+      if (typeof extractedText === "string" && contentTextWouldTriggerInterceptor(extractedText)) {
         return true;
       }
     }
   }
 
   if (typeof content === "string") {
-    // interceptInlineImages: explicit media marker or a long base64 run.
-    if (content.startsWith("[media attached:")) return true;
-    if (content.length >= 80 && /[A-Za-z0-9+/]{80,}={0,2}/.test(content)) return true;
-    // interceptLargeFiles: presence of a file block — match `<file>`,
-    // `<file ...>`, and `<file\n...>` forms. The interceptor decides on
-    // size; we only need a robust open-tag detector here.
-    if (/<file(?:\s|>)/.test(content)) return true;
+    if (looksLikeJsonPayload(content)) {
+      return true;
+    }
+    const extractedText = extractStructuredText(content);
+    if (typeof extractedText === "string" && contentTextWouldTriggerInterceptor(extractedText)) {
+      return true;
+    }
   }
 
-  // Size gate for interceptLargeRawPayload / interceptLargeToolResults.
-  // Use the same `estimateTokens` heuristic the production token-count
-  // code path uses — `content.length` (UTF-16 code units) is NOT a safe
-  // upper bound on token count for CJK text, where `estimateTokens`
-  // weights per-codepoint at ~1.5 tokens/char, so long CJK text can have
-  // MORE tokens than code units and a code-unit upper-bound check would
-  // produce false negatives (slip past the structural pre-scan and into
-  // bulk-insert when a size-driven interceptor would have fired).
-  let estimatedTokens = 0;
-  if (typeof content === "string") {
-    estimatedTokens = estimateTokens(content);
-  } else if (Array.isArray(content)) {
-    for (const block of content) {
-      if (typeof block === "string") {
-        estimatedTokens += estimateTokens(block);
-      } else if (block && typeof block === "object") {
-        const text = (block as { text?: unknown }).text;
-        estimatedTokens +=
-          typeof text === "string" ? estimateTokens(text) : 1024;
-      }
+  if (content && typeof content === "object" && !Array.isArray(content)) {
+    const extractedText = extractStructuredText(content);
+    if (typeof extractedText === "string" && contentTextWouldTriggerInterceptor(extractedText)) {
+      return true;
     }
-  } else if (content && typeof content === "object") {
-    estimatedTokens += 1024;
+    return true;
   }
-  return estimatedTokens >= threshold;
+
+  // Size gate for interceptLargeRawPayload / interceptLargeToolResults. Match
+  // live ingest exactly: the interceptor compares the normalized stored message
+  // token count, not the raw string/block token count seen in the transcript.
+  return toStoredMessage(message).tokenCount >= threshold;
 }
 
 /**
@@ -5995,7 +6050,10 @@ export class LcmContextEngine implements ContextEngine {
             if (!requiresPerMessageIngest) {
               const nextSeq =
                 (await this.conversationStore.getMaxSeq(conversationId)) + 1;
-              const bulkInput = bootstrapMessages.map((message, index) => {
+              const persistableMessages = bootstrapMessages.filter((message) =>
+                !shouldSkipPersistedMessage(message),
+              );
+              const bulkInput = persistableMessages.map((message, index) => {
                 const stored = toStoredMessage(message);
                 return {
                   conversationId,
@@ -6646,38 +6704,8 @@ export class LcmContextEngine implements ContextEngine {
     skipReplayTimestampFloodGuard?: boolean;
   }): Promise<IngestResult> {
     const { sessionId, sessionKey, message, isHeartbeat, skipReplayTimestampFloodGuard } = params;
-    if (isHeartbeat) {
+    if (shouldSkipPersistedMessage(message, isHeartbeat)) {
       return { ingested: false };
-    }
-    if (!hasPersistableMessageRole(message)) {
-      return { ingested: false };
-    }
-
-    // Skip assistant messages that failed with an error and have no useful content.
-    // These occur when an API call returns a 500 or similar transient error.
-    // Ingesting them pollutes the LCM database: on retry, the error messages
-    // accumulate and get assembled into context, creating a positive feedback
-    // loop where each retry sends an increasingly large (and malformed) payload
-    // that continues to fail.
-    if (message.role === "assistant") {
-      const topLevel = message as unknown as Record<string, unknown>;
-      const stopReason =
-        typeof topLevel.stopReason === "string"
-          ? topLevel.stopReason
-          : typeof topLevel.stop_reason === "string"
-            ? topLevel.stop_reason
-            : undefined;
-      if (stopReason === "error" || stopReason === "aborted") {
-        const content = topLevel.content;
-        const isEmpty =
-          content === undefined ||
-          content === null ||
-          content === "" ||
-          (Array.isArray(content) && content.length === 0);
-        if (isEmpty) {
-          return { ingested: false };
-        }
-      }
     }
 
     let stored = toStoredMessage(message);

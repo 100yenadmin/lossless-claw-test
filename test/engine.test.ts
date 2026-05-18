@@ -5243,6 +5243,86 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(singleSpy).not.toHaveBeenCalled();
   });
 
+  it("skips messages rejected by live ingest when using the bootstrap bulk path", async () => {
+    const sessionFile = createSessionFilePath("bootstrap-ingest-path-fast-filter");
+    writeFileSync(
+      sessionFile,
+      [
+        JSON.stringify({ role: "user", content: "persist me" }),
+        JSON.stringify({ role: "assistant", stopReason: "error", content: "" }),
+        JSON.stringify({ role: "alien", content: "ignore me" }),
+        JSON.stringify({ role: "assistant", content: "persist me too" }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 100_000 });
+    const bulkSpy = vi.spyOn(engine.getConversationStore(), "createMessagesBulk");
+    const singleSpy = vi.spyOn(engine.getConversationStore(), "createMessage");
+
+    const result = await engine.bootstrap({
+      sessionId: "bootstrap-ingest-path-fast-filter",
+      sessionFile,
+    });
+
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(2);
+    expect(bulkSpy).toHaveBeenCalledTimes(1);
+    expect(singleSpy).not.toHaveBeenCalled();
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId("bootstrap-ingest-path-fast-filter");
+    expect(conversation).not.toBeNull();
+    const messages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(messages.map((message) => message.content)).toEqual([
+      "persist me",
+      "persist me too",
+    ]);
+  });
+
+  it("falls through to per-message ingest for JSON string bootstrap content", async () => {
+    const sessionFile = createSessionFilePath("bootstrap-json-string-content-parts");
+    const jsonContent = JSON.stringify({
+      text: "shown text",
+      payload: { hidden: "must stay in message_parts" },
+    });
+    writeFileSync(
+      sessionFile,
+      `${JSON.stringify({ role: "assistant", content: jsonContent })}\n`,
+      "utf8",
+    );
+
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 100_000 });
+    const bulkSpy = vi.spyOn(engine.getConversationStore(), "createMessagesBulk");
+    const singleSpy = vi.spyOn(engine.getConversationStore(), "createMessage");
+
+    const result = await engine.bootstrap({
+      sessionId: "bootstrap-json-string-content-parts",
+      sessionFile,
+    });
+
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(1);
+    expect(bulkSpy).not.toHaveBeenCalled();
+    expect(singleSpy).toHaveBeenCalledTimes(1);
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId("bootstrap-json-string-content-parts");
+    expect(conversation).not.toBeNull();
+    const messages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toBe("shown text");
+
+    const parts = await engine.getConversationStore().getMessageParts(messages[0].messageId);
+    expect(parts.map((part) => part.textContent)).toEqual([jsonContent]);
+  });
+
   it("falls through to per-message ingest when a bootstrap message would trigger an interceptor", async () => {
     const sessionFile = createSessionFilePath("bootstrap-ingest-path-slow");
     const fileText = `${"bootstrap fallthrough line\n".repeat(80)}done`;
@@ -5268,6 +5348,149 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(result.importedMessages).toBe(1);
     expect(bulkSpy).not.toHaveBeenCalled();
     expect(singleSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls through to per-message ingest for oversized structured bootstrap payloads without text", async () => {
+    await withTempHome(async () => {
+      const sessionFile = createSessionFilePath("bootstrap-structured-raw-payload");
+      const rawBlob = "RAW_VENDOR_PAYLOAD ".repeat(800);
+      const rawPayload = [
+        {
+          type: "vendor_payload",
+          payload: { blob: rawBlob, status: "ok" },
+        },
+      ];
+      writeFileSync(
+        sessionFile,
+        `${JSON.stringify({ role: "assistant", content: rawPayload })}\n`,
+        "utf8",
+      );
+
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 1_500 });
+      const bulkSpy = vi.spyOn(engine.getConversationStore(), "createMessagesBulk");
+      const singleSpy = vi.spyOn(engine.getConversationStore(), "createMessage");
+
+      const result = await engine.bootstrap({
+        sessionId: "bootstrap-structured-raw-payload",
+        sessionFile,
+      });
+
+      expect(result.bootstrapped).toBe(true);
+      expect(result.importedMessages).toBe(1);
+      expect(bulkSpy).not.toHaveBeenCalled();
+      expect(singleSpy).toHaveBeenCalledTimes(1);
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId("bootstrap-structured-raw-payload");
+      expect(conversation).not.toBeNull();
+
+      const messages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(messages).toHaveLength(1);
+      expect(messages[0].content).toContain("[LCM Raw Payload: file_");
+      expect(messages[0].content).toContain("role=assistant");
+      expect(messages[0].content).not.toContain(rawBlob.slice(0, 64));
+
+      const fileIdMatch = messages[0].content.match(/file_[a-f0-9]{16}/);
+      expect(fileIdMatch).not.toBeNull();
+      const storedFile = await engine.getSummaryStore().getLargeFile(fileIdMatch![0]);
+      expect(storedFile).not.toBeNull();
+      expect(storedFile!.fileName).toBe("raw-assistant-payload.json");
+      expect(storedFile!.mimeType).toBe("application/json");
+      expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(JSON.stringify(rawPayload));
+    });
+  });
+
+  it("falls through to per-message ingest for oversized structured bootstrap payloads with text", async () => {
+    await withTempHome(async () => {
+      const sessionFile = createSessionFilePath("bootstrap-structured-text-raw-payload");
+      const rawBlob = "RAW_VENDOR_PAYLOAD ".repeat(800);
+      const rawPayload = [
+        {
+          type: "message",
+          text: "short display text",
+          payload: { blob: rawBlob, status: "ok" },
+        },
+      ];
+      writeFileSync(
+        sessionFile,
+        `${JSON.stringify({ role: "assistant", content: rawPayload })}\n`,
+        "utf8",
+      );
+
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 1_500 });
+      const bulkSpy = vi.spyOn(engine.getConversationStore(), "createMessagesBulk");
+      const singleSpy = vi.spyOn(engine.getConversationStore(), "createMessage");
+
+      const result = await engine.bootstrap({
+        sessionId: "bootstrap-structured-text-raw-payload",
+        sessionFile,
+      });
+
+      expect(result.bootstrapped).toBe(true);
+      expect(result.importedMessages).toBe(1);
+      expect(bulkSpy).not.toHaveBeenCalled();
+      expect(singleSpy).toHaveBeenCalledTimes(1);
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId("bootstrap-structured-text-raw-payload");
+      expect(conversation).not.toBeNull();
+
+      const messages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(messages).toHaveLength(1);
+      expect(messages[0].content).toContain("[LCM Raw Payload: file_");
+      expect(messages[0].content).not.toContain(rawBlob.slice(0, 64));
+
+      const fileIdMatch = messages[0].content.match(/file_[a-f0-9]{16}/);
+      expect(fileIdMatch).not.toBeNull();
+      const storedFile = await engine.getSummaryStore().getLargeFile(fileIdMatch![0]);
+      expect(storedFile).not.toBeNull();
+      expect(storedFile!.fileName).toBe("raw-assistant-payload.json");
+      expect(storedFile!.mimeType).toBe("application/json");
+      expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(JSON.stringify(rawPayload));
+    });
+  });
+
+  it("falls through to per-message ingest when stored assistant text exceeds the raw-payload threshold", async () => {
+    await withTempHome(async () => {
+      const sessionFile = createSessionFilePath("bootstrap-stored-token-threshold");
+      const content = "x".repeat(35);
+      writeFileSync(
+        sessionFile,
+        `${JSON.stringify({ role: "assistant", content })}\n`,
+        "utf8",
+      );
+
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 10 });
+      const bulkSpy = vi.spyOn(engine.getConversationStore(), "createMessagesBulk");
+      const singleSpy = vi.spyOn(engine.getConversationStore(), "createMessage");
+
+      const result = await engine.bootstrap({
+        sessionId: "bootstrap-stored-token-threshold",
+        sessionFile,
+      });
+
+      expect(result.bootstrapped).toBe(true);
+      expect(result.importedMessages).toBe(1);
+      expect(bulkSpy).not.toHaveBeenCalled();
+      expect(singleSpy).toHaveBeenCalledTimes(1);
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId("bootstrap-stored-token-threshold");
+      expect(conversation).not.toBeNull();
+      const messages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(messages).toHaveLength(1);
+      expect(messages[0].content).toContain("[LCM Raw Payload: file_");
+      expect(messages[0].content).toContain("role=assistant");
+    });
   });
 
   it("forces per-message ingest when bootstrap messages carry tool_use / reasoning blocks (no tool/toolResult role)", async () => {
@@ -5312,6 +5535,13 @@ describe("LcmContextEngine.bootstrap", () => {
           { type: "text", text: "Done." },
         ],
       }),
+      JSON.stringify({
+        role: "assistant",
+        content: [
+          { type: "tool_call", id: "tc_boot_1", name: "pwd", arguments: "{}" },
+          { type: "tool_use_result", tool_use_id: "tc_boot_1", output: "ok" },
+        ],
+      }),
     ];
     writeFileSync(sessionFile, `${lines.join("\n")}\n`, "utf8");
 
@@ -5350,6 +5580,158 @@ describe("LcmContextEngine.bootstrap", () => {
       totalParts += parts.length;
     }
     expect(totalParts).toBeGreaterThan(0);
+  });
+
+  it("forces per-message ingest when bootstrap content blocks carry structural rawType metadata", async () => {
+    const sessionFile = createSessionFilePath("bootstrap-structural-raw-type-block");
+    writeFileSync(
+      sessionFile,
+      `${JSON.stringify({
+        role: "assistant",
+        content: [
+          {
+            type: "agent",
+            rawType: "tool_use",
+            id: "raw_type_tool_use_1",
+            name: "ls",
+            input: { path: "/tmp" },
+          },
+          { type: "text", text: "Done." },
+        ],
+      })}\n`,
+      "utf8",
+    );
+
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 100_000 });
+    const bulkSpy = vi.spyOn(engine.getConversationStore(), "createMessagesBulk");
+    const singleSpy = vi.spyOn(engine.getConversationStore(), "createMessage");
+
+    const result = await engine.bootstrap({
+      sessionId: "bootstrap-structural-raw-type-block",
+      sessionFile,
+    });
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(1);
+    expect(bulkSpy).not.toHaveBeenCalled();
+    expect(singleSpy).toHaveBeenCalledTimes(1);
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId("bootstrap-structural-raw-type-block");
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(1);
+    const parts = await engine.getConversationStore().getMessageParts(stored[0].messageId);
+    expect(parts.some((part) => part.partType === "tool")).toBe(true);
+  });
+
+  it("forces per-message ingest when bootstrap content blocks need message parts", async () => {
+    const sessionFile = createSessionFilePath("bootstrap-non-text-message-parts");
+    writeFileSync(
+      sessionFile,
+      `${JSON.stringify({
+        role: "assistant",
+        content: [
+          { type: "patch", text: "diff --git a/a b/a" },
+          { type: "snapshot", text: "state snapshot" },
+        ],
+      })}\n`,
+      "utf8",
+    );
+
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 100_000 });
+    const bulkSpy = vi.spyOn(engine.getConversationStore(), "createMessagesBulk");
+    const singleSpy = vi.spyOn(engine.getConversationStore(), "createMessage");
+
+    const result = await engine.bootstrap({
+      sessionId: "bootstrap-non-text-message-parts",
+      sessionFile,
+    });
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(1);
+    expect(bulkSpy).not.toHaveBeenCalled();
+    expect(singleSpy).toHaveBeenCalledTimes(1);
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId("bootstrap-non-text-message-parts");
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(1);
+    const parts = await engine.getConversationStore().getMessageParts(stored[0].messageId);
+    expect(parts.map((part) => part.partType)).toEqual(["patch", "snapshot"]);
+  });
+
+  it("forces per-message ingest when bootstrap text arrays need message parts", async () => {
+    const sessionFile = createSessionFilePath("bootstrap-text-array-message-parts");
+    writeFileSync(
+      sessionFile,
+      `${JSON.stringify({
+        role: "assistant",
+        content: [
+          { type: "text", text: "first block" },
+          { type: "text", text: "second block" },
+        ],
+      })}\n`,
+      "utf8",
+    );
+
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 100_000 });
+    const bulkSpy = vi.spyOn(engine.getConversationStore(), "createMessagesBulk");
+    const singleSpy = vi.spyOn(engine.getConversationStore(), "createMessage");
+
+    const result = await engine.bootstrap({
+      sessionId: "bootstrap-text-array-message-parts",
+      sessionFile,
+    });
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(1);
+    expect(bulkSpy).not.toHaveBeenCalled();
+    expect(singleSpy).toHaveBeenCalledTimes(1);
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId("bootstrap-text-array-message-parts");
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(1);
+    const parts = await engine.getConversationStore().getMessageParts(stored[0].messageId);
+    expect(parts.map((part) => part.textContent)).toEqual(["first block", "second block"]);
+  });
+
+  it("forces per-message ingest when bootstrap object content needs message parts", async () => {
+    const sessionFile = createSessionFilePath("bootstrap-object-message-parts");
+    writeFileSync(
+      sessionFile,
+      `${JSON.stringify({
+        role: "assistant",
+        content: { type: "patch", text: "diff --git a/a b/a" },
+      })}\n`,
+      "utf8",
+    );
+
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 100_000 });
+    const bulkSpy = vi.spyOn(engine.getConversationStore(), "createMessagesBulk");
+    const singleSpy = vi.spyOn(engine.getConversationStore(), "createMessage");
+
+    const result = await engine.bootstrap({
+      sessionId: "bootstrap-object-message-parts",
+      sessionFile,
+    });
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(1);
+    expect(bulkSpy).not.toHaveBeenCalled();
+    expect(singleSpy).toHaveBeenCalledTimes(1);
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId("bootstrap-object-message-parts");
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(1);
+    const parts = await engine.getConversationStore().getMessageParts(stored[0].messageId);
+    expect(parts.map((part) => part.partType)).toEqual(["agent"]);
+    expect(parts[0].metadata).toContain("\"type\":\"patch\"");
   });
 
   it("externalizes oversized file blocks during first-time bootstrap and still reconciles later tail messages", async () => {
@@ -5457,6 +5839,262 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(storedFile).not.toBeNull();
     expect(storedFile!.mimeType).toBe("image/png");
     expect(storedFile!.storageUri).toContain(`${largeFilesDir}/${conversation!.conversationId}/`);
+  });
+
+  it("externalizes inline images in bootstrap text blocks", async () => {
+    const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
+    tempDirs.push(largeFilesDir);
+    const sessionFile = createSessionFilePath("bootstrap-inline-image-text-block");
+    const base64Image = `iVBOR${"A".repeat(600)}`;
+    writeFileSync(
+      sessionFile,
+      `${JSON.stringify({
+        role: "user",
+        content: [{ type: "text", text: `[media attached: bootstrap-block.png]\n${base64Image}\n` }],
+      })}\n`,
+      "utf8",
+    );
+
+    const engine = createEngineWithConfig({
+      largeFileTokenThreshold: 25_000,
+      largeFilesDir,
+    });
+    const bulkSpy = vi.spyOn(engine.getConversationStore(), "createMessagesBulk");
+    const sessionId = "bootstrap-inline-image-text-block";
+    const result = await engine.bootstrap({ sessionId, sessionFile });
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(1);
+    expect(bulkSpy).not.toHaveBeenCalled();
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toContain("[User image: bootstrap-block.png");
+    expect(messages[0].content).not.toContain(base64Image.slice(0, 32));
+
+    const fileIdMatch = messages[0].content.match(/file_[a-f0-9]{16}/);
+    expect(fileIdMatch).not.toBeNull();
+    const storedFile = await engine.getSummaryStore().getLargeFile(fileIdMatch![0]);
+    expect(storedFile).not.toBeNull();
+    expect(storedFile!.mimeType).toBe("image/png");
+    expect(storedFile!.storageUri).toContain(`${largeFilesDir}/${conversation!.conversationId}/`);
+  });
+
+  it("externalizes inline images in bootstrap structured value blocks", async () => {
+    const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
+    tempDirs.push(largeFilesDir);
+    const sessionFile = createSessionFilePath("bootstrap-inline-image-value-block");
+    const base64Image = `iVBOR${"A".repeat(600)}`;
+    writeFileSync(
+      sessionFile,
+      `${JSON.stringify({
+        role: "user",
+        content: [
+          {
+            type: "message",
+            value: `[media attached: bootstrap-value-block.png]\n${base64Image}\n`,
+          },
+        ],
+      })}\n`,
+      "utf8",
+    );
+
+    const engine = createEngineWithConfig({
+      largeFileTokenThreshold: 25_000,
+      largeFilesDir,
+    });
+    const bulkSpy = vi.spyOn(engine.getConversationStore(), "createMessagesBulk");
+    const sessionId = "bootstrap-inline-image-value-block";
+    const result = await engine.bootstrap({ sessionId, sessionFile });
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(1);
+    expect(bulkSpy).not.toHaveBeenCalled();
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toContain("[User image: bootstrap-value-block.png");
+    expect(messages[0].content).not.toContain(base64Image.slice(0, 32));
+  });
+
+  it("externalizes inline images in bootstrap string array blocks", async () => {
+    const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
+    tempDirs.push(largeFilesDir);
+    const sessionFile = createSessionFilePath("bootstrap-inline-image-string-block");
+    const base64Image = `iVBOR${"A".repeat(600)}`;
+    writeFileSync(
+      sessionFile,
+      `${JSON.stringify({
+        role: "user",
+        content: [`[media attached: bootstrap-string-block.png]\n${base64Image}\n`],
+      })}\n`,
+      "utf8",
+    );
+
+    const engine = createEngineWithConfig({
+      largeFileTokenThreshold: 25_000,
+      largeFilesDir,
+    });
+    const bulkSpy = vi.spyOn(engine.getConversationStore(), "createMessagesBulk");
+    const sessionId = "bootstrap-inline-image-string-block";
+    const result = await engine.bootstrap({ sessionId, sessionFile });
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(1);
+    expect(bulkSpy).not.toHaveBeenCalled();
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toContain("[User image: bootstrap-string-block.png");
+    expect(messages[0].content).not.toContain(base64Image.slice(0, 32));
+  });
+
+  it("externalizes inline images in bootstrap object text content", async () => {
+    const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
+    tempDirs.push(largeFilesDir);
+    const sessionFile = createSessionFilePath("bootstrap-inline-image-object-content");
+    const base64Image = `iVBOR${"A".repeat(600)}`;
+    writeFileSync(
+      sessionFile,
+      `${JSON.stringify({
+        role: "user",
+        content: {
+          text: `[media attached: bootstrap-object-content.png]\n${base64Image}\n`,
+        },
+      })}\n`,
+      "utf8",
+    );
+
+    const engine = createEngineWithConfig({
+      largeFileTokenThreshold: 25_000,
+      largeFilesDir,
+    });
+    const bulkSpy = vi.spyOn(engine.getConversationStore(), "createMessagesBulk");
+    const sessionId = "bootstrap-inline-image-object-content";
+    const result = await engine.bootstrap({ sessionId, sessionFile });
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(1);
+    expect(bulkSpy).not.toHaveBeenCalled();
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toContain("[User image: bootstrap-object-content.png");
+    expect(messages[0].content).not.toContain(base64Image.slice(0, 32));
+  });
+
+  it("externalizes inline images in bootstrap JSON string content", async () => {
+    const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
+    tempDirs.push(largeFilesDir);
+    const sessionFile = createSessionFilePath("bootstrap-inline-image-json-string-content");
+    const base64Image = `iVBOR${"A".repeat(600)}`;
+    writeFileSync(
+      sessionFile,
+      `${JSON.stringify({
+        role: "user",
+        content: JSON.stringify({
+          text: `[media attached: bootstrap-json-string-content.png]\n${base64Image}\n`,
+        }),
+      })}\n`,
+      "utf8",
+    );
+
+    const engine = createEngineWithConfig({
+      largeFileTokenThreshold: 25_000,
+      largeFilesDir,
+    });
+    const bulkSpy = vi.spyOn(engine.getConversationStore(), "createMessagesBulk");
+    const sessionId = "bootstrap-inline-image-json-string-content";
+    const result = await engine.bootstrap({ sessionId, sessionFile });
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(1);
+    expect(bulkSpy).not.toHaveBeenCalled();
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toContain("[User image: bootstrap-json-string-content.png");
+    expect(messages[0].content).not.toContain(base64Image.slice(0, 32));
+  });
+
+  it("externalizes wrapped pure base64 images during first-time bootstrap", async () => {
+    const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
+    tempDirs.push(largeFilesDir);
+    const sessionFile = createSessionFilePath("bootstrap-wrapped-base64-image");
+    const base64Image = `iVBOR${"A".repeat(907)}`;
+    const wrappedBase64Image = base64Image.match(/.{1,76}/g)!.join("\n");
+    writeFileSync(
+      sessionFile,
+      `${JSON.stringify({
+        role: "assistant",
+        content: wrappedBase64Image,
+      })}\n`,
+      "utf8",
+    );
+
+    const engine = createEngineWithConfig({
+      largeFileTokenThreshold: 25_000,
+      largeFilesDir,
+    });
+    const bulkSpy = vi.spyOn(engine.getConversationStore(), "createMessagesBulk");
+    const sessionId = "bootstrap-wrapped-base64-image";
+    const result = await engine.bootstrap({ sessionId, sessionFile });
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(1);
+    expect(bulkSpy).not.toHaveBeenCalled();
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toContain("[Assistant image: assistant-image.png");
+    expect(messages[0].content).not.toContain(base64Image.slice(0, 32));
+
+    const fileIdMatch = messages[0].content.match(/file_[a-f0-9]{16}/);
+    expect(fileIdMatch).not.toBeNull();
+    const storedFile = await engine.getSummaryStore().getLargeFile(fileIdMatch![0]);
+    expect(storedFile).not.toBeNull();
+    expect(storedFile!.mimeType).toBe("image/png");
+    expect(storedFile!.storageUri).toContain(`${largeFilesDir}/${conversation!.conversationId}/`);
+  });
+
+  it("externalizes mostly-base64 image payloads during first-time bootstrap", async () => {
+    const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
+    tempDirs.push(largeFilesDir);
+    const sessionFile = createSessionFilePath("bootstrap-mostly-base64-image");
+    const base64Image = `iVBOR${"A".repeat(907)}`;
+    const mostlyBase64Image = `${base64Image}${"!".repeat(40)}`;
+    writeFileSync(
+      sessionFile,
+      `${JSON.stringify({
+        role: "assistant",
+        content: mostlyBase64Image,
+      })}\n`,
+      "utf8",
+    );
+
+    const engine = createEngineWithConfig({
+      largeFileTokenThreshold: 25_000,
+      largeFilesDir,
+    });
+    const bulkSpy = vi.spyOn(engine.getConversationStore(), "createMessagesBulk");
+    const sessionId = "bootstrap-mostly-base64-image";
+    const result = await engine.bootstrap({ sessionId, sessionFile });
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(1);
+    expect(bulkSpy).not.toHaveBeenCalled();
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toContain("[Assistant image: assistant-image.png");
+    expect(messages[0].content).not.toContain(base64Image.slice(0, 32));
   });
 
   it("externalizes oversized tool results during first-time bootstrap", async () => {
@@ -6448,13 +7086,13 @@ describe("LcmContextEngine.assemble canonical path", () => {
   });
 
   it("drops stale recentBootstrapImport observations from overflow diagnostics", async () => {
-    const infoLog = vi.fn();
+    const debugLog = vi.fn();
     const engine = createEngineWithDepsOverrides({
       log: {
-        info: infoLog,
+        info: vi.fn(),
         warn: vi.fn(),
         error: vi.fn(),
-        debug: vi.fn(),
+        debug: debugLog,
       },
     });
     const sessionId = "session-overflow-stale-bootstrap";
@@ -6500,7 +7138,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
       tokenBudget: 100,
     });
 
-    const assembleDebugLog = infoLog.mock.calls
+    const assembleDebugLog = debugLog.mock.calls
       .map((call: unknown[]) => call[0])
       .find(
         (entry: unknown) =>
@@ -6520,13 +7158,13 @@ describe("LcmContextEngine.assemble canonical path", () => {
   });
 
   it("preserves a fresh recentBootstrapImport observation in overflow diagnostics", async () => {
-    const infoLog = vi.fn();
+    const debugLog = vi.fn();
     const engine = createEngineWithDepsOverrides({
       log: {
-        info: infoLog,
+        info: vi.fn(),
         warn: vi.fn(),
         error: vi.fn(),
-        debug: vi.fn(),
+        debug: debugLog,
       },
     });
     const sessionId = "session-overflow-fresh-bootstrap";
@@ -6563,7 +7201,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
       tokenBudget: 100,
     });
 
-    const assembleDebugLog = infoLog.mock.calls
+    const assembleDebugLog = debugLog.mock.calls
       .map((call: unknown[]) => call[0])
       .find(
         (entry: unknown) =>
