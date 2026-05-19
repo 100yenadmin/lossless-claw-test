@@ -121,7 +121,8 @@ Answer a focused question by expanding summaries through the DAG. Spawns a bound
 | `query` | string | ✅* | — | Text query to find seed summaries |
 | `summaryIds` | string[] | ✅* | — | Explicit seed summary IDs |
 | `maxTokens` | number | | 2000 | Answer length cap |
-| `conversationId` | number | | current session family | Scope |
+| `timeoutMs` | number | ✅ | `delegationTimeoutMs + 30000` | Total OpenClaw dynamic tool RPC timeout; use the schema default so delegated recall can finish before the host watchdog fires |
+| `conversationId` | number | | current session family | Scope to a specific physical conversation |
 | `allConversations` | boolean | | `false` | Cross-conversation synthesis (bounded; ranks buckets, expands top few) |
 
 *One of `query` or `summaryIds` required.
@@ -223,3 +224,11 @@ Use LCM tools for recall:
 When summaries in context have an "Expand for details about:" footer
 listing something you need, use `lcm_expand_query` to get the full detail.
 ```
+
+### Performance considerations
+
+- `lcm_grep` and `lcm_describe` are fast (direct database queries)
+- `lcm_expand_query` spawns a sub-agent and takes ~30–120 seconds
+- The sub-agent has a 120-second timeout with cleanup guarantees by default, and the tool schema advertises a 150-second OpenClaw dynamic RPC timeout so the host watchdog stays open long enough for delegated recall plus result cleanup
+- Token caps (`LCM_MAX_EXPAND_TOKENS`) prevent runaway expansion
+- Cross-conversation `lcm_expand_query` expands only a bounded set of top-ranked conversations
