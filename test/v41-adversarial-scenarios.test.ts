@@ -892,12 +892,12 @@ describe("Adversarial — Cross-tool composition", () => {
       id: ids[0]!,
       allConversations: true,
     });
-    const describeDetails = describeR.details as {
-      type?: string;
-      summary?: { content?: string };
-    };
+    const describeDetails = describeR.details as { type?: string };
+    // compactDescribeDetails() strips summary.content — assert against
+    // the agent-facing markdown (see v41-five-questions E1).
+    const describeText = describeR.content.map((c) => c.text).join("\n");
     expect(describeDetails.type).toBe("summary");
-    expect(describeDetails.summary?.content).toContain("crosstool-marker-X9K2A1");
+    expect(describeText).toContain("crosstool-marker-X9K2A1");
   });
 
   it("xtool-2: lcm_search_entities → lcm_get_entity → drilldown", async () => {

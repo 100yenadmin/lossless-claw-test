@@ -405,12 +405,14 @@ describe("THE_FIVE_QUESTIONS — Type E: Drilldown", () => {
       sessionKey: "agent:main:main",
     });
     const r = await tool.execute("test-e1", { id: "sum_e1_001" });
-    const details = r.details as {
-      type?: string;
-      summary?: { content?: string };
-    };
+    const details = r.details as { type?: string };
+    // Upstream's compactDescribeDetails() strips `content` from
+    // details.summary (result-budget — the content lives in the
+    // markdown, not duplicated in the structured details). Assert
+    // against the agent-facing markdown, where the drilldown lands.
+    const text = r.content.map((c) => c.text).join("\n");
     expect(details.type).toBe("summary");
-    expect(details.summary?.content).toContain("+52.5pp");
+    expect(text).toContain("+52.5pp");
   });
 
   it("E2: drill from a condensed summary into its child leaves", async () => {
@@ -500,12 +502,12 @@ describe("THE_FIVE_QUESTIONS — Type E: Drilldown", () => {
       id: "sum_d2_005",
       allConversations: true,
     });
-    const details = r.details as {
-      type?: string;
-      summary?: { content?: string };
-    };
+    const details = r.details as { type?: string };
+    // See E1: compactDescribeDetails() strips summary.content — assert
+    // against the agent-facing markdown.
+    const text = r.content.map((c) => c.text).join("\n");
     expect(details.type).toBe("summary");
-    expect(details.summary?.content).toContain("disable smarter-claw step");
+    expect(text).toContain("disable smarter-claw step");
   });
 });
 

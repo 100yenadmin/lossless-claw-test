@@ -119,6 +119,15 @@ const READ_ONLY_OPERATOR_CASES: ReadonlySet<string> = new Set([
   // service for "start fresh." Currently ungated; if this changes,
   // move to DESTRUCTIVE_OPERATOR_CASES and add a gate.
   "rotate",
+  // Upstream focus-mode commands (Lossless focus mode, PR #692 / #707).
+  // None are senderIsOwner-gated in lcm-command.ts — focus is user-self-
+  // service like rotate/backup. Classified read-only to match the actual
+  // (ungated) command behavior; if focus_generate's LLM cost later
+  // warrants an owner gate, move the gated case to DESTRUCTIVE.
+  "focus_status",
+  "focus_generate",
+  "refocus",
+  "unfocus",
 ]);
 
 // ────────────────────────────────────────────────────────────────────
