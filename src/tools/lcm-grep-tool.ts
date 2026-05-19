@@ -16,10 +16,15 @@ import {
 } from "../embeddings/semantic-search.js";
 import { VoyageError } from "../voyage/client.js";
 import { containsCjk } from "../store/full-text-fallback.js";
+import { runWithTokenGate } from "../plugin/needs-compact-gate.js";
+import { MAX_RESULT_CHARS, truncationNotice } from "../plugin/result-budget.js";
 
 // Tool-result hard cap — protects against back-to-back tool calls
-// blowing out the agent's context window (~10K tokens / 40K chars).
-const MAX_RESULT_CHARS = 40_000;
+// blowing out the agent's context window. Operators tune via the
+// `LCM_TOOL_RESULT_TOKEN_BUDGET` env var (default 10K tokens / ~40K chars).
+// Wave-12 audit (W1A1 #2 + W1A8 #3): MAX_RESULT_CHARS now lives in
+// `src/plugin/result-budget.ts` so the needs-compact gate's HARD_CAP
+// estimator and per-tool char cap stay in lockstep.
 
 function formatDisplayTime(
   value: Date | string | number | null | undefined,
@@ -237,6 +242,11 @@ export function createLcmGrepTool(input: {
   getLcm?: () => Promise<LcmContextEngine>;
   sessionId?: string;
   sessionKey?: string;
+  /** Wave-14 token-state runtime context (see plugin/token-state.ts). */
+  getRuntimeContext?: () => {
+    currentTokenCount?: number;
+    tokenBudget?: number;
+  };
 }): AnyAgentTool {
   return {
     name: "lcm_grep",
@@ -253,6 +263,21 @@ export function createLcmGrepTool(input: {
       "Tool result is hard-capped at LCM_TOOL_RESULT_TOKEN_BUDGET (default 10K tokens / 40K chars) — when context is near full, prefer narrower queries (smaller `limit`, more specific `pattern`) over big sweeps; chained calls accumulate context, and compaction only fires post-turn.",
     parameters: LcmGrepSchema,
     async execute(_toolCallId, params) {
+      // Wave-12 reviewer F5 fix: migrated from inline gate + 4 hand-written
+      // taps (lines 206/222/247/252/264) leaving 9+ untapped return paths
+      // (lines 392/590/598/604/661/761/774/779/854/1063) to a single
+      // runWithTokenGate wrapper. Pre-fix, helpers like runHybridLcmGrep,
+      // runSemanticLcmGrep, runVerbatimLcmGrep had error returns + success
+      // returns that bypassed accounting entirely. The wrapper funnels
+      // every return through one tap exit, structurally eliminating the
+      // antipattern. Adversarial review caught 12 untapped paths total
+      // across grep + describe.
+      return runWithTokenGate({
+        toolName: "lcm_grep",
+        toolParams: params as Record<string, unknown>,
+        sessionKey: input.sessionKey,
+        getRuntimeContext: input.getRuntimeContext,
+        inner: async () => {
       const lcm = input.lcm ?? (await input.getLcm?.());
       if (!lcm) {
         throw new Error("LCM engine is unavailable.");
@@ -473,6 +498,8 @@ export function createLcmGrepTool(input: {
             : {}),
         },
       };
+        },  // close inner: async () => { ... }
+      });   // close runWithTokenGate({ ... })
     },
   };
 }

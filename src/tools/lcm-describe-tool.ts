@@ -9,8 +9,8 @@ import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 import { formatTimestamp } from "../compaction.js";
-
-const MAX_RESULT_CHARS = 40_000;
+import { runWithTokenGate } from "../plugin/needs-compact-gate.js";
+import { MAX_RESULT_CHARS, truncationNotice } from "../plugin/result-budget.js";
 
 /**
  * Wave-12 audit (W1A8 #3): describe was previously unbounded — a single
@@ -35,9 +35,7 @@ function truncateLinesToCap(
     const next = total + line.length + (out.length > 0 ? 1 : 0);
     if (next > MAX_RESULT_CHARS) {
       out.push("");
-      out.push(
-        `*(truncated at ~${Math.round(MAX_RESULT_CHARS / 4)} tokens to protect agent context — ${reasonHint}; raise LCM_TOOL_RESULT_TOKEN_BUDGET env to increase the cap)*`,
-      );
+      out.push(truncationNotice(reasonHint));
       return { text: out.join("\n"), truncated: true };
     }
     out.push(line);
@@ -175,6 +173,16 @@ export function createLcmDescribeTool(input: {
   getLcm?: () => Promise<LcmContextEngine>;
   sessionId?: string;
   sessionKey?: string;
+  /**
+   * Live runtime-context provider (Wave-14 token-state cache). When
+   * present, the tool runs a pre-call needsCompact gate and refuses
+   * with structured response if projected result would push context
+   * past REFUSAL_THRESHOLD. Tolerates undefined (no llm_output yet).
+   */
+  getRuntimeContext?: () => {
+    currentTokenCount?: number;
+    tokenBudget?: number;
+  };
 }): AnyAgentTool {
   return {
     name: "lcm_describe",
@@ -194,6 +202,19 @@ export function createLcmDescribeTool(input: {
       "token counts, file exploration, and (with expand flags) one-hop detail.",
     parameters: LcmDescribeSchema,
     async execute(_toolCallId, params) {
+      // Wave-12 reviewer F5 fix: migrated from inline gate + hand-written
+      // taps to `runWithTokenGate` wrapper. Pre-fix, the file had THREE
+      // return paths (summary at line 661, file at 707, fallthrough at
+      // 713) but only the early refusal + fallthrough were tapped — the
+      // two largest emitters silently skipped accounting. The wrapper
+      // funnels every return through a single tap exit, structurally
+      // eliminating the antipattern.
+      return runWithTokenGate({
+        toolName: "lcm_describe",
+        toolParams: params as Record<string, unknown>,
+        sessionKey: input.sessionKey,
+        getRuntimeContext: input.getRuntimeContext,
+        inner: async () => {
       const lcm = input.lcm ?? (await input.getLcm?.());
       if (!lcm) {
         throw new Error("LCM engine is unavailable.");
@@ -814,6 +835,8 @@ export function createLcmDescribeTool(input: {
       }
 
       return jsonResult(result);
+        },  // close inner: async () => { ... }
+      });   // close runWithTokenGate({ ... })
     },
   };
 }

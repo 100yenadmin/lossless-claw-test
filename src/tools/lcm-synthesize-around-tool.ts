@@ -11,6 +11,7 @@ import { createLcmSummarizeFromLegacyParams } from "../summarize.js";
 import { estimateTokens } from "../estimate-tokens.js";
 import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
+import { runWithTokenGate } from "../plugin/needs-compact-gate.js";
 import { jsonResult } from "./common.js";
 import { parseIsoTimestampParam, resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 import { formatTimestamp } from "../compaction.js";
@@ -622,6 +623,16 @@ export function createLcmSynthesizeAroundTool(input: {
   getLcm?: () => Promise<LcmContextEngine>;
   sessionId?: string;
   sessionKey?: string;
+  /**
+   * Wave-12 audit (W2A1 P0 #2): post-Wave-14 token-state runtime context.
+   * Without this, every successful synthesize call's markdown output
+   * (4K-8K tokens of LLM-generated rollup) silently bypasses the per-
+   * session token cache, drifting downstream gate decisions low.
+   */
+  getRuntimeContext?: () => {
+    currentTokenCount?: number;
+    tokenBudget?: number;
+  };
 }): AnyAgentTool {
   return {
     name: "lcm_synthesize_around",
@@ -642,6 +653,18 @@ export function createLcmSynthesizeAroundTool(input: {
       "lcm_grep --mode semantic (which returns ranked snippets, not a synthesized rollup).",
     parameters: LcmSynthesizeAroundSchema,
     async execute(_toolCallId, params) {
+      // Wave-12 audit (W2A1 P0 #2): bring lcm_synthesize_around onto the
+      // token-accounting bus. Previously the markdown output (4K-8K
+      // tokens) silently flowed past the cache, drifting downstream
+      // needsCompact gate decisions low. The needs-compact-gate.ts
+      // exemption ("self-protecting via 50K source cap") covered SOURCE
+      // input bounds, not OUTPUT — an oversight surfaced by Wave-2 audit.
+      return runWithTokenGate({
+        toolName: "lcm_synthesize_around",
+        toolParams: params as Record<string, unknown>,
+        sessionKey: input.sessionKey,
+        getRuntimeContext: input.getRuntimeContext,
+        inner: async () => {
       const lcm = input.lcm ?? (await input.getLcm?.());
       if (!lcm) {
         throw new Error("LCM engine is unavailable.");
@@ -1447,6 +1470,8 @@ export function createLcmSynthesizeAroundTool(input: {
           },
         },
       };
+        },  // close inner: async () => { ... }
+      });   // close runWithTokenGate({ ... })
     },
   };
 }
