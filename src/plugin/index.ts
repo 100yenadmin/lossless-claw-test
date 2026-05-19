@@ -22,6 +22,7 @@ import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
 import { createLcmGetEntityTool } from "../tools/lcm-get-entity-tool.js";
 import { createLcmSearchEntitiesTool } from "../tools/lcm-search-entities-tool.js";
+import { createLcmSynthesizeAroundTool } from "../tools/lcm-synthesize-around-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
 import {
   tryStartBackfillAutostart,
@@ -1436,6 +1437,15 @@ function wirePluginHandlers(
         sessionKey: ctx.sessionKey,
       }),
     { name: "lcm_search_entities" },
+  );
+  api.registerTool(
+    (ctx) =>
+      createLcmSynthesizeAroundTool({
+        deps,
+        getLcm: shared.waitForEngine,
+        sessionKey: ctx.sessionKey,
+      }),
+    { name: "lcm_synthesize_around" },
   );
 
   api.registerCommand(

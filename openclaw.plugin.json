@@ -14,7 +14,8 @@
       "lcm_expand",
       "lcm_expand_query",
       "lcm_get_entity",
-      "lcm_search_entities"
+      "lcm_search_entities",
+      "lcm_synthesize_around"
     ]
   },
   "uiHints": {
